@@ -1,0 +1,6 @@
+# SPDX-FileCopyrightText: 2023 LakeSoul Contributors
+#
+# SPDX-License-Identifier: Apache-2.0
+
+[target.x86_64-unknown-linux-gnu]
+image = "dmetasoul/lakesoul-cross:ubuntu2004-v1.0"

@@ -1,0 +1,34 @@
+# SPDX-FileCopyrightText: 2026 LakeSoul Contributors
+#
+# SPDX-License-Identifier: Apache-2.0
+
+[package]
+name = "lakesoul-console"
+version = { workspace = true }
+publish = false
+edition = { workspace = true }
+
+[dependencies]
+# lakesoul
+lakesoul-datafusion = { path = "../lakesoul-datafusion" }
+# datafusion
+datafusion = { workspace = true }
+# runtime
+tokio = { workspace = true }
+# cli
+clap = { workspace = true }
+rustyline = "16.0.0"
+base64 = { version = "0.22", features = ["std"] }
+# async
+futures = { workspace = true }
+# rand
+rand = { workspace = true }
+# logging
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+tracing-appender = "0.2"
+# error
+rootcause = { workspace = true }
+
+[lints]
+workspace = true

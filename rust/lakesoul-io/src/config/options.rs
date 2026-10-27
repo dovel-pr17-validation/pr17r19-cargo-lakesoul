@@ -1,0 +1,86 @@
+// SPDX-FileCopyrightText: 2023 LakeSoul Contributors
+//
+// SPDX-License-Identifier: Apache-2.0
+
+/// Key for keeping row order in output
+pub static OPTION_KEY_KEEP_ORDERS: &str = "keep_orders";
+/// Default value for keeping row order
+pub static OPTION_DEFAULT_VALUE_KEEP_ORDERS: &str = "false";
+
+/// Key for memory limit in bytes
+pub static OPTION_KEY_MEM_LIMIT: &str = "mem_limit";
+/// Key for memory pool size in bytes
+pub static OPTION_KEY_POOL_SIZE: &str = "pool_size";
+/// Key for memory pool spill dir
+pub static OPTION_KEY_POOL_DIR: &str = "pool_dir";
+/// Key for hash bucket ID for partitioning
+pub static OPTION_KEY_HASH_BUCKET_ID: &str = "hash_bucket_id";
+/// Key for CDC (Change Data Capture) column name
+pub static OPTION_KEY_CDC_COLUMN: &str = "cdc_column";
+/// Key for indicating if data is compacted
+pub static OPTION_KEY_IS_COMPACTED: &str = "is_compacted";
+/// Key for skipping merge operation during read
+pub static OPTION_KEY_SKIP_MERGE_ON_READ: &str = "skip_merge_on_read";
+/// Key for maximum file size in bytes
+pub static OPTION_KEY_MAX_FILE_SIZE: &str = "max_file_size";
+/// Key for pushdown filters in file format
+pub static OPTION_KEY_FILE_FILTER_PUSHDOWN: &str = "file_filter_pushdown";
+/// Key for spill dir
+pub static OPTION_KEY_SPILL_DIR: &str = "spill_dir";
+/// Key for using stable sort algorithm
+pub static OPTION_KEY_STABLE_SORT: &str = "stable_sort";
+/// Key for repartition memory
+pub static OPTION_KEY_REPARTITION_MEM_RATIO: &str = "repartition_mem_ratio";
+/// Key for selecting the physical file format used by writers
+pub static OPTION_KEY_PHYSICAL_FORMAT: &str = "physical_format";
+/// Key for the number of batches the reader keeps in flight ahead of the consumer
+pub static OPTION_KEY_PREFETCH_SIZE: &str = "prefetch_size";
+/// Key for externalizing binary columns into side pack files (JSON object)
+pub static OPTION_KEY_BLOB_COLUMNS: &str = "blob_columns";
+/// Vector search: column name of the vector index to query
+pub static OPTION_KEY_VECTOR_SEARCH_COLUMN: &str = "vector_search_column";
+/// Vector search: comma-separated f32 values of the query vector
+pub static OPTION_KEY_VECTOR_SEARCH_QUERY: &str = "vector_search_query";
+/// Vector search: top-K results to return
+pub static OPTION_KEY_VECTOR_SEARCH_TOP_K: &str = "vector_search_top_k";
+/// Vector search: number of IVF clusters to probe (default 64)
+pub static OPTION_KEY_VECTOR_SEARCH_NPROBE: &str = "vector_search_nprobe";
+/// Vector search: clusters probed concurrently, 1 = sequential (default 1)
+pub static OPTION_KEY_VECTOR_SEARCH_PARALLELISM: &str = "vector_search_parallelism";
+/// Vector search: distance metric (default "L2")
+pub static OPTION_KEY_VECTOR_SEARCH_METRIC: &str = "vector_search_metric";
+/// Vector search: order the candidates by the index distance instead of the
+/// exact re-rank over the vector column (default false).  The reserved
+/// `__lakesoul_vector_distance` column carries the L2 (sqrt) distance.
+pub static OPTION_KEY_VECTOR_SEARCH_ORDER_BY: &str = "vector_search_order_by";
+/// Vector search: direct index prefix path (alternative to auto-detection from files)
+pub static OPTION_KEY_VECTOR_SEARCH_INDEX_PREFIX: &str = "vector_search_index_prefix";
+/// Vector search: JSON list of several column queries, e.g.
+/// `[{"column":"a","query":"0.1,0.2","top_k":10,"weight":0.7}]`.  The
+/// candidate sets are intersected; with `vector_search_order_by` the
+/// reserved distance column carries the weighted sum of the per-column
+/// index distances.
+pub static OPTION_KEY_VECTOR_SEARCH_REQUESTS: &str = "vector_search_requests";
+/// Text search: column name of the text index to query
+pub static OPTION_KEY_TEXT_SEARCH_COLUMN: &str = "text_search_column";
+/// Text search: query string parsed by the text index
+pub static OPTION_KEY_TEXT_SEARCH_QUERY: &str = "text_search_query";
+/// Text search: top-K candidates to retrieve
+pub static OPTION_KEY_TEXT_SEARCH_TOP_K: &str = "text_search_top_k";
+/// Text search: run the exact post-merge verification pass (default true);
+/// SQL pushdown disables it because the residual `text_match` predicate
+/// verifies above the scan.
+pub static OPTION_KEY_TEXT_SEARCH_VERIFY: &str = "text_search_verify";
+/// Text search: expose the BM25 score of each verified row in a
+/// `__lakesoul_text_score` column (default false).  Requesting scores also
+/// enables the verification pass, which drops stale candidates.
+pub static OPTION_KEY_TEXT_SEARCH_SCORES: &str = "text_search_scores";
+/// Vortex: target row block size (rows) for every column of a written file.
+/// Random row access reads a row block per column, so smaller blocks make
+/// candidate/pk reads cheaper; the writer default is 8192 rows.
+pub static OPTION_KEY_VORTEX_ROW_BLOCK_SIZE: &str = "vortex_row_block_size";
+/// Vortex: target uncompressed bytes per data block of a written file.
+/// Blocks are the smallest unit a random read fetches; the writer default is
+/// 1 MiB, which reads far more than a candidate row needs.
+pub static OPTION_KEY_VORTEX_DATA_BLOCK_TARGET_BYTES: &str =
+    "vortex_data_block_target_bytes";

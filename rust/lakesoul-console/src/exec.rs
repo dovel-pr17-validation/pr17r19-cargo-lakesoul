@@ -1,0 +1,335 @@
+// SPDX-FileCopyrightText: 2025 LakeSoul Contributors
+//
+// SPDX-License-Identifier: Apache-2.0
+
+use std::io::{BufRead, Write};
+use std::path::PathBuf;
+use std::sync::{Arc, OnceLock};
+use std::time::Instant;
+use std::{fs::File, io::BufReader};
+
+use base64::Engine as _;
+use base64::engine::general_purpose::STANDARD as BASE64;
+use datafusion::arrow::array::RecordBatch;
+use datafusion::arrow::datatypes::Schema;
+use datafusion::config::Dialect;
+use datafusion::logical_expr::sqlparser::ast::{Statement as SQLStatement, Use};
+use datafusion::physical_plan::execute_stream;
+use datafusion::prelude::SessionContext;
+use datafusion::sql::parser::Statement;
+use futures::stream::StreamExt;
+use lakesoul_datafusion::tpch::tpch_gen_sql;
+use rootcause::bail;
+use rustyline::error::ReadlineError;
+use tokio::fs::OpenOptions;
+use tokio::io::AsyncWriteExt;
+use tokio::signal;
+use tracing::{debug, trace};
+
+use crate::Command;
+use crate::Result;
+use crate::print::Printer;
+
+pub async fn exec_command(
+    commands: Command,
+    printer: &Printer,
+    ctx: &SessionContext,
+) -> Result<()> {
+    match commands {
+        Command::TpchGen {
+            schema,
+            path_prefix,
+            scale_factor,
+            num_parts,
+        } => {
+            println!(
+                "start to generate tpch data scale_factor:{} num_parts:{}",
+                scale_factor, num_parts
+            );
+            let mut all = vec![];
+            let all_targets = [
+                "part".to_string(),
+                "customer".to_string(),
+                "lineitem".to_string(),
+                "nation".to_string(),
+                "supplier".to_string(),
+                "partsupp".to_string(),
+                "orders".to_string(),
+                "region".to_string(),
+            ];
+
+            for t in all_targets.iter() {
+                let table_name = if let Some(sha) = &schema {
+                    format!("{}.{}", sha, t)
+                } else {
+                    t.clone()
+                };
+                let mut buf = PathBuf::from(&path_prefix);
+                buf.push(t);
+                let v = tpch_gen_sql(
+                    &table_name,
+                    t,
+                    scale_factor,
+                    num_parts,
+                    buf.to_str().unwrap(),
+                );
+                all.push(v);
+            }
+
+            exec_tpch_gen(ctx, all, printer).await?;
+        }
+    }
+    Ok(())
+}
+
+async fn exec_tpch_gen(
+    ctx: &SessionContext,
+    sqls: Vec<Vec<String>>,
+    printer: &Printer,
+) -> Result<()> {
+    let start = Instant::now();
+    let mut row_counts = 0;
+    let mut res = vec![];
+    for t in sqls {
+        for sql in t {
+            let (row_count, v, _) = exec(ctx, &sql).await?;
+            trace!("add row_count {row_count}");
+            row_counts += row_count;
+            res.extend(v);
+        }
+    }
+    printer.print_batches(Arc::new(Schema::empty()), &res, start, row_counts)?;
+    Ok(())
+}
+
+// run and execute SQL statements and commands from a file, against a context with the given print options
+async fn exec_from_lines(
+    ctx: &SessionContext,
+    reader: &mut BufReader<File>,
+    printer: &Printer,
+) -> Result<()> {
+    let mut query = "".to_owned();
+
+    let mut last_output = String::new();
+
+    for line in reader.lines() {
+        match line {
+            Ok(line) if line.starts_with("#!") => {
+                continue;
+            }
+            Ok(line) if line.starts_with("--") => {
+                continue;
+            }
+            Ok(line) => {
+                let line = line.trim_end();
+                query.push_str(line);
+                if line.ends_with(';') {
+                    match exec_and_print(ctx, printer, &query, &mut last_output).await {
+                        Ok(_) => {}
+                        Err(err) => eprintln!("{err}"),
+                    }
+                    query = "".to_string();
+                } else {
+                    query.push('\n');
+                }
+            }
+            _ => {
+                break;
+            }
+        }
+    }
+
+    // run the left over query if the last statement doesn't contain ‘;’
+    // ignore if it only consists of '\n'
+    if query.contains(|c| c != '\n') {
+        exec_and_print(ctx, printer, &query, &mut last_output).await?;
+    }
+
+    Ok(())
+}
+
+pub async fn exec_from_files(
+    ctx: &SessionContext,
+    printer: &Printer,
+    files: Vec<String>,
+) -> Result<()> {
+    let files = files
+        .into_iter()
+        .map(|file_path| File::open(file_path).unwrap())
+        .collect::<Vec<_>>();
+    for file in files {
+        let mut reader = BufReader::new(file);
+        exec_from_lines(ctx, &mut reader, printer).await?;
+    }
+    Ok(())
+}
+
+fn parse_use(stmt: Statement) -> Option<Use> {
+    match stmt {
+        Statement::Statement(sql_stmt) => {
+            let sql_stmt = *sql_stmt;
+            match sql_stmt {
+                SQLStatement::Use(u) => Some(u),
+                _ => None,
+            }
+        }
+        _ => None,
+    }
+}
+
+async fn exec(
+    ctx: &SessionContext,
+    sql: &str,
+) -> Result<(usize, Vec<RecordBatch>, Arc<Schema>)> {
+    let stmt = ctx.state().sql_to_statement(sql, &Dialect::PostgreSQL)?;
+    if let Some(u) = parse_use(stmt.clone()) {
+        match u {
+            Use::Object(name) => {
+                let target = name.to_string();
+                if ctx
+                    .state()
+                    .catalog_list()
+                    .catalog("lakesoul")
+                    .unwrap()
+                    .schema(&target)
+                    .is_none()
+                {
+                    bail!("{} not found in LakeSoul", target)
+                }
+                let default_schema = &ctx
+                    .state()
+                    .config_mut()
+                    .options_mut()
+                    .catalog
+                    .default_schema
+                    .clone();
+                debug!("change the default schema from {default_schema} to {target}");
+                {
+                    // write lock
+                    ctx.state_ref()
+                        .write()
+                        .config_mut()
+                        .options_mut()
+                        .catalog
+                        .default_schema = target;
+                }
+            }
+            _ => {
+                bail!("Not Supported");
+            }
+        }
+        // use finished
+        return Ok((0, vec![], Arc::new(Schema::empty())));
+    }
+    let plan = ctx.state().statement_to_plan(stmt).await?;
+    let df = ctx.execute_logical_plan(plan).await?;
+    let physical_plan = df.create_physical_plan().await?;
+    let schema = physical_plan.schema();
+    let mut stream = execute_stream(physical_plan, ctx.task_ctx())?;
+    let mut row_count = 0_usize;
+    let mut res = vec![];
+    while let Some(batch) = stream.next().await {
+        let batch = batch?;
+        let curr_num_rows = batch.num_rows();
+        res.push(batch);
+        row_count += curr_num_rows;
+    }
+    Ok((row_count, res, schema))
+}
+
+fn history_path() -> &'static str {
+    static HISTORY_PATH: OnceLock<String> = OnceLock::new();
+    HISTORY_PATH.get_or_init(|| {
+        std::env::var("LAKESOUL_CONSOLE_HISTORY_PATH")
+            .unwrap_or(String::from("/tmp/console.history"))
+    })
+}
+
+#[tracing::instrument(skip(ctx, printer))]
+async fn exec_and_print(
+    ctx: &SessionContext,
+    printer: &Printer,
+    sql: &str,
+    last_output: &mut String,
+) -> Result<()> {
+    trace!("begin exec sql");
+    let now = Instant::now();
+    // match control command
+    match sql.trim() {
+        r"\copy" => {
+            if last_output.is_empty() {
+                bail!("nothing to copy, run a query first");
+            }
+            // OSC52 hands the payload to the *local* terminal emulator's
+            // clipboard, so it works over ssh and tmux with no display server
+            // on this machine. tmux needs `set -g set-clipboard on` to forward
+            // it, and the outer terminal must support OSC52.
+            // 74994 is the conservative payload cap accepted across terminals.
+            let encoded = BASE64.encode(last_output.as_bytes());
+            if encoded.len() > 74_994 {
+                bail!(
+                    "output too large for OSC52 ({} bytes encoded); trim the result with LIMIT",
+                    encoded.len()
+                );
+            }
+            let mut stdout = std::io::stdout().lock();
+            write!(stdout, "\x1b]52;c;{encoded}\x07")?;
+            stdout.flush()?;
+            println!("copied {} bytes to clipboard via OSC52", last_output.len());
+            debug!("copied {} bytes via OSC52", last_output.len());
+        }
+        r"\dump" => {
+            // write last output to a file
+            let mut options = OpenOptions::new();
+            let filename = String::from("console.dump");
+            let mut f = options.create(true).write(true).open(&filename).await?;
+            f.write_all(last_output.as_bytes()).await?;
+            println!("dump to {filename}");
+        }
+        _ => {
+            let (row_count, res, schema) = exec(ctx, sql).await?;
+            printer.print_batches(schema.clone(), &res, now, row_count)?;
+            *last_output = printer.format_batches(schema, &res)?;
+        }
+    }
+    Ok(())
+}
+
+pub async fn exec_from_repl(ctx: &SessionContext, printer: &Printer) -> Result<()> {
+    let mut rl = rustyline::DefaultEditor::new()?;
+    rl.load_history(history_path()).ok();
+    let mut last_output = String::new();
+
+    loop {
+        match rl.readline("lakesoul >> ") {
+            Ok(line) => {
+                rl.add_history_entry(line.trim_end())?;
+                tokio::select! {
+                        res = exec_and_print(ctx, printer, &line,&mut last_output) => match res {
+                            Ok(_) => {}
+                            Err(err) => eprintln!("{err}"),
+                        },
+                        _ = signal::ctrl_c() => {
+                            println!("^C");
+                            continue
+                        },
+                }
+            }
+            Err(ReadlineError::Interrupted) => {
+                println!("^C");
+                break;
+            }
+            Err(ReadlineError::Eof) => {
+                println!("bye bye! 🫡");
+                break;
+            }
+            Err(err) => {
+                eprintln!("Unknown error happened {err:?}");
+                break;
+            }
+        }
+    }
+
+    rl.save_history(history_path())?;
+    Ok(())
+}

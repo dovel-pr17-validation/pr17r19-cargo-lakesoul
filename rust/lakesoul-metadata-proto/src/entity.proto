@@ -1,0 +1,229 @@
+// SPDX-FileCopyrightText: 2023 LakeSoul Contributors
+//
+// SPDX-License-Identifier: Apache-2.0
+
+syntax = "proto3";
+
+package proto.entity;
+
+option java_multiple_files = true;
+option java_package = "com.dmetasoul.lakesoul.meta.entity";
+
+//  A collection of PartitionInfo of one TableInfo
+message MetaInfo {
+  repeated PartitionInfo list_partition = 1;
+  TableInfo table_info = 2;
+  repeated PartitionInfo read_partition_info = 3;
+}
+
+
+//  Meta Information for LakeSoul Table
+message TableInfo {
+  //  Global unique identifier of table
+  string table_id = 1;
+  //  Namespace of table. A string of 'tableNamespace.tablePath' or 'tableNamespace.tableName'  maps one unique table globally
+  string table_namespace = 2;
+  //  Name of table, optional
+  string table_name = 3;
+  //  Physical qualified path of table
+  string table_path = 4;
+  //  Spark/Java-compatible schema of table.
+  string table_schema = 5;
+  //  Full-fidelity Arrow IPC schema for Rust/Vortex clients.
+  bytes table_schema_arrow_ipc = 10;
+  //  Hash of table_schema used to detect stale table_schema_arrow_ipc values.
+  string table_schema_arrow_ipc_json_hash = 11;
+  //  Properties of table, used to tag table with information not tracked by SQL
+  string properties = 7;
+  //  Partition columns of table. Format of partitions is 'comma_separated_range_column;hash_column'
+  string partitions = 8;
+  //  Domain this entry belongs to.
+  //  Only when rbac feature enabled will have contents different to 'public'
+  string domain = 9;
+}
+
+//  Version information for specific table range partitions
+message PartitionInfo {
+  //  TableId of PartitionInfo
+  string table_id = 1;
+  //  Range partition description, which defines a specific range partition of the table, in the formatted of comma-separated range_colum=range_value
+  //  Especially, a table without range partitions use LAKESOUL_NON_PARTITION_TABLE_PART_DESC as partitionDesc
+  string partition_desc = 2;
+  //  A version is defined as a number monotonically increasing by 1
+  int32 version = 3;
+  //  Specific operation of the version information
+  CommitOp commit_op = 4;
+  //  Timestamp of the PartitionInfo successfully committed
+  int64 timestamp = 5;
+  //  Collection of commitId of DataCommitInfo included with PartitionInfo
+  repeated Uuid snapshot = 7;
+  //  Expression used to calculate or filter data, will be launched in the future. Now it's just a meaningless empty string.
+  string expression = 8;
+  //  Domain this entry belongs to.
+  //  Only when rbac feature enabled will have contents different to 'public'
+  string domain = 9;
+  //  Whether a snapshot or tag keeps this version alive.
+  bool pinned = 6;
+}
+
+//  Namespace of tables
+message Namespace {
+  //  Dot-separated-formatted namespace
+  string namespace = 1;
+  string properties = 2;
+  string comment = 3;
+  //  Domain this entry belongs to.
+  //  Only when rbac feature enabled will have contents different to 'public'
+  string domain = 4;
+}
+
+
+//  Set of {AppendCommit, CompactionCommit, UpdateCommit, MergeCommit}, which define the specific operation of this DataCommit
+enum CommitOp {
+  //  CompactionCommit: A commit type indicates that this DataCommit is to compact files in a specific table range partition
+  CompactionCommit = 0;
+  //  AppendCommit: A commit type indicates that this DataCommit is to append files to a specific table range partition without hash partition
+  AppendCommit = 1;
+  //  MergeCommit: A commit type indicates that this DataCommit is to append files to a specific table range partition with hash partition
+  MergeCommit = 2;
+  //  UpdateCommit: A commit type indicates that this DataCommit is to update data(add new files and delete old invalid files) in a specific table range partition
+  UpdateCommit = 3;
+  //  DeleteCommit: A commit type indicates that this DataCommit is to delete files in a specific table range partition
+  DeleteCommit = 4;
+}
+
+//  Set of {add, delete}, which define the specific operation of this file
+enum FileOp {
+  //  add: indicates that the parquet file is newly added
+  add = 0;
+  //  del: indicates that the parquet file has been deleted
+  del = 1;
+}
+
+//  Singleton Data File information
+message DataFileOp {
+  //  Physical qualified non-percent-encoded path of a parquet file,
+  string path = 1;
+  //  Specific operation of this file
+  FileOp file_op = 2;
+  //  File size of byte-unit
+  int64 size = 3;
+  //  Columns included with this parquet file, which should be equivalent of the meta of parquet file
+  string file_exist_cols = 4;
+}
+
+// Data Files Commit information for specific table range partitions
+message DataCommitInfo {
+  //  TableId of DataCommit
+  string table_id = 1;
+  //  Range partition description, which defines a specific range partition of the table, in the formatted of comma-separated range_colum=range_value
+  //  Especially, a table without range partitions use LAKESOUL_NON_PARTITION_TABLE_PART_DESC as partitionDesc
+  string partition_desc = 2;
+  // Global unique identifier of DataCommit
+  Uuid commit_id = 3;
+  // Collection of DataFileOps included with DataCommit
+  repeated DataFileOp file_ops = 4;
+  // Specific operation of this DataCommit
+  CommitOp commit_op = 5;
+  //  Creation timestamp of the files of the DataCommit
+  int64 timestamp = 6;
+  //   mark define if this DataCommit has already committed as PartitionInfo of table
+  bool committed = 7;
+  string domain = 8;
+  //  Whether a snapshot or tag keeps this commit alive.
+  bool pinned = 9;
+}
+
+//  Relationship between 'TableNamespace.TableName' and TableId
+message TableNameId {
+  //  Name of table
+  string table_name = 1;
+  //  Global unique identifier of table
+  string tableId = 2;
+  //  Namespace of table
+  string table_namespace = 3;
+  //  Domain this entry belongs to.
+  //  Only when rbac feature enabled will have contents different to 'public'
+  string domain = 4;
+}
+
+// Meta Information for LakeSoul DiscardCompressedFile
+message DiscardCompressedFileInfo {
+  //  File path
+  string file_path = 1;
+  //  Table path of this file belong to
+  string table_path = 2;
+  //  Partition info
+  string partition_desc = 3;
+  // Creation timestamp when the date created
+  int64 timestamp = 4;
+  // Date
+  string t_date = 5;
+}
+
+//  Relationship between 'TableNamespace.TablePath' and TableId
+message TablePathId {
+  //  Physical qualified path of table
+  string table_path = 1;
+  //  Global unique identifier of table
+  string table_id = 2;
+  //  Namespace of table
+  string table_namespace = 3;
+  //  Domain this entry belongs to.
+  //  Only when rbac feature enabled will have contents different to 'public'
+  string domain = 4;
+}
+
+message Uuid {
+  uint64 high = 1;
+  uint64 low = 2;
+}
+
+message SnapshotInfo {
+  string table_id = 1;
+  int64 snapshot_id = 2;
+  int64 created_at = 3;
+  string description = 4;
+}
+
+message SnapshotCommitInfo {
+  string table_id = 1;
+  int64 snapshot_id = 2;
+  string partition_desc = 3;
+  int32 version = 4;
+  Uuid commit_id = 5;
+}
+
+message SnapshotTagInfo {
+  string table_id = 1;
+  string tag = 2;
+  int64 snapshot_id = 3;
+  int64 created_at = 4;
+  int64 expire_at = 5;
+}
+
+// Atomic partition publication request. Real partition rows and the data commit
+// IDs made visible by those rows are separate so neither can be mistaken for
+// control data.
+message PartitionCommitEntry {
+  PartitionInfo partition_info = 1;
+  repeated Uuid commit_id = 2;
+}
+
+message PartitionInfoCommit {
+  repeated PartitionCommitEntry partitions = 1;
+}
+
+message JniWrapper {
+  repeated Namespace namespace = 1;
+  repeated TableInfo table_info = 2;
+  repeated TablePathId table_path_id = 3;
+  repeated TableNameId table_name_id = 4;
+  repeated PartitionInfo partition_info = 5;
+  repeated DataCommitInfo data_commit_info = 6;
+  repeated DiscardCompressedFileInfo discard_compressed_file_info = 7;
+  repeated SnapshotInfo snapshot_info = 8;
+  repeated SnapshotCommitInfo snapshot_commit_info = 9;
+  repeated SnapshotTagInfo snapshot_tag_info = 10;
+  PartitionInfoCommit partition_info_commit = 11;
+}

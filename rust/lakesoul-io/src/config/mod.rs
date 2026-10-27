@@ -1,0 +1,1087 @@
+// SPDX-FileCopyrightText: 2023 LakeSoul Contributors
+//
+// SPDX-License-Identifier: Apache-2.0
+
+use std::fmt::Debug;
+use std::{collections::HashMap, sync::Arc};
+
+use arrow_schema::{Schema, SchemaRef};
+use datafusion_common::DFSchema;
+use datafusion_expr::Expr;
+use datafusion_substrait::substrait::proto::Plan;
+use educe::Educe;
+use itertools::Itertools;
+use lakesoul_common::misc::SecretMap;
+
+use crate::{
+    Result,
+    file_format::PhysicalFormat,
+    filter::parser::{FilterContainer, Parser},
+    helpers::coerce_filter_type,
+    utils::ByteSize,
+};
+
+mod options;
+pub use options::*;
+
+#[derive(Debug, Clone)]
+pub struct IOSchema(pub(crate) SchemaRef);
+
+impl Default for IOSchema {
+    fn default() -> Self {
+        Self(Arc::new(Schema::empty()))
+    }
+}
+
+/// Per-column write layout override.
+///
+/// Every field is optional; `None` keeps the writer default for that aspect.
+/// Columns not listed fall back to the built-in defaults: small row blocks and
+/// a small data block target (vortex), and binary/blob columns are written
+/// without compression so already-compressed payloads (e.g. H.264 GOPs) are
+/// not compressed twice.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ColumnPolicy {
+    /// `Some(false)` writes the column without the BtrBlocks compressor.
+    pub compress: Option<bool>,
+    /// Overrides the row block size used for row repartitioning.
+    pub row_block_size: Option<usize>,
+    /// Overrides the target uncompressed byte size for block coalescing.
+    pub data_block_target_bytes: Option<u64>,
+}
+
+/// Configuration for LakeSoul IO operations.
+///
+/// This struct contains all the necessary parameters for configuring LakeSoul IO operations,
+/// including file paths, schema information, partitioning settings, and performance tuning options.
+#[derive(Educe, Clone)]
+#[educe(Default)]
+pub struct LakeSoulIOConfig {
+    /// Root directory path for files, unescaped
+    pub(crate) prefix: String,
+    /// List of file paths to read or write, unescaped
+    pub(crate) files: Vec<String>,
+    /// Names of primary key columns
+    pub(crate) primary_keys: Vec<String>,
+    /// Columns used for hash partitioning when they differ from the merge key
+    /// (`primary_keys`). Empty means the merge key is used. Must be a prefix of
+    /// `primary_keys`; internal tables (e.g. IVM join state) use this to bucket
+    /// by a key prefix while keeping the full merge key.
+    pub(crate) hash_partitioning_columns: Vec<String>,
+    /// Vector index columns; the writer gives these columns small row
+    /// blocks so candidate rows can be fetched by row index cheaply.
+    pub(crate) vector_columns: Vec<String>,
+    /// Per-column write layout overrides, keyed by column name.
+    pub(crate) column_policies: HashMap<String, ColumnPolicy>,
+    /// Index commits resolved by the caller (the layer with metadata
+    /// access) for index search.
+    pub(crate) resolved_index_shards: Vec<crate::index::commit::ResolvedIndex>,
+    /// Leases held while this reader uses the resolved index shards; they
+    /// are released when the config (and the reader) is dropped.
+    pub(crate) index_leases: Vec<Arc<crate::index::IndexLease>>,
+    /// Names of range partition columns
+    pub(crate) range_partitions: Vec<String>,
+    /// Number of hash buckets for hash partitioning
+    #[educe(Default = "1")]
+    hash_bucket_num: String,
+    /// Names of columns to select
+    #[deprecated(since = "2.5.0", note = "deprecated")]
+    pub(crate) columns: Vec<String>,
+    /// Names of auxiliary columns for sorting
+    pub(crate) aux_sort_cols: Vec<String>,
+    /// Encoded java filter predicates as strings
+    pub(crate) filter_strs: Vec<String>,
+    /// Filter predicates as expressions
+    #[deprecated(since = "2.5.0", note = "deprecated")]
+    pub(crate) filters: Vec<Expr>,
+    /// Filter predicates as substrait plans
+    pub(crate) filter_protos: Vec<Plan>,
+    /// Filter predicates as substrait raw buf
+    pub(crate) filter_buf: Vec<Vec<u8>>,
+    /// Number of rows per batch for reading/writing
+    #[educe(Default = 8192)]
+    pub(crate) batch_size: usize,
+    /// Maximum number of rows per row group when writing
+    #[educe(Default = 250000)]
+    pub(crate) max_row_group_size: usize,
+    /// Maximum number of values per row group when writing
+    #[educe(Default = 2147483647)]
+    pub(crate) max_row_group_num_values: usize,
+    /// Number of batches to prefetch
+    #[educe(Default = 1)]
+    pub(crate) prefetch_size: usize,
+    /// Target Arrow schema for the reader and writer
+    pub(crate) target_schema: IOSchema,
+    /// Arrow schema for partition columns
+    pub(crate) partition_schema: IOSchema,
+    /// Object store configuration options (e.g., S3 credentials)
+    pub(crate) object_store_options: SecretMap,
+    /// Merge operators for each column
+    pub(crate) merge_operators: HashMap<String, String>,
+    /// Default values for columns
+    pub(crate) default_column_value: HashMap<String, String>,
+    /// Number of threads for parallel processing
+    #[educe(Default = 2)]
+    pub(crate) thread_num: usize,
+    /// Default filesystem URI (compatible with Hadoop's fs.defaultFS)
+    pub(crate) default_fs: String,
+    /// Additional configuration options
+    pub(super) options: SecretMap,
+    /// Whether to use dynamic partitioning
+    #[educe(Default = false)]
+    pub(crate) use_dynamic_partition: bool,
+    /// Whether to infer schema from data
+    #[educe(Default = false)]
+    pub(crate) inferring_schema: bool,
+    /// Maximum file size in bytes
+    #[educe(Default  = None)]
+    pub(crate) max_file_size: Option<u64>,
+    /// Target number of rows in one sort/write window.  When reached, the
+    /// writer flushes the current sorted window and starts a new one.  Zero
+    /// disables row-based rolling.
+    #[educe(Default = 1_000_000)]
+    pub(crate) file_rolling_rows: usize,
+    /// Target number of Arrow bytes in one sort/write window.  Zero disables
+    /// byte-based rolling.
+    #[educe(Default = 256 * 1024 * 1024)]
+    pub(crate) file_rolling_bytes: u64,
+    /// Random number generator seed
+    #[educe(Default = 1234)]
+    pub(crate) seed: u64,
+    /// Memory buffer capacity
+    #[educe(Default = 16 * 1024)]
+    pub(crate) memory_buffer_capacity: usize,
+    /// Chunk size
+    #[educe(Default=128 * 1024 * 1024)]
+    pub(crate) multipart_chunk_size: usize,
+    /// Receiver capacity
+    #[educe(Default = 8)]
+    pub(crate) receiver_capacity: usize,
+    /// Maximum number of primary-key candidates a filtered scan resolves
+    /// through the row-level pk index.  Above it the scan falls back to the
+    /// regular path.  IVM refreshes raise it for their key-filtered state
+    /// reads, whose candidate sets reach the change ratio times the view size.
+    #[educe(Default = 10_000)]
+    pub(crate) max_pk_candidates: usize,
+    /// Answer large `pk IN (...)` candidate sets with the sorted index merge
+    /// instead of one binary search per key.  The merge is O(index rows +
+    /// keys) per file, so it stays cheap when the candidate set is large.
+    #[educe(Default = false)]
+    pub(crate) bulk_pk_lookup: bool,
+}
+
+impl LakeSoulIOConfig {
+    /// Returns a builder for LakeSoulIOConfig
+    pub fn builder() -> LakeSoulIOConfigBuilder {
+        LakeSoulIOConfigBuilder::new()
+    }
+
+    /// Returns the target Arrow schema for the reader and writer
+    pub fn target_schema(&self) -> SchemaRef {
+        self.target_schema.0.clone()
+    }
+
+    /// Returns the Arrow schema for partition columns
+    pub fn partition_schema(&self) -> SchemaRef {
+        self.partition_schema.0.clone()
+    }
+
+    /// Returns a slice of primary key column names
+    pub fn primary_keys_slice(&self) -> &[String] {
+        &self.primary_keys
+    }
+
+    /// The largest `pk IN (...)` candidate set the pk index resolves.
+    pub fn max_pk_candidates(&self) -> usize {
+        self.max_pk_candidates
+    }
+
+    /// Whether large candidate sets use the sorted index merge.
+    pub fn bulk_pk_lookup(&self) -> bool {
+        self.bulk_pk_lookup
+    }
+
+    /// Returns the columns used for hash partitioning.
+    ///
+    /// Falls back to the primary keys when no dedicated bucket columns are set,
+    /// so regular tables keep their existing behaviour.
+    pub fn hash_partitioning_columns_slice(&self) -> &[String] {
+        if self.hash_partitioning_columns.is_empty() {
+            &self.primary_keys
+        } else {
+            &self.hash_partitioning_columns
+        }
+    }
+
+    /// Returns a slice of vector index column names
+    pub fn vector_columns_slice(&self) -> &[String] {
+        &self.vector_columns
+    }
+
+    /// Returns the per-column write layout overrides.
+    pub fn column_policies(&self) -> &HashMap<String, ColumnPolicy> {
+        &self.column_policies
+    }
+
+    /// Number of batches the reader keeps in flight ahead of the consumer.
+    ///
+    /// The `prefetch_size` option overrides the builder value; values below 2
+    /// disable prefetching.
+    pub fn prefetch_size(&self) -> usize {
+        self.option(OPTION_KEY_PREFETCH_SIZE)
+            .and_then(|value| value.parse::<usize>().ok())
+            .filter(|value| *value > 0)
+            .unwrap_or(self.prefetch_size)
+    }
+
+    /// Returns the index commits resolved by the caller for index search.
+    pub fn resolved_index_shards_slice(&self) -> &[crate::index::commit::ResolvedIndex] {
+        &self.resolved_index_shards
+    }
+
+    /// Returns the leases held while the resolved shards are in use.
+    pub fn index_leases(&self) -> &[Arc<crate::index::IndexLease>] {
+        &self.index_leases
+    }
+
+    /// Returns the range partition column names.
+    ///
+    /// Writers use these columns to derive partition directories and exclude them
+    /// from the physical file schema. Readers use the same list to identify
+    /// logical partition columns that are absent from files; their values are
+    /// supplied through default-column projection.
+    pub fn range_partitions_slice(&self) -> &[String] {
+        &self.range_partitions
+    }
+
+    /// Returns a slice of file paths to read or write
+    pub fn files_slice(&self) -> &[String] {
+        &self.files
+    }
+
+    /// Returns a slice of auxiliary sort column names
+    pub fn aux_sort_cols_slice(&self) -> &[String] {
+        &self.aux_sort_cols
+    }
+
+    /// Returns the value of a configuration option by key
+    pub fn option(&self, key: &str) -> Option<String> {
+        self.options
+            .get(key)
+            .cloned()
+            .or_else(|| std::env::var(format!("LAKESOUL_{}", key.to_uppercase())).ok())
+    }
+
+    /// Returns the object store configuration options (e.g. S3 credentials)
+    pub fn object_store_options(&self) -> &SecretMap {
+        &self.object_store_options
+    }
+
+    /// Returns the additional configuration options map
+    pub fn options(&self) -> &SecretMap {
+        &self.options
+    }
+
+    /// Returns the root directory path for files
+    pub fn prefix(&self) -> &String {
+        &self.prefix
+    }
+
+    /// Returns whether to support parquet pushdown filters
+    pub fn file_filter_pushdown(&self) -> bool {
+        self.option(OPTION_KEY_FILE_FILTER_PUSHDOWN)
+            .is_some_and(|x| x.eq("true"))
+    }
+
+    /// Returns whether to keep row order in output
+    pub fn keep_ordering(&self) -> bool {
+        self.option(OPTION_KEY_KEEP_ORDERS)
+            .is_some_and(|x| x.eq("true"))
+    }
+
+    /// Maximum flush memory limit in bytes for query execution
+    pub fn mem_limit(&self) -> Option<usize> {
+        // todo change name
+        self.option(OPTION_KEY_MEM_LIMIT)
+            .map(|x| x.parse::<ByteSize>().unwrap().bytes())
+    }
+
+    /// Target rows in one sorted write window.
+    pub fn file_rolling_rows(&self) -> usize {
+        self.file_rolling_rows
+    }
+
+    /// Target Arrow bytes in one sorted write window.
+    pub fn file_rolling_bytes(&self) -> u64 {
+        self.file_rolling_bytes
+    }
+
+    /// Returns the maximum file size in bytes if set
+    pub fn max_file_size_option(&self) -> Option<u64> {
+        self.option(OPTION_KEY_MAX_FILE_SIZE)
+            .map(|x| x.parse().unwrap())
+    }
+
+    /// Returns the configured vortex row block size (rows) if set
+    pub fn vortex_row_block_size(&self) -> Option<usize> {
+        self.option(OPTION_KEY_VORTEX_ROW_BLOCK_SIZE)
+            .and_then(|value| value.parse().ok())
+    }
+
+    /// Returns the configured vortex data block target (bytes) if set
+    pub fn vortex_data_block_target_bytes(&self) -> Option<u64> {
+        self.option(OPTION_KEY_VORTEX_DATA_BLOCK_TARGET_BYTES)
+            .and_then(|value| value.parse().ok())
+    }
+
+    /// Returns the memory pool size in bytes if set
+    pub fn pool_size(&self) -> Option<usize> {
+        self.option(OPTION_KEY_POOL_SIZE)
+            .map(|x| x.parse::<ByteSize>().unwrap().bytes())
+    }
+
+    /// Returns the memory pool dir if set
+    pub fn pool_dir(&self) -> Option<String> {
+        self.option(OPTION_KEY_POOL_DIR).map(|x| x.parse().unwrap())
+    }
+
+    /// Returns the hash bucket ID for partitioning (defaults to 0)
+    pub fn hash_bucket_id(&self) -> usize {
+        self.option(OPTION_KEY_HASH_BUCKET_ID)
+            .map_or(0, |x| x.parse().unwrap())
+    }
+
+    /// Returns the number of hash buckets for partitioning (defaults to 1, equvalent to not partitioning)
+    pub fn hash_bucket_num(&self) -> usize {
+        self.get_hash_bucket_num().expect("invalid hash_bucket_num")
+    }
+
+    /// Returns the number of hash buckets for partitioning.
+    pub fn get_hash_bucket_num(&self) -> Result<usize> {
+        let mut tmp = self.hash_bucket_num.parse::<isize>()?;
+        tmp = tmp.max(1);
+        Ok(tmp as usize)
+    }
+
+    /// Returns the CDC (Change Data Capture) column name if set
+    pub fn cdc_column(&self) -> String {
+        self.option(OPTION_KEY_CDC_COLUMN)
+            .map_or_else(String::new, |x| x.to_string())
+    }
+
+    /// Returns whether the data is compacted, default is false
+    pub fn is_compacted(&self) -> bool {
+        self.option(OPTION_KEY_IS_COMPACTED)
+            .is_some_and(|x| x.eq("true"))
+    }
+
+    /// Returns whether to skip merge operation during read, default is false
+    pub fn skip_merge_on_read(&self) -> bool {
+        self.option(OPTION_KEY_SKIP_MERGE_ON_READ)
+            .is_some_and(|x| x.eq("true"))
+    }
+
+    /// Returns whether to use stable sort algorithm
+    pub fn stable_sort(&self) -> bool {
+        self.option(OPTION_KEY_STABLE_SORT)
+            .is_some_and(|x| x.eq("true"))
+    }
+
+    /// Returns the physical file format selected for writes.
+    pub fn physical_format(&self) -> Result<PhysicalFormat> {
+        if let Some(format) = self.option(OPTION_KEY_PHYSICAL_FORMAT) {
+            return format.parse();
+        }
+
+        Ok(self
+            .files
+            .iter()
+            .rev()
+            .find_map(|path| PhysicalFormat::from_extension(path).ok())
+            .unwrap_or_default()) // no files
+    }
+
+    pub fn set_files(&mut self, files: Vec<String>) {
+        self.files = files
+    }
+
+    /// Returns the repartition ratio
+    ///
+    /// The repartition ratio determines the proportion of memory used for repartitioning.
+    /// A value <= 0.0 means no independent repartitioning memory pool will be used.
+    pub fn repartition_mem_ratio(&self) -> f64 {
+        self.option(OPTION_KEY_REPARTITION_MEM_RATIO)
+            .and_then(|x| x.parse::<f64>().ok())
+            .unwrap_or(0.0) // not use
+    }
+}
+
+impl Debug for LakeSoulIOConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut debug = f.debug_struct("LakeSoulIOConfig");
+        macro_rules! field {
+            ($name:ident) => {
+                debug.field(stringify!($name), &self.$name);
+            };
+        }
+        macro_rules! container {
+            ($name:ident) => {
+                if !self.$name.is_empty() {
+                    debug.field(stringify!($name), &self.$name);
+                }
+            };
+        }
+
+        field!(prefix);
+        container!(files);
+        container!(primary_keys);
+        container!(hash_partitioning_columns);
+        container!(vector_columns);
+        container!(column_policies);
+        container!(resolved_index_shards);
+        container!(index_leases);
+        container!(range_partitions);
+        field!(hash_bucket_num);
+        container!(columns);
+        container!(aux_sort_cols);
+        container!(filter_strs);
+        container!(filters);
+        container!(filter_protos);
+        container!(filter_buf);
+        field!(batch_size);
+        field!(max_row_group_size);
+        field!(max_row_group_num_values);
+        field!(prefetch_size);
+        field!(target_schema);
+        field!(partition_schema);
+        container!(object_store_options);
+        container!(merge_operators);
+        container!(default_column_value);
+        field!(thread_num);
+        field!(default_fs);
+        container!(options);
+        field!(use_dynamic_partition);
+        field!(inferring_schema);
+        field!(max_file_size);
+        field!(file_rolling_rows);
+        field!(file_rolling_bytes);
+        field!(seed);
+        field!(memory_buffer_capacity);
+        field!(multipart_chunk_size);
+        field!(receiver_capacity);
+        debug.finish()
+    }
+}
+
+#[derive(Debug, Default, Clone)]
+/// Builder for LakeSoulIOConfig
+///
+/// This struct provides a fluent builder interface for creating LakeSoulIOConfig instances.
+/// It allows for setting various configuration options using method chaining.
+pub struct LakeSoulIOConfigBuilder {
+    config: LakeSoulIOConfig,
+}
+
+impl LakeSoulIOConfigBuilder {
+    /// Creates a new LakeSoulIOConfigBuilder instance with default configuration
+    ///
+    /// # Returns
+    ///
+    /// A new LakeSoulIOConfigBuilder instance with default configuration
+    pub fn new() -> Self {
+        LakeSoulIOConfigBuilder {
+            config: LakeSoulIOConfig::default(),
+        }
+    }
+
+    /// Creates a new LakeSoulIOConfigBuilder instance with object store options
+    ///
+    /// # Arguments
+    ///
+    /// * `options` - A HashMap of string key-value pairs representing object store options
+    ///
+    pub fn new_with_object_store_options(options: HashMap<String, String>) -> Self {
+        let mut builder = LakeSoulIOConfigBuilder::new();
+        builder.config.object_store_options = SecretMap::from_map(options);
+        builder
+    }
+
+    pub fn schema(&self) -> SchemaRef {
+        self.config.target_schema()
+    }
+
+    pub fn primary_keys_slice(&self) -> &[String] {
+        self.config.primary_keys_slice()
+    }
+
+    pub fn aux_sort_cols_slice(&self) -> &[String] {
+        self.config.aux_sort_cols_slice()
+    }
+
+    pub fn prefix(&self) -> &String {
+        &self.config.prefix
+    }
+
+    pub fn object_store_options(&self) -> &SecretMap {
+        &self.config.object_store_options
+    }
+
+    /// Sets the prefix for the file path
+    ///
+    /// # Arguments
+    ///
+    /// * `prefix` - The prefix for the file path
+    pub fn with_prefix(mut self, prefix: String) -> Self {
+        self.config.prefix = prefix;
+        self
+    }
+
+    /// Adds a file path to the list of files to read or write
+    ///
+    /// # Arguments
+    ///
+    /// * `file` - The file path to add
+    pub fn with_file(mut self, file: impl Into<String>) -> Self {
+        self.config.files.push(file.into());
+        self
+    }
+
+    /// Adds a list of file paths to the list of files to read or write
+    ///
+    /// # Arguments
+    ///
+    /// * `files` - The list of file paths to add
+    pub fn with_files(mut self, files: Vec<impl ToString>) -> Self {
+        let files = files.into_iter().map(|x| x.to_string()).collect();
+        self.config.files = files;
+        self
+    }
+
+    /// Adds a primary key to the list of primary keys
+    ///
+    /// # Arguments
+    ///
+    /// * `pks` - The primary key to add
+    pub fn with_primary_key(mut self, pks: impl Into<String>) -> Self {
+        self.config.primary_keys.push(pks.into());
+        self
+    }
+
+    /// Adds a list of primary keys to the list of primary keys
+    ///
+    /// # Arguments
+    ///
+    /// * `pks` - The list of primary keys to add
+    pub fn with_primary_keys(mut self, pks: Vec<String>) -> Self {
+        self.config.primary_keys = pks;
+        self
+    }
+
+    /// Sets the columns used for hash partitioning.
+    ///
+    /// They must be a prefix of the primary keys. When unset (or empty) the
+    /// primary keys are used, which is the behaviour regular tables rely on.
+    ///
+    /// # Arguments
+    ///
+    /// * `columns` - The bucket columns
+    pub fn with_hash_partitioning_columns(mut self, columns: Vec<String>) -> Self {
+        self.config.hash_partitioning_columns = columns;
+        self
+    }
+
+    /// Sets the vector index columns of the table; writers give these
+    /// columns small row blocks for cheap row-index fetches.
+    pub fn with_vector_columns(mut self, columns: Vec<String>) -> Self {
+        self.config.vector_columns = columns;
+        self
+    }
+
+    /// Sets one column's write layout override.
+    pub fn with_column_policy(
+        mut self,
+        column: impl Into<String>,
+        policy: ColumnPolicy,
+    ) -> Self {
+        self.config.column_policies.insert(column.into(), policy);
+        self
+    }
+
+    /// Replaces all column write layout overrides.
+    pub fn with_column_policies(
+        mut self,
+        policies: HashMap<String, ColumnPolicy>,
+    ) -> Self {
+        self.config.column_policies = policies;
+        self
+    }
+
+    /// Supplies the caller-resolved index commits for index search.
+    pub fn with_resolved_index_shards(
+        mut self,
+        shards: Vec<crate::index::commit::ResolvedIndex>,
+    ) -> Self {
+        self.config.resolved_index_shards = shards;
+        self
+    }
+
+    /// Holds leases for the resolved index shards for the reader's lifetime.
+    pub fn with_index_leases(
+        mut self,
+        leases: Vec<Arc<crate::index::IndexLease>>,
+    ) -> Self {
+        self.config.index_leases = leases;
+        self
+    }
+
+    /// Adds a range partition to the list of range partitions
+    ///
+    /// # Arguments
+    ///
+    /// * `range_partition` - The range partition to add
+    pub fn with_range_partition(mut self, range_partition: String) -> Self {
+        self.config.range_partitions.push(range_partition);
+        self
+    }
+
+    /// Adds a list of range partitions to the list of range partitions
+    ///
+    /// # Arguments
+    ///
+    /// * `range_partitions` - The list of range partitions to add
+    pub fn with_range_partitions(mut self, range_partitions: Vec<String>) -> Self {
+        self.config.range_partitions = range_partitions;
+        self
+    }
+
+    /// Sets the number of hash buckets for partitioning
+    ///
+    /// # Arguments
+    ///
+    /// * `hash_bucket_num` - The number of hash buckets for partitioning
+    pub fn with_hash_bucket_num(mut self, hash_bucket_num: impl Into<String>) -> Self {
+        self.config.hash_bucket_num = hash_bucket_num.into();
+        self
+    }
+
+    /// Adds a column to the list of columns to select
+    ///
+    /// # Arguments
+    ///
+    /// * `col` - The column to add
+    #[deprecated(
+        since = "2.5.0",
+        note = "This method is deprecated. Use target_schema instead."
+    )]
+    #[allow(deprecated)]
+    pub fn with_column(mut self, col: String) -> Self {
+        self.config.columns.push(String::from(&col));
+        self
+    }
+
+    /// Adds an auxiliary sort column to the list of auxiliary sort columns
+    ///
+    /// # Arguments
+    ///
+    /// * `col` - The auxiliary sort column to add
+    pub fn with_aux_sort_column(mut self, col: String) -> Self {
+        self.config.aux_sort_cols.push(String::from(&col));
+        self
+    }
+
+    /// Sets the number of rows per batch for reading/writing
+    ///
+    /// # Arguments
+    ///
+    /// * `batch_size` - The number of rows per batch for reading/writing
+    pub fn with_batch_size(mut self, batch_size: usize) -> Self {
+        self.config.batch_size = batch_size;
+        self
+    }
+
+    /// Sets the maximum number of rows per row group when writing
+    ///
+    /// # Arguments
+    ///
+    /// * `max_row_group_size` - The maximum number of rows per row group when writing
+    pub fn with_max_row_group_size(mut self, max_row_group_size: usize) -> Self {
+        self.config.max_row_group_size = max_row_group_size;
+        self
+    }
+
+    /// Sets the maximum number of values per row group when writing
+    ///
+    /// # Arguments
+    ///
+    /// * `max_row_group_num_values` - The maximum number of values per row group when writing
+    pub fn with_max_row_group_num_values(
+        mut self,
+        max_row_group_num_values: usize,
+    ) -> Self {
+        self.config.max_row_group_num_values = max_row_group_num_values;
+        self
+    }
+
+    /// Sets the number of batches to prefetch
+    ///
+    /// # Arguments
+    ///
+    /// * `prefetch_size` - The number of batches to prefetch
+    pub fn with_prefetch_size(mut self, prefetch_size: usize) -> Self {
+        self.config.prefetch_size = prefetch_size;
+        self
+    }
+
+    /// Sets the largest `pk IN (...)` candidate set the pk index resolves.
+    ///
+    /// Above this many candidates the scan falls back to the regular path.
+    /// The default ([`crate::pk_locator::MAX_PK_CANDIDATES`]) suits point
+    /// lookups; IVM refreshes raise it for their key-filtered state reads.
+    pub fn with_max_pk_candidates(mut self, max_pk_candidates: usize) -> Self {
+        self.config.max_pk_candidates = max_pk_candidates;
+        self
+    }
+
+    /// Answers large candidate sets with the sorted index merge.
+    ///
+    /// One binary search per key costs `keys * log(rows)` per file, which
+    /// stops paying off for the candidate sets of an incremental refresh
+    /// (thousands to hundreds of thousands of keys over many files).  The
+    /// merge answers them in one pass: `rows + keys` per file.
+    pub fn with_bulk_pk_lookup(mut self, bulk_pk_lookup: bool) -> Self {
+        self.config.bulk_pk_lookup = bulk_pk_lookup;
+        self
+    }
+
+    #[deprecated(
+        since = "2.5.0",
+        note = "This method is deprecated. Use target_schema instead."
+    )]
+    #[allow(deprecated)]
+    pub fn with_columns(mut self, cols: Vec<String>) -> Self {
+        self.config.columns = cols;
+        self
+    }
+
+    /// Sets the target Arrow schema for the reader and writer
+    ///
+    /// # Arguments
+    ///
+    /// * `schema` - The target Arrow schema to set
+    pub fn with_schema(mut self, schema: SchemaRef) -> Self {
+        self.config.target_schema = IOSchema(schema);
+        self
+    }
+
+    /// Sets the Arrow schema for partition columns
+    ///
+    /// # Arguments
+    ///
+    /// * `schema` - The Arrow schema for partition columns to set
+    pub fn with_partition_schema(mut self, schema: SchemaRef) -> Self {
+        self.config.partition_schema = IOSchema(schema);
+        self
+    }
+
+    /// Adds a filter string to the list of filter strings
+    ///
+    /// # Arguments
+    ///
+    /// * `filter_str` - The filter string to add
+    pub fn with_filter_str(mut self, filter_str: String) -> Self {
+        self.config.filter_strs.push(filter_str);
+        self
+    }
+
+    /// Adds a filter proto to the list of filter protos
+    ///
+    /// # Arguments
+    ///
+    /// * `filter_proto` - The filter proto to add
+    pub fn with_filter_proto(mut self, filter_proto: Plan) -> Self {
+        self.config.filter_protos.push(filter_proto);
+        self
+    }
+
+    /// Adds a filter protobuf to the list of filter bufs
+    ///
+    /// # Arguments
+    ///
+    /// * `filter_buf` - The filter proto buf to add
+    pub fn with_filter_buf(mut self, filter_buf: Vec<u8>) -> Self {
+        self.config.filter_buf.push(filter_buf);
+        self
+    }
+
+    #[deprecated(
+        since = "2.5.0",
+        note = "This method is deprecated. Use with_filter_str and with_filter_proto instead."
+    )]
+    #[allow(deprecated)]
+    pub fn with_filters(mut self, filters: Vec<Expr>) -> Self {
+        self.config.filters = filters;
+        self
+    }
+
+    /// Adds a merge operator to the list of merge operators
+    ///
+    /// # Arguments
+    ///
+    /// * `field_name` - The field name to add the merge operator to
+    /// * `merge_op` - The merge operator to add
+    pub fn with_merge_op(mut self, field_name: String, merge_op: String) -> Self {
+        self.config.merge_operators.insert(field_name, merge_op);
+        self
+    }
+
+    /// Sets the default value for a column
+    ///
+    /// # Arguments
+    ///
+    /// * `field_name` - The field name to set the default value for
+    /// * `value` - The default value to set
+    pub fn with_default_column_value(
+        mut self,
+        field_name: impl Into<String>,
+        value: impl Into<String>,
+    ) -> Self {
+        self.config
+            .default_column_value
+            .insert(field_name.into(), value.into());
+        self
+    }
+
+    /// Adds an object store option
+    ///
+    /// # Arguments
+    ///
+    /// * `key` - The key to add the object store option for
+    /// * `value` - The value to add the object store option for
+    pub fn with_object_store_option(
+        mut self,
+        key: impl Into<String>,
+        value: impl Into<String>,
+    ) -> Self {
+        self.config
+            .object_store_options
+            .insert(key.into(), value.into());
+        self
+    }
+
+    /// Adds an option
+    ///
+    /// # Arguments
+    ///
+    /// * `key` - The key to add the option for
+    /// * `value` - The value to add the option for
+    pub fn with_option(mut self, key: impl ToString, value: impl ToString) -> Self {
+        self.config
+            .options
+            .insert(key.to_string(), value.to_string());
+        self
+    }
+
+    /// Sets the physical file format for writers.
+    pub fn with_physical_format(mut self, format: PhysicalFormat) -> Self {
+        self.config
+            .options
+            .insert(OPTION_KEY_PHYSICAL_FORMAT.to_string(), format.to_string());
+        self
+    }
+
+    /// Sets the number of threads for parallel processing
+    ///
+    /// # Arguments
+    ///
+    /// * `thread_num` - The number of threads for parallel processing
+    pub fn with_thread_num(mut self, thread_num: usize) -> Self {
+        self.config.thread_num = thread_num;
+        self
+    }
+
+    /// Sets whether to use dynamic partitioning
+    ///
+    /// # Arguments
+    ///
+    /// * `enable` - Whether to use dynamic partitioning
+    pub fn set_dynamic_partition(mut self, enable: bool) -> Self {
+        self.config.use_dynamic_partition = enable;
+        self
+    }
+
+    /// Sets whether to infer schema from data
+    ///
+    /// # Arguments
+    ///
+    /// * `enable` - Whether to infer schema from data
+    pub fn set_inferring_schema(mut self, enable: bool) -> Self {
+        self.config.inferring_schema = enable;
+        self
+    }
+
+    /// Sets the maximum file size
+    ///
+    /// # Arguments
+    ///
+    /// * `size` - The maximum file size to set
+    pub fn with_max_file_size(mut self, size: u64) -> Self {
+        self.config.max_file_size = Some(size);
+        self
+    }
+
+    /// Set the number of rows in one sorted write window (0 disables).
+    pub fn with_file_rolling_rows(mut self, rows: usize) -> Self {
+        self.config.file_rolling_rows = rows;
+        self
+    }
+
+    /// Set the Arrow memory budget in one sorted write window (0 disables).
+    pub fn with_file_rolling_bytes(mut self, bytes: u64) -> Self {
+        self.config.file_rolling_bytes = bytes;
+        self
+    }
+
+    /// Sets the random number generator seed for Local Sensitive Hash
+    ///
+    /// # Arguments
+    ///
+    /// * `seed` - The random number generator seed to set
+    pub fn with_seed(mut self, seed: u64) -> Self {
+        self.config.seed = seed;
+        self
+    }
+
+    /// Sets the capacity for In Memory Buffer
+    ///
+    /// # Arguments
+    ///
+    /// * `capacity` - The capacity for memory buffer
+    pub fn with_memory_buffer_capacity(mut self, capacity: usize) -> Self {
+        self.config.memory_buffer_capacity = capacity;
+        self
+    }
+
+    /// Sets the chunk size for multipart upload
+    ///
+    /// # Arguments
+    ///
+    /// * `chunk_size` - size used by multipart writer
+    pub fn with_multipart_chunk_size(mut self, chunk_size: usize) -> Self {
+        self.config.multipart_chunk_size = chunk_size;
+        self
+    }
+
+    /// Sets the capacity for receiver
+    ///
+    /// # Arguments
+    ///
+    /// * `capacity` - receiver's buffer capacity
+    pub fn with_receiver_capacity(mut self, capacity: usize) -> Self {
+        self.config.receiver_capacity = capacity;
+        self
+    }
+
+    /// Builds the LakeSoulIOConfig instance
+    ///
+    /// # Returns
+    ///
+    /// The built LakeSoulIOConfig instance
+    pub fn build(self) -> LakeSoulIOConfig {
+        self.config
+    }
+}
+
+impl LakeSoulIOConfig {
+    /// Get filter in datafusion logical expr
+    ///
+    /// This will consume all filters
+    pub async fn get_filter_exprs(&mut self, table_schema: &Schema) -> Result<Vec<Expr>> {
+        let filter_strs = std::mem::take(&mut self.filter_strs);
+        let filters = std::mem::take(&mut self.filters);
+        let filter_protos = std::mem::take(&mut self.filter_protos);
+        let filter_bufs = std::mem::take(&mut self.filter_buf);
+        let iter = filter_strs
+            .into_iter()
+            .map(FilterContainer::String)
+            .chain(filter_protos.into_iter().map(FilterContainer::Plan))
+            .chain(filter_bufs.into_iter().map(FilterContainer::RawBuf));
+
+        let df_schema = DFSchema::try_from(table_schema.clone())?;
+
+        let mut exprs: Vec<Expr> = filters;
+
+        let dummy_ctx = datafusion::prelude::SessionContext::new();
+
+        for container in iter {
+            exprs.extend(
+                Parser::parse_filter_container(&dummy_ctx, &df_schema, container).await?,
+            );
+        }
+        let exprs = exprs
+            .into_iter()
+            .map(|expr| coerce_filter_type(expr, &df_schema))
+            .collect::<Result<Vec<_>>>()?;
+
+        debug!("parser filter exprs: {}", exprs.iter().format(","));
+
+        Ok(exprs)
+    }
+}
+
+impl From<LakeSoulIOConfig> for LakeSoulIOConfigBuilder {
+    fn from(val: LakeSoulIOConfig) -> Self {
+        LakeSoulIOConfigBuilder { config: val }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn with_hash_bucket_num_sets_config_field() {
+        let config = LakeSoulIOConfigBuilder::new()
+            .with_hash_bucket_num("4")
+            .build();
+
+        assert_eq!(config.hash_bucket_num, "4");
+        assert_eq!(config.hash_bucket_num(), 4);
+        assert_eq!(config.get_hash_bucket_num().unwrap(), 4);
+    }
+
+    #[test]
+    fn hash_bucket_num_clamps_non_positive_values() {
+        let config = LakeSoulIOConfigBuilder::new()
+            .with_hash_bucket_num("-1")
+            .build();
+
+        assert_eq!(config.hash_bucket_num(), 1);
+        assert_eq!(config.get_hash_bucket_num().unwrap(), 1);
+    }
+
+    #[test]
+    fn hash_partitioning_falls_back_to_primary_keys() {
+        let config = LakeSoulIOConfigBuilder::new()
+            .with_primary_keys(vec!["k".to_string(), "row_id".to_string()])
+            .build();
+
+        assert_eq!(
+            config.hash_partitioning_columns_slice(),
+            &["k".to_string(), "row_id".to_string()]
+        );
+    }
+
+    #[test]
+    fn with_hash_partitioning_columns_overrides_primary_keys() {
+        let config = LakeSoulIOConfigBuilder::new()
+            .with_primary_keys(vec!["k".to_string(), "row_id".to_string()])
+            .with_hash_partitioning_columns(vec!["k".to_string()])
+            .build();
+
+        assert_eq!(config.hash_partitioning_columns_slice(), &["k".to_string()]);
+        assert_eq!(
+            config.primary_keys_slice(),
+            &["k".to_string(), "row_id".to_string()]
+        );
+    }
+}

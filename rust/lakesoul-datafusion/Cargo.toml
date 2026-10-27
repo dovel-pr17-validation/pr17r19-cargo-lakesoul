@@ -1,0 +1,115 @@
+# SPDX-FileCopyrightText: 2023 LakeSoul Contributors
+#
+# SPDX-License-Identifier: Apache-2.0
+
+[package]
+name = "lakesoul-datafusion"
+version = { workspace = true }
+publish = false
+edition = { workspace = true }
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+[dependencies]
+# lakesoul
+lakesoul-build-info = { path = "../lakesoul-build-info" }
+lakesoul-io = { path = "../lakesoul-io" }
+lakesoul-metadata = { path = "../lakesoul-metadata" }
+lakesoul-common = { path = "../lakesoul-common" }
+lakesoul-observability = { path = "../lakesoul-observability" }
+lakesoul-metadata-proto = { path = "../lakesoul-metadata-proto" }
+lakesoul-vector = { path = "../lakesoul-vector" }
+lakesoul-text = { path = "../lakesoul-text" }
+# datafusion
+datafusion = { workspace = true }
+datafusion-expr = { workspace = true }
+datafusion-common = { workspace = true }
+datafusion-proto = { workspace = true }
+datafusion-datasource = { workspace = true }
+http = { workspace = true }
+datafusion-distributed = { workspace = true }
+# arrow
+arrow = { workspace = true }
+arrow-cast = { workspace = true }
+arrow-arith = { workspace = true }
+arrow-ipc = { workspace = true }
+arrow-flight = { workspace = true }
+parquet = { workspace = true }
+object_store = { workspace = true }
+# vortex (scan codec for distributed execution)
+vortex-datafusion = { workspace = true }
+# protobuf
+prost = { workspace = true }
+# async
+futures = { workspace = true }
+async-trait = { workspace = true }
+# runtime
+tokio = { workspace = true }
+tokio-stream = { workspace = true }
+tonic = { workspace = true }
+# kubernetes worker discovery
+reqwest = { workspace = true, features = ["json"] }
+parking_lot = { workspace = true }
+# cli
+clap = { workspace = true }
+# rand
+rand = { workspace = true }
+# utils
+uuid = { workspace = true }
+bytes = { workspace = true }
+url = { workspace = true }
+# time
+chrono = { workspace = true }
+# serialization
+serde = { workspace = true }
+serde_json = { workspace = true }
+serde-aux = "4.6.0"
+json = "0.12"
+# tpch
+tpchgen = { git = "https://github.com/clflushopt/tpchgen-rs.git", rev = "46f3dca" }
+tpchgen-arrow = { git = "https://github.com/clflushopt/tpchgen-rs.git", rev = "46f3dca" }
+# adbc
+adbc_core = { version = "0.23.0", optional = true }
+adbc_driver_manager = { version = "0.23.0", optional = true }
+# observability
+metrics = { workspace = true }
+opentelemetry = { version = "0.32.0", default-features = false, features = [
+  "trace",
+] }
+tower = "0.5"
+tracing-opentelemetry = "0.33.0"
+# logging
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+log = { workspace = true }
+# error
+rootcause = { workspace = true }
+downcast-rs = "2"
+
+[dev-dependencies]
+ctor = "0.4"
+# Captures the write-path metrics in the unit tests.
+metrics-exporter-prometheus = { workspace = true }
+# The W3C propagator used by the global text-map propagator normally installed
+# by `lakesoul-observability::init_tracing`; tests install it themselves.
+opentelemetry_sdk = { version = "0.32.1", default-features = false, features = [
+  "trace",
+] }
+test-log = { workspace = true }
+rand = { workspace = true }
+# `Float16` vector storage samples in the vector benchmark.
+half = { workspace = true }
+
+[[bench]]
+name = "vector_rebuild_bench"
+harness = false
+
+[[bench]]
+name = "text_index_bench"
+harness = false
+
+[features]
+ci = []
+adbc = ["dep:adbc_core", "dep:adbc_driver_manager"]
+
+[lints]
+workspace = true

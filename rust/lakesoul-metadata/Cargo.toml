@@ -1,0 +1,65 @@
+# SPDX-FileCopyrightText: 2023 LakeSoul Contributors
+#
+# SPDX-License-Identifier: Apache-2.0
+
+[package]
+name = "lakesoul-metadata"
+version = { workspace = true }
+publish = false
+edition = { workspace = true }
+
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+# pg
+postgres = "0.19.5"
+tokio-postgres = { version = "0.7.8", features = [
+  "default",
+  "with-serde_json-1",
+  "with-uuid-1",
+  "array-impls",
+  "with-chrono-0_4",
+] }
+bb8-postgres = "0.8.1"
+postgres-types = { version = "0.2.5", features = ["derive"] }
+# utils
+bytes = { workspace = true }
+# time
+chrono = { workspace = true }
+# async
+async-trait = { workspace = true }
+# runtime
+tokio = { workspace = true }
+# serialization
+serde = { workspace = true }
+serde_json = { workspace = true }
+# protobuf
+lakesoul-metadata-proto = { path = "../lakesoul-metadata-proto" }
+prost = { workspace = true }
+# shared index kind descriptors
+lakesoul-common = { path = "../lakesoul-common" }
+# cache
+cached = { workspace = true }
+# web
+jsonwebtoken = { workspace = true }
+# utils
+num_enum = "0.5.1"
+uuid = { workspace = true }
+url = { workspace = true }
+regex = { workspace = true }
+md5 = "0.7.0"
+# observability
+metrics = { workspace = true }
+tracing = { workspace = true }
+# error
+rootcause = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+metrics-exporter-prometheus = { workspace = true }
+test-log = { workspace = true, features = ["trace"] }
+tracing-subscriber = { workspace = true }
+
+[lints]
+workspace = true

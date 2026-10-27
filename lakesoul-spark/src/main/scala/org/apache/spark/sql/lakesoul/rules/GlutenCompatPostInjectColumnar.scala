@@ -1,0 +1,84 @@
+// SPDX-FileCopyrightText: 2023 LakeSoul Contributors
+//
+// SPDX-License-Identifier: Apache-2.0
+
+package org.apache.spark.sql.lakesoul.rules
+
+import org.apache.spark.internal.Logging
+import org.apache.spark.sql.SparkSession
+import org.apache.spark.sql.catalyst.rules.Rule
+import org.apache.spark.sql.connector.read.Scan
+import org.apache.spark.sql.execution.datasources.v2.BatchScanExec
+import org.apache.spark.sql.execution.datasources.v2.merge.{
+  MergeDeltaLakeSoulScan,
+  OnePartitionMergeBucketScan
+}
+import org.apache.spark.sql.execution.{
+  ColumnarRule,
+  ColumnarToRowExec,
+  SparkPlan,
+  UnaryExecNode
+}
+import org.apache.spark.sql.vectorized.GlutenUtils
+
+/** To be compatible with Gluten, we remove RowToVeloxColumnar and ColumnarToRow
+  * wraps for lakesoul's batch scan, since lakesoul has already read data as
+  * arrow vectors.
+  *
+  * @param session
+  */
+case class GlutenCompatPostInjectColumnar(session: SparkSession)
+    extends ColumnarRule
+    with Logging {
+
+  private def isLakeSoulScan(scan: Scan): Boolean = {
+    scan.getClass.getSimpleName.contains("NativeScan") ||
+    scan.isInstanceOf[MergeDeltaLakeSoulScan] ||
+    scan.isInstanceOf[OnePartitionMergeBucketScan]
+  }
+
+  private lazy val offloadExecCtor = {
+    val cls = Class.forName("org.apache.spark.sql.execution.OffloadToVeloxExec")
+    cls.getConstructor(classOf[SparkPlan])
+  }
+
+  private def transform(plan: SparkPlan): SparkPlan = plan match {
+    case UnaryExecNode(plan, ColumnarToRowExec(BatchScan(scan)))
+        if plan.getClass.getName == "org.apache.gluten.execution.RowToVeloxColumnarExec" &&
+          isLakeSoulScan(scan match {
+            case scan: BatchScanExec         => scan.scan
+            case w: withPartitionAndOrdering =>
+              w.child.asInstanceOf[BatchScanExec].scan
+            case _ =>
+              throw new IllegalArgumentException(
+                s"Unknown scan type: ${scan.getClass.getSimpleName}"
+              )
+          }) =>
+      val args = Array[AnyRef](scan)
+      val newPlan =
+        offloadExecCtor.newInstance(args: _*).asInstanceOf[SparkPlan]
+      logInfo(
+        s"Replace RowToVeloxColumnarExec with OffloadArrowDataExec for LakeSoul:\nOriginal:\n${plan}New:\n${newPlan}"
+      )
+      newPlan
+    case p =>
+      p.withNewChildren(p.children.map(transform))
+  }
+
+  override def postColumnarTransitions: Rule[SparkPlan] = plan => {
+    if (GlutenUtils.isGlutenEnabled)
+      transform(plan)
+    else
+      plan
+  }
+}
+
+object BatchScan {
+  def unapply(plan: SparkPlan): Option[SparkPlan] = {
+    plan match {
+      case scan: BatchScanExec         => Some(scan)
+      case w: withPartitionAndOrdering => Some(w)
+      case _                           => None
+    }
+  }
+}

@@ -1,0 +1,635 @@
+# SPDX-FileCopyrightText: 2026 LakeSoul Contributors
+#
+# SPDX-License-Identifier: Apache-2.0
+from __future__ import annotations
+
+import importlib
+
+import numpy as np
+import pyarrow as pa
+import pytest
+
+import lakesoul.embodied.dataset as dataset_module
+
+align_module = importlib.import_module("lakesoul.embodied.align")
+from lakesoul.arrow import LakeSoulScanConfig
+from lakesoul.embodied import EmbodiedDataset, SecondaryStream, Window, align
+from lakesoul.embodied.dataset import _as_window, plan_anchor_order
+from lakesoul.metadata import LakeSoulScanPlanPartition
+
+SCHEMA = pa.schema(
+    [
+        pa.field("state", pa.int64()),
+        pa.field("action", pa.int64()),
+        pa.field("image", pa.binary()),
+    ]
+)
+
+
+def _table(rows: int, offset: int = 0) -> pa.Table:
+    values = np.arange(offset, offset + rows, dtype=np.int64)
+    return pa.table(
+        {
+            "state": pa.array(values, type=pa.int64()),
+            "action": pa.array(values * 10, type=pa.int64()),
+            "image": pa.array(
+                [f"img-{value}".encode() for value in values], type=pa.binary()
+            ),
+        }
+    )
+
+
+def _unit(episode: str, file: str) -> LakeSoulScanPlanPartition:
+    return LakeSoulScanPlanPartition(
+        files=[file],
+        primary_keys=[],
+        partition_info=[("episode_id", episode)],
+    )
+
+
+class _FakeTable:
+    partition_by = ("episode_id",)
+
+
+class _FakeScan:
+    def __init__(
+        self, units: list[LakeSoulScanPlanPartition], schema: pa.Schema = SCHEMA
+    ) -> None:
+        self._units = tuple(units)
+        self._config = LakeSoulScanConfig(
+            table_name="episodes",
+            namespace="default",
+            schema=schema,
+            partition_schema=None,
+            scan_partitions=self._units,
+            partitions={},
+            object_store_options={},
+        )
+        self.table = _FakeTable()
+
+    def scan_plan(self):
+        return self._units
+
+    def to_scan_config(self) -> LakeSoulScanConfig:
+        return self._config
+
+
+class _FakeArrowDataset:
+    def __init__(self, table: pa.Table) -> None:
+        self._table = table
+
+    def to_table(self, columns=None, **kwargs) -> pa.Table:
+        if columns is None:
+            return self._table
+        return self._table.select(columns)
+
+
+def _install_reader(monkeypatch, tables: dict[str, pa.Table]) -> list[str]:
+    reads: list[str] = []
+
+    def fake_lakesoul_dataset(config: LakeSoulScanConfig) -> _FakeArrowDataset:
+        (unit,) = config.scan_partitions
+        reads.append(unit.files[0])
+        return _FakeArrowDataset(tables[unit.files[0]])
+
+    monkeypatch.setattr(dataset_module, "lakesoul_dataset", fake_lakesoul_dataset)
+    monkeypatch.setattr(align_module, "lakesoul_dataset", fake_lakesoul_dataset)
+    return reads
+
+
+def _dataset(
+    monkeypatch,
+    units: list[LakeSoulScanPlanPartition],
+    tables: dict[str, pa.Table],
+    **kwargs,
+) -> tuple[EmbodiedDataset, list[str]]:
+    reads = _install_reader(monkeypatch, tables)
+    return EmbodiedDataset(_FakeScan(units), **kwargs), reads
+
+
+def _anchor_of(sample: dict[str, np.ndarray]) -> int:
+    """Anchors are recoverable because state is ``[anchor - 2, anchor)``."""
+    return int(sample["state"][-1]) + 1
+
+
+def test_iter_epoch_matches_naive_slicing(monkeypatch) -> None:
+    unit = _unit("a", "file-a")
+    dataset, _ = _dataset(
+        monkeypatch,
+        [unit],
+        {"file-a": _table(10)},
+        window={"state": (-2, 0), "action": (0, 2)},
+        stride=3,
+    )
+
+    samples = list(dataset.iter_epoch(0))
+
+    assert {tuple(sample["state"]) for sample in samples} == {(1, 2), (4, 5)}
+    assert {tuple(sample["action"]) for sample in samples} == {(30, 40), (60, 70)}
+    assert {_anchor_of(sample) for sample in samples} == {3, 6}
+
+
+def test_seed_reproduces_and_epoch_reshuffles(monkeypatch) -> None:
+    unit = _unit("a", "file-a")
+    window = {"state": (0, 1)}
+    tables = {"file-a": _table(200)}
+
+    first, _ = _dataset(monkeypatch, [unit], tables, window=window, seed=7)
+    second, _ = _dataset(monkeypatch, [unit], tables, window=window, seed=7)
+    other, _ = _dataset(monkeypatch, [unit], tables, window=window, seed=8)
+
+    epoch0 = [int(sample["state"][0]) for sample in first.iter_epoch(0)]
+    assert epoch0 == [int(sample["state"][0]) for sample in second.iter_epoch(0)]
+    assert epoch0 != [int(sample["state"][0]) for sample in other.iter_epoch(0)]
+    assert epoch0 != [int(sample["state"][0]) for sample in first.iter_epoch(1)]
+    assert sorted(epoch0) == list(range(200))
+
+
+def test_rank_shards_are_disjoint_and_complete(monkeypatch) -> None:
+    units = [_unit("a", "file-a"), _unit("b", "file-b")]
+    tables = {"file-a": _table(10), "file-b": _table(6, offset=100)}
+    window = {"state": (0, 1)}
+    world_size = 3
+
+    per_rank = []
+    for rank in range(world_size):
+        dataset, _ = _dataset(
+            monkeypatch, units, tables, window=window, seed=3, stride=2
+        )
+        per_rank.append(
+            {
+                int(sample["state"][0])
+                for sample in dataset.iter_epoch(0, rank=rank, world_size=world_size)
+            }
+        )
+
+    union = set().union(*per_rank)
+    assert sum(len(shard) for shard in per_rank) == len(union)
+    assert union == set(range(0, 10, 2)) | set(range(100, 106, 2))
+
+
+def test_rank_sharding_reads_only_assigned_units(monkeypatch) -> None:
+    units = [_unit(name, f"file-{name}") for name in ("a", "b", "c", "d")]
+    tables = {f"file-{name}": _table(4) for name in ("a", "b", "c", "d")}
+    window = {"state": (0, 1)}
+
+    reads_by_rank = []
+    for rank in range(2):
+        dataset, reads = _dataset(monkeypatch, units, tables, window=window, seed=1)
+        list(dataset.iter_epoch(0, rank=rank, world_size=2))
+        reads_by_rank.append(reads)
+
+    first, second = reads_by_rank
+    assert len(first) == len(second) == 2
+    assert set(first).isdisjoint(second)
+    assert set(first) | set(second) == {f"file-{name}" for name in ("a", "b", "c", "d")}
+
+
+def test_boundary_skip_drops_and_clamp_keeps_edge_anchors(monkeypatch) -> None:
+    unit = _unit("a", "file-a")
+    tables = {"file-a": _table(10)}
+    window = {"state": (-3, 1)}
+
+    skipped, _ = _dataset(
+        monkeypatch, [unit], tables, window=window, stride=9, boundary="skip"
+    )
+    assert [int(sample["state"][-1]) for sample in skipped.iter_epoch(0)] == [9]
+
+    clamped, _ = _dataset(
+        monkeypatch, [unit], tables, window=window, stride=9, boundary="clamp"
+    )
+    samples = sorted(sample["state"].tolist() for sample in clamped.iter_epoch(0))
+    assert samples == [[0], [6, 7, 8, 9]]
+
+
+def test_episode_filter_and_unknown_episode(monkeypatch) -> None:
+    units = [_unit("a", "file-a"), _unit("b", "file-b")]
+    tables = {"file-a": _table(4), "file-b": _table(4, offset=100)}
+    dataset, reads = _dataset(
+        monkeypatch,
+        units,
+        tables,
+        window={"state": (0, 1)},
+        episodes=["b"],
+    )
+
+    samples = list(dataset.iter_epoch(0))
+
+    assert len(samples) == 4
+    assert all(int(sample["state"][0]) >= 100 for sample in samples)
+    assert reads == ["file-b"]
+
+    with pytest.raises(ValueError, match="episodes not found"):
+        _dataset(
+            monkeypatch,
+            units,
+            tables,
+            window={"state": (0, 1)},
+            episodes=["missing"],
+        )
+
+
+def test_set_epoch_drives_iter(monkeypatch) -> None:
+    unit = _unit("a", "file-a")
+    dataset, _ = _dataset(
+        monkeypatch, [unit], {"file-a": _table(50)}, window={"state": (0, 1)}
+    )
+    dataset.set_epoch(2)
+
+    assert [int(sample["state"][0]) for sample in dataset] == [
+        int(sample["state"][0]) for sample in dataset.iter_epoch(2)
+    ]
+
+
+def test_constructor_validation(monkeypatch) -> None:
+    unit = _unit("a", "file-a")
+    tables = {"file-a": _table(4)}
+
+    with pytest.raises(ValueError, match="at least one column"):
+        _dataset(monkeypatch, [unit], tables, window={})
+    with pytest.raises(ValueError, match="not found in table schema"):
+        _dataset(monkeypatch, [unit], tables, window={"missing": (0, 1)})
+    with pytest.raises(ValueError, match="boundary"):
+        _dataset(monkeypatch, [unit], tables, window={"state": (0, 1)}, boundary="pad")
+    with pytest.raises(ValueError, match="stride"):
+        _dataset(monkeypatch, [unit], tables, window={"state": (0, 1)}, stride=0)
+    with pytest.raises(ValueError, match="both set or both unset"):
+        list(
+            _dataset(monkeypatch, [unit], tables, window={"state": (0, 1)})[
+                0
+            ].iter_epoch(0, rank=0)
+        )
+    with pytest.raises(ValueError, match="out of range"):
+        list(
+            _dataset(monkeypatch, [unit], tables, window={"state": (0, 1)})[
+                0
+            ].iter_epoch(0, rank=2, world_size=2)
+        )
+
+
+def test_dataset_pickle_roundtrip(monkeypatch) -> None:
+    import pickle
+
+    unit = _unit("a", "file-a")
+    dataset, _ = _dataset(
+        monkeypatch, [unit], {"file-a": _table(20)}, window={"state": (0, 1)}, seed=3
+    )
+
+    restored = pickle.loads(pickle.dumps(dataset))
+
+    assert restored.num_units == dataset.num_units
+    assert [int(sample["state"][0]) for sample in restored] == [
+        int(sample["state"][0]) for sample in dataset
+    ]
+
+
+def test_fixed_size_list_columns_become_2d(monkeypatch) -> None:
+    values = np.arange(12, dtype=np.float32).reshape(4, 3)
+    table = pa.table(
+        {
+            "state": pa.FixedSizeListArray.from_arrays(
+                pa.array(values.reshape(-1), type=pa.float32()), 3
+            ),
+            "action": pa.array(np.arange(4, dtype=np.float32)),
+        }
+    )
+    _install_reader(monkeypatch, {"file-a": table})
+    dataset = EmbodiedDataset(
+        _FakeScan([_unit("a", "file-a")], schema=table.schema),
+        window={"state": (0, 2), "action": (0, 2)},
+    )
+
+    sample = next(iter(dataset))
+
+    assert sample["state"].shape == (2, 3)
+    np.testing.assert_allclose(sample["state"], values[:2])
+    assert sample["action"].shape == (2,)
+
+
+class _FakeEpisodeVideo:
+    def __init__(self, video: _FakeVideo, episode_id: str) -> None:
+        self._video = video
+        self._episode_id = episode_id
+
+    def frames(self, start_frame: int, end_frame: int):
+        self._video.calls.append((self._episode_id, start_frame, end_frame))
+        return self._video.payload(start_frame, end_frame)
+
+
+class _FakeVideo:
+    episode_column = "episode_id"
+
+    def __init__(self, payload) -> None:
+        self.calls: list[tuple[str, int, int]] = []
+        self.episodes: list[str] = []
+        self.payload = payload
+
+    def for_episode(self, episode_id: str) -> _FakeEpisodeVideo:
+        self.episodes.append(episode_id)
+        return _FakeEpisodeVideo(self, episode_id)
+
+
+def _camera_frame(value: float) -> np.ndarray:
+    return np.full((4, 4, 3), value, dtype=np.uint8)
+
+
+def test_video_frames_are_attached_to_samples(monkeypatch) -> None:
+    unit = _unit("a", "file-a")
+    video = _FakeVideo(
+        lambda start, end: {
+            "cam": np.stack([_camera_frame(index) for index in range(start, end)])
+        }
+    )
+    _install_reader(monkeypatch, {"file-a": _table(4)})
+    dataset = EmbodiedDataset(
+        _FakeScan([unit]),
+        window={"state": (0, 1)},
+        video=video,
+    )
+
+    samples = list(dataset.iter_epoch(0))
+
+    assert sorted(int(sample["state"][0]) for sample in samples) == [0, 1, 2, 3]
+    assert all(sample["cam"].shape == (1, 4, 4, 3) for sample in samples)
+    assert sorted(call[1:] for call in video.calls) == [
+        (0, 1),
+        (1, 2),
+        (2, 3),
+        (3, 4),
+    ]
+    assert video.episodes == ["a"]
+
+
+def test_video_window_can_follow_another_column(monkeypatch) -> None:
+    unit = _unit("a", "file-a")
+    video = _FakeVideo(
+        lambda start, end: {"cam": np.zeros((end - start, 2, 2, 3), np.uint8)}
+    )
+    _install_reader(monkeypatch, {"file-a": _table(6)})
+    dataset = EmbodiedDataset(
+        _FakeScan([unit]),
+        window={"state": (0, 1), "action": (-2, 0)},
+        video=video,
+        video_window="action",
+        boundary="clamp",
+    )
+
+    samples = list(dataset.iter_epoch(0))
+
+    assert sorted(call[1:] for call in video.calls) == [
+        (0, 1),
+        (0, 2),
+        (1, 3),
+        (2, 4),
+        (3, 5),
+    ]
+    shapes = {int(sample["state"][0]): sample["cam"].shape for sample in samples}
+    assert shapes == {
+        1: (1, 2, 2, 3),
+        2: (2, 2, 2, 3),
+        3: (2, 2, 2, 3),
+        4: (2, 2, 2, 3),
+        5: (2, 2, 2, 3),
+    }
+
+
+def test_video_validation(monkeypatch) -> None:
+    unit = _unit("a", "file-a")
+    _install_reader(monkeypatch, {"file-a": _table(4)})
+    scan = _FakeScan([unit])
+
+    with pytest.raises(ValueError, match="video_window"):
+        EmbodiedDataset(
+            scan,
+            window={"state": (0, 1)},
+            video_window="missing",  # type: ignore[arg-type]
+        )
+    with pytest.raises(ValueError, match="end > start"):
+        EmbodiedDataset(
+            scan,
+            window={"state": (0, 1)},
+            video_window=(1, 1),  # type: ignore[arg-type]
+        )
+
+
+def test_video_camera_collision(monkeypatch) -> None:
+    unit = _unit("a", "file-a")
+    video = _FakeVideo(
+        lambda start, end: {"state": np.zeros((end - start, 1, 1, 3), np.uint8)}
+    )
+    _install_reader(monkeypatch, {"file-a": _table(4)})
+    dataset = EmbodiedDataset(_FakeScan([unit]), window={"state": (0, 1)}, video=video)
+
+    with pytest.raises(ValueError, match="collides"):
+        list(dataset.iter_epoch(0))
+
+
+def test_video_requires_episode_partition(monkeypatch) -> None:
+    unit = LakeSoulScanPlanPartition(files=["file-a"], primary_keys=[])
+    video = _FakeVideo(lambda start, end: {})
+    _install_reader(monkeypatch, {"file-a": _table(4)})
+    dataset = EmbodiedDataset(_FakeScan([unit]), window={"state": (0, 1)}, video=video)
+
+    with pytest.raises(ValueError, match="partitioned"):
+        list(dataset.iter_epoch(0))
+
+
+def test_window_validation() -> None:
+    with pytest.raises(ValueError, match="greater than start"):
+        Window(0, 0)
+    with pytest.raises(TypeError, match="Window or a"):
+        _as_window((0, 1, 2))
+
+
+def test_plan_anchor_order_is_deterministic() -> None:
+    windows = {"state": Window(-2, 1)}
+    first = plan_anchor_order(
+        rows=100, stride=3, seed=1, epoch=0, unit_seed=42, windows=windows
+    )
+    second = plan_anchor_order(
+        rows=100, stride=3, seed=1, epoch=0, unit_seed=42, windows=windows
+    )
+
+    np.testing.assert_array_equal(first, second)
+    assert first.min() >= 2
+    assert first.max() <= 99
+    assert len(first) == len(np.unique(first))
+
+
+def _timed_table(rows: int) -> pa.Table:
+    values = np.arange(rows, dtype=np.int64)
+    return pa.table(
+        {
+            "state": pa.array(values, type=pa.int64()),
+            "timestamp": pa.array(values.astype(np.float64), type=pa.float64()),
+            "image": pa.array(
+                [f"img-{value}".encode() for value in values], pa.binary()
+            ),
+        }
+    )
+
+
+def test_seconds_window_matches_row_window(monkeypatch) -> None:
+    unit = _unit("a", "file-a")
+    table = _timed_table(12)
+    _install_reader(monkeypatch, {"file-a": table})
+    scan = _FakeScan([unit], schema=table.schema)
+
+    seconds = EmbodiedDataset(
+        scan,
+        window={"state": (-2.0, 0.0)},
+        time_column="timestamp",
+        boundary="clamp",
+    )
+    rows = EmbodiedDataset(scan, window={"state": (-2, 0)}, boundary="clamp")
+
+    seconds_samples = list(seconds.iter_epoch(0))
+    row_samples = list(rows.iter_epoch(0))
+
+    assert [sample["state"].tolist() for sample in seconds_samples] == [
+        sample["state"].tolist() for sample in row_samples
+    ]
+    assert len(seconds_samples) == 11
+
+
+def test_seconds_window_validation(monkeypatch) -> None:
+    unit = _unit("a", "file-a")
+    table = _timed_table(6)
+    _install_reader(monkeypatch, {"file-a": table})
+
+    with pytest.raises(ValueError, match="time column"):
+        EmbodiedDataset(
+            _FakeScan([unit], schema=pa.schema([pa.field("state", pa.int64())])),
+            window={"state": (-2.0, 0.0)},
+        )
+    with pytest.raises(ValueError, match="greater than start"):
+        EmbodiedDataset(
+            _FakeScan([unit], schema=table.schema),
+            window={"state": (2.0, 0.0)},
+            time_column="timestamp",
+        )
+
+
+def test_video_rejects_seconds_window(monkeypatch) -> None:
+    unit = _unit("a", "file-a")
+    table = _timed_table(6)
+    video = _FakeVideo(lambda start, end: {})
+    _install_reader(monkeypatch, {"file-a": table})
+
+    with pytest.raises(ValueError, match="row-based window"):
+        EmbodiedDataset(
+            _FakeScan([unit], schema=table.schema),
+            window={"state": (-2, 0), "image": (-0.5, 0.0)},
+            time_column="timestamp",
+            video=video,
+            video_window="image",
+        )
+
+
+def _secondary_table() -> pa.Table:
+    return pa.table(
+        {
+            "timestamp": pa.array([0.5, 2.5, 4.5], type=pa.float64()),
+            "grip": pa.array([10.0, 20.0, 30.0], type=pa.float64()),
+        }
+    )
+
+
+def _stream(scan, **kwargs) -> SecondaryStream:
+    return SecondaryStream(scan=scan, columns=("grip",), **kwargs)
+
+
+def test_secondary_stream_aligns_rows(monkeypatch) -> None:
+    primary = _timed_table(6)
+    secondary = _secondary_table()
+    _install_reader(monkeypatch, {"file-a": primary, "file-b": secondary})
+    stream = _stream(
+        _FakeScan([_unit("a", "file-b")], schema=secondary.schema), tolerance=0.6
+    )
+    dataset = EmbodiedDataset(
+        _FakeScan([_unit("a", "file-a")], schema=primary.schema),
+        window={"state": (0, 2)},
+        streams=[stream],
+    )
+
+    samples = {int(sample["state"][0]): sample["grip"].tolist() for sample in dataset}
+
+    assert samples == {
+        0: [10.0, 10.0],
+        1: [10.0, 20.0],
+        2: [20.0, 20.0],
+        3: [20.0, 30.0],
+        4: [30.0, 30.0],
+    }
+
+
+def test_secondary_stream_missing_and_direction(monkeypatch) -> None:
+    primary = _timed_table(6)
+    secondary = _secondary_table()
+    _install_reader(monkeypatch, {"file-a": primary, "file-b": secondary})
+    scan = _FakeScan([_unit("a", "file-a")], schema=primary.schema)
+    stream_scan = _FakeScan([_unit("a", "file-b")], schema=secondary.schema)
+
+    nulls = EmbodiedDataset(
+        scan,
+        window={"state": (0, 2)},
+        streams=[_stream(stream_scan, tolerance=0.2)],
+    )
+    null_samples = list(nulls)
+    assert null_samples and all(
+        None in sample["grip"].tolist() for sample in null_samples
+    )
+
+    skipped = EmbodiedDataset(
+        scan,
+        window={"state": (0, 2)},
+        streams=[_stream(stream_scan, tolerance=0.2, missing="skip")],
+    )
+    assert list(skipped) == []
+
+    backward = EmbodiedDataset(
+        scan,
+        window={"state": (0, 1)},
+        streams=[_stream(stream_scan, tolerance=0.6, direction="backward")],
+    )
+    first = {int(sample["state"][0]): sample["grip"].tolist() for sample in backward}
+    assert first[0] == [None]
+    assert first[1] == [10.0]
+
+
+def test_align_materializes_joined_table(monkeypatch) -> None:
+    primary = _timed_table(6)
+    secondary = _secondary_table()
+    _install_reader(monkeypatch, {"file-a": primary, "file-b": secondary})
+
+    table = align(
+        _FakeScan([_unit("a", "file-a")], schema=primary.schema),
+        _FakeScan([_unit("a", "file-b")], schema=secondary.schema),
+        columns=("grip",),
+        tolerance=0.6,
+    )
+
+    assert table.num_rows == 6
+    assert table.column("grip_r").to_pylist() == [10.0, 10.0, 20.0, 20.0, 30.0, 30.0]
+
+
+def test_align_skips_only_unmatched_rows(monkeypatch) -> None:
+    primary = _timed_table(6)
+    secondary = pa.table(
+        {
+            "timestamp": pa.array([0.0, 2.0], type=pa.float64()),
+            "grip": pa.array([10.0, 20.0], type=pa.float64()),
+        }
+    )
+    _install_reader(monkeypatch, {"file-a": primary, "file-b": secondary})
+
+    table = align(
+        _FakeScan([_unit("a", "file-a")], schema=primary.schema),
+        _FakeScan([_unit("a", "file-b")], schema=secondary.schema),
+        columns=("grip",),
+        tolerance=1.0,
+        missing="skip",
+    )
+
+    assert table.column("state").to_pylist() == [0, 1, 2, 3]
+    assert table.column("grip_r").to_pylist() == [10.0, 20.0, 20.0, 20.0]

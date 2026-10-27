@@ -1,0 +1,144 @@
+// SPDX-FileCopyrightText: 2023 LakeSoul Contributors
+//
+// SPDX-License-Identifier: Apache-2.0
+package com.dmetasoul.lakesoul.meta.jnr;
+
+import jnr.ffi.Pointer;
+import jnr.ffi.annotations.Delegate;
+import jnr.ffi.annotations.LongLong;
+
+public interface LibLakeSoulMetaData {
+    /** Returns the NUL-terminated LakeSoul Core version owned by the native library. */
+    Pointer lakesoul_metadata_version();
+
+    /** Returns the NUL-terminated native build information owned by the native library. */
+    Pointer lakesoul_metadata_build_info();
+
+    Pointer create_tokio_runtime();
+
+    void free_tokio_runtime(Pointer runtime);
+
+    Pointer create_tokio_postgres_client(
+            BooleanCallback booleanCallback,
+            String config,
+            String secondaryConfig,
+            Pointer runtime);
+
+    void free_tokio_postgres_client(Pointer client);
+
+    Pointer execute_query(
+            IntegerCallback integerCallback,
+            Pointer runtime,
+            Pointer client,
+            Integer type,
+            String texts);
+
+    void export_bytes_result(
+            BooleanCallback booleanCallback, Pointer bytes, Integer len, @LongLong long addr);
+
+    void free_bytes_result(Pointer bytes);
+
+    void execute_update(
+            IntegerCallback integerCallback,
+            Pointer runtime,
+            Pointer client,
+            Integer type,
+            String texts);
+
+    void execute_query_scalar(
+            StringCallback stringCallback,
+            Pointer runtime,
+            Pointer client,
+            Integer type,
+            String texts);
+
+    void execute_insert(
+            IntegerCallback integerCallback,
+            Pointer runtime,
+            Pointer client,
+            Integer type,
+            @LongLong long addr,
+            int length);
+
+    /**
+     * Runs the authoritative metadata commit state machine. Outcome codes: 1 = committed, 2 =
+     * already committed, 3 = superseded, -1 = error (message delivered through the callback).
+     */
+    void commit_data(
+            IntegerCallback integerCallback,
+            Pointer runtime,
+            Pointer client,
+            Integer commitOp,
+            @LongLong long addr,
+            int length);
+
+    void clean_meta_for_test(IntegerCallback integerCallback, Pointer runtime, Pointer client);
+
+    Pointer create_split_desc_array(
+            BooleanCallback booleanCallback,
+            Pointer client,
+            Pointer runtime,
+            String tableName,
+            String namespace);
+
+    void free_split_desc_array(Pointer json);
+
+    void encode_token_from_claims(StringCallback stringCallback, String claimsJson, String secret);
+
+    void decode_token_to_claims(StringCallback stringCallback, String token, String secret);
+
+    /**
+     * caller should ensure that ptr is valid
+     *
+     * @param c_string ptr
+     */
+    void free_c_string(Pointer c_string);
+
+    String debug(BooleanCallback booleanCallback);
+
+    void rust_logger_init();
+
+    void call_rust(@LongLong long addr, Integer len);
+
+    void hello_world(Callback<byte[]> bytesCallback);
+
+    void namespace(byte[] bytes, Integer len);
+
+    Pointer create_native_client(BooleanCallback booleanCallback, String config);
+
+    interface Callback<T> {
+        @Delegate
+        void invoke(T result, String msg);
+    }
+
+    interface VoidCallback { // type representing callback
+        @Delegate
+        void invoke(
+                String err); // function name doesn't matter, it just needs to be the only function
+        // and have @Delegate
+    }
+
+    interface BooleanCallback { // type representing callback
+        @Delegate
+        void invoke(
+                Boolean status,
+                String err); // function name doesn't matter, it just needs to be the only function
+        // and have @Delegate
+    }
+
+    interface IntegerCallback { // type representing callback
+        @Delegate
+        void invoke(
+                Integer status,
+                String err); // function name doesn't matter, it just needs to be the only function
+        // and have @Delegate
+    }
+
+    interface StringCallback { // type representing callback
+        @Delegate
+        void invoke(
+                String status,
+                String err); // function name doesn't matter, it just needs to be the only function
+        // and have @Delegate
+    }
+}

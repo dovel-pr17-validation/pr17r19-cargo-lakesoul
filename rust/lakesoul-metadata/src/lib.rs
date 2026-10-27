@@ -1,0 +1,2459 @@
+// SPDX-FileCopyrightText: 2023 LakeSoul Contributors
+//
+// SPDX-License-Identifier: Apache-2.0
+
+//! The Metadata Interface of LakeSoul.
+
+#[macro_use]
+extern crate tracing;
+use std::io::ErrorKind;
+use std::str::FromStr;
+
+use chrono::NaiveDate;
+use postgres_types::{FromSql, ToSql};
+use prost::Message;
+pub use tokio::runtime::{Builder, Runtime};
+pub use tokio_postgres::{Client, NoTls, Statement};
+use tokio_postgres::{Error, Row};
+
+pub use crate::metadata_client::{
+    PRIMARY_URL_ENV_KEY, PRIMARY_URL_PROP_KEY, SECONDARY_URL_ENV_KEY,
+    SECONDARY_URL_PROP_KEY,
+};
+use crate::pooled_client::PgConnection;
+pub use crate::pooled_client::{PooledClient, QueryType};
+pub use error::{LakeSoulMetaDataError, Result};
+use lakesoul_metadata_proto::entity;
+pub use metadata_client::{
+    CommitOutcome, IncrementalWindow, MetaDataClient, MetaDataClientRef,
+    PartitionChangelog, pg_config_from_env,
+};
+
+pub mod transfusion;
+
+pub mod error;
+mod jwt;
+use crate::DaoType::SelectOnePartitionVersionByTableIdAndDesc;
+use crate::metrics::MetadataRequestMetrics;
+use crate::pooled_client::QueryType::{RO, RW};
+pub use jwt::{Claims, JwtServer};
+
+pub mod index_catalog;
+mod metadata_client;
+mod metrics;
+mod pooled_client;
+pub mod rbac;
+pub mod utils;
+
+/// The offset of code for the Data Access Object type for query one.
+pub const DAO_TYPE_QUERY_ONE_OFFSET: i32 = 0;
+/// The offset of code for the Data Access Object type for query list.
+pub const DAO_TYPE_QUERY_LIST_OFFSET: i32 = 100;
+/// The offset of code for the Data Access Object type for insert one.
+pub const DAO_TYPE_INSERT_ONE_OFFSET: i32 = 200;
+/// The offset of code for the Data Access Object type for transaction insert list.
+pub const DAO_TYPE_TRANSACTION_INSERT_LIST_OFFSET: i32 = 300;
+/// The offset of code for the Data Access Object type for query scalar.
+pub const DAO_TYPE_QUERY_SCALAR_OFFSET: i32 = 400;
+/// The offset of code for the Data Access Object type for update.
+pub const DAO_TYPE_UPDATE_OFFSET: i32 = 500;
+
+/// The delimiter for the Data Access Object parameters.
+pub const PARAM_DELIM: &str = "__DELIM__";
+/// The delimiter for the Data Access Object partition description.
+pub const PARTITION_DESC_DELIM: &str = "_DELIM_";
+
+/// The result type for the Data Access Object.
+enum ResultType {
+    /// The result type for the namespace.
+    Namespace,
+    /// The result type for the table_info.
+    TableInfo,
+    /// The result type for the table_name_id.
+    TableNameId,
+    /// The result type for the table_path_id.
+    TablePathId,
+    /// The result type for the partition_info.
+    PartitionInfo,
+    /// The result type for the data_commit_info.
+    DataCommitInfo,
+    /// The result type for the table_path_id with only table path.
+    TablePathIdWithOnlyPath,
+    /// The result type for the partition_info with only commit_op.
+    PartitionInfoWithOnlyCommitOp,
+    /// The result type for the discard_compressed_file_info.
+    DiscardCompressedFileInfo,
+    /// The result type for the table_snapshot.
+    SnapshotInfo,
+    /// The result type for the snapshot_commit.
+    SnapshotCommitInfo,
+    /// The result type for the table_snapshot_tag.
+    SnapshotTagInfo,
+}
+
+/// The Data File Operation type, which is corresponding to the user defined type `data_file_op` in PostgreSQL.
+#[derive(FromSql, ToSql, Debug, PartialEq)]
+#[postgres(name = "data_file_op")]
+struct DataFileOp {
+    path: String,
+    file_op: String,
+    size: i64,
+    file_exist_cols: String,
+}
+
+impl DataFileOp {
+    fn from_proto_data_file_op(data_file_op: &entity::DataFileOp) -> Result<Self> {
+        Ok(DataFileOp {
+            path: data_file_op.path.clone(),
+            file_op: entity::FileOp::try_from(data_file_op.file_op)
+                .map_err(|e| LakeSoulMetaDataError::Internal(e.to_string()))?
+                .as_str_name()
+                .to_string(),
+            size: data_file_op.size,
+            file_exist_cols: data_file_op.file_exist_cols.clone(),
+        })
+    }
+
+    fn as_proto_data_file_op(&self) -> Result<entity::DataFileOp> {
+        Ok(entity::DataFileOp {
+            path: self.path.clone(),
+            file_op: entity::FileOp::from_str_name(self.file_op.as_str())
+                .ok_or(LakeSoulMetaDataError::Internal("unknown file_op".into()))?
+                as i32,
+            size: self.size,
+            file_exist_cols: self.file_exist_cols.clone(),
+        })
+    }
+}
+
+/// The coded type for the Data Access Object.
+///
+/// The discriminants are the wire codes used by the JNI clients and must stay
+/// in sync with the Java `CodedDaoType` enum in
+/// `lakesoul-common/src/main/java/com/dmetasoul/lakesoul/meta/jnr/NativeUtils.java`.
+#[derive(
+    Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, num_enum::TryFromPrimitive,
+)]
+#[repr(i32)]
+pub enum DaoType {
+    // ==== Coded Query One ====
+    /// The coded type for the Data Access Object for select namespace by namespace.
+    SelectNamespaceByNamespace = DAO_TYPE_QUERY_ONE_OFFSET,
+    /// The coded type for the Data Access Object for select table path id by table path.
+    SelectTablePathIdByTablePath = DAO_TYPE_QUERY_ONE_OFFSET + 1,
+    /// The coded type for the Data Access Object for select table info by table id.
+    SelectTableInfoByTableId = DAO_TYPE_QUERY_ONE_OFFSET + 2,
+    /// The coded type for the Data Access Object for select table name id by table name.
+    SelectTableNameIdByTableName = DAO_TYPE_QUERY_ONE_OFFSET + 3,
+    /// The coded type for the Data Access Object for select table info by table name and namespace.
+    SelectTableInfoByTableNameAndNameSpace = DAO_TYPE_QUERY_ONE_OFFSET + 4,
+    /// The coded type for the Data Access Object for select table info by table path.
+    SelectTableInfoByTablePath = DAO_TYPE_QUERY_ONE_OFFSET + 5,
+    /// The coded type for the Data Access Object for select table info by table id and table path.
+    SelectTableInfoByIdAndTablePath = DAO_TYPE_QUERY_ONE_OFFSET + 6,
+
+    /// The coded type for the Data Access Object for select one partition version by table id and partition description.
+    SelectOnePartitionVersionByTableIdAndDesc = DAO_TYPE_QUERY_ONE_OFFSET + 7,
+    /// The coded type for the Data Access Object for select partition version by table id and partition description and version.
+    SelectPartitionVersionByTableIdAndDescAndVersion = DAO_TYPE_QUERY_ONE_OFFSET + 8,
+    /// The coded type for the Data Access Object for select one data commit info by table id and partition description and commit id.
+    SelectOneDataCommitInfoByTableIdAndPartitionDescAndCommitId =
+        DAO_TYPE_QUERY_ONE_OFFSET + 9,
+    /// The coded type for the Data Access Object for select table domain by table id.
+    SelectTableDomainById = DAO_TYPE_QUERY_ONE_OFFSET + 10,
+    /// The coded type for the Data Access Object for select discard compressed file info by file path.
+    SelectDiscardCompressedFileInfoByFilePath = DAO_TYPE_QUERY_ONE_OFFSET + 11,
+    /// The coded type for the Data Access Object for select the latest partition version by table id, partition description and timestamp (inclusive).
+    SelectOnePartitionVersionByTableIdAndDescAndTimestamp =
+        DAO_TYPE_QUERY_ONE_OFFSET + 12,
+    /// The coded type for the Data Access Object for select the latest data commit info by table id.
+    SelectOneDataCommitInfoByTableId = DAO_TYPE_QUERY_ONE_OFFSET + 13,
+
+    // ==== Coded Table List ====
+    /// The coded type for the Data Access Object for list namespaces.
+    ListNamespaces = DAO_TYPE_QUERY_LIST_OFFSET,
+    /// The coded type for the Data Access Object for list table name by namespace.
+    ListTableNameByNamespace = DAO_TYPE_QUERY_LIST_OFFSET + 1,
+    /// The coded type for the Data Access Object for list all table path.
+    ListAllTablePath = DAO_TYPE_QUERY_LIST_OFFSET + 2,
+    /// The coded type for the Data Access Object for list all path table path by namespace.
+    ListAllPathTablePathByNamespace = DAO_TYPE_QUERY_LIST_OFFSET + 3,
+
+    // ==== Coded Query Partition List ====
+    /// The coded type for the Data Access Object for list partition by table id.
+    ListPartitionByTableId = DAO_TYPE_QUERY_LIST_OFFSET + 4,
+    /// The coded type for the Data Access Object for list partition description by table id and partition description.
+    ListPartitionDescByTableIdAndParList = DAO_TYPE_QUERY_LIST_OFFSET + 5,
+    /// The coded type for the Data Access Object for list partition by table id and partition description.
+    ListPartitionByTableIdAndDesc = DAO_TYPE_QUERY_LIST_OFFSET + 6,
+    /// The coded type for the Data Access Object for list partition version by table id and partition description and version range.
+    ListPartitionVersionByTableIdAndPartitionDescAndVersionRange =
+        DAO_TYPE_QUERY_LIST_OFFSET + 7,
+    /// The coded type for the Data Access Object for list partition version by table id and partition description and timestamp range.
+    ListPartitionVersionByTableIdAndPartitionDescAndTimestampRange =
+        DAO_TYPE_QUERY_LIST_OFFSET + 8,
+    /// The coded type for the Data Access Object for list commit ops between versions.
+    ListCommitOpsBetweenVersions = DAO_TYPE_QUERY_LIST_OFFSET + 9,
+
+    // ==== Coded Query DataCommitInfo List ====
+    /// The coded type for the Data Access Object for list data commit info by table id and partition description and commit id list.
+    ListDataCommitInfoByTableIdAndPartitionDescAndCommitList =
+        DAO_TYPE_QUERY_LIST_OFFSET + 10,
+    /// The coded type for the Data Access Object for list all discard compressed file info.
+    ListAllDiscardCompressedFileInfo = DAO_TYPE_QUERY_LIST_OFFSET + 11,
+    /// The coded type for the Data Access Object for list discard compressed file info before timestamp.
+    ListDiscardCompressedFileInfoBeforeTimestamp = DAO_TYPE_QUERY_LIST_OFFSET + 12,
+    /// The coded type for the Data Access Object for list discard compressed file by filter condition.
+    ListDiscardCompressedFileByFilterCondition = DAO_TYPE_QUERY_LIST_OFFSET + 13,
+    /// The coded type for the Data Access Object for list every partition version at or above a
+    /// minimum version of one table (table-level changelog scan). Reserved values outside the
+    /// coded JNI ranges: these queries are only issued by the Rust runtime.
+    ListPartitionVersionsByTableIdAndMinVersion = DAO_TYPE_QUERY_LIST_OFFSET + 30,
+    /// The coded type for the Data Access Object for list data commit info by table id and commit
+    /// id list (table-level changelog scan). Reserved value, see above.
+    ListDataCommitInfoByTableIdAndCommitIds = DAO_TYPE_QUERY_LIST_OFFSET + 31,
+
+    /// The coded type for the Data Access Object for list namespaces by domain.
+    ListNamespacesByDomain = DAO_TYPE_QUERY_LIST_OFFSET + 14,
+    /// The coded type for the Data Access Object for list table name by domain.
+    ListTableNamesByDomain = DAO_TYPE_QUERY_LIST_OFFSET + 15,
+
+    ListPartitionByTableIdAndFilterCondition = DAO_TYPE_QUERY_LIST_OFFSET + 16,
+    /// The coded type for the Data Access Object for list the latest partition version of each partition by table id at or before a timestamp (inclusive).
+    ListPartitionByTableIdAndTimestamp = DAO_TYPE_QUERY_LIST_OFFSET + 17,
+    /// The coded type for the Data Access Object for listing snapshots by table id.
+    ListSnapshotsByTableId = DAO_TYPE_QUERY_LIST_OFFSET + 18,
+    /// The coded type for the Data Access Object for listing snapshot commits.
+    ListSnapshotCommitsBySnapshot = DAO_TYPE_QUERY_LIST_OFFSET + 19,
+    /// The coded type for the Data Access Object for listing tags by table id.
+    ListTagsByTableId = DAO_TYPE_QUERY_LIST_OFFSET + 20,
+    /// The coded type for the Data Access Object for selecting a tag.
+    SelectTagByTableIdAndTag = DAO_TYPE_QUERY_LIST_OFFSET + 21,
+    /// The coded type for the Data Access Object for creating a snapshot.
+    CreateSnapshot = DAO_TYPE_QUERY_LIST_OFFSET + 22,
+    /// The coded type for the Data Access Object for dropping a snapshot.
+    DropSnapshot = DAO_TYPE_QUERY_LIST_OFFSET + 23,
+    /// The coded type for the Data Access Object for dropping a tag.
+    DropTagByTableIdAndTag = DAO_TYPE_QUERY_LIST_OFFSET + 24,
+    /// The coded type for the Data Access Object for creating a tag.
+    CreateTag = DAO_TYPE_QUERY_LIST_OFFSET + 25,
+
+    // ==== Coded Insert One ====
+    /// The coded type for the Data Access Object for insert namespace.
+    InsertNamespace = DAO_TYPE_INSERT_ONE_OFFSET,
+    /// The coded type for the Data Access Object for insert table path id.
+    InsertTablePathId = DAO_TYPE_INSERT_ONE_OFFSET + 1,
+    /// The coded type for the Data Access Object for insert table name id.
+    InsertTableNameId = DAO_TYPE_INSERT_ONE_OFFSET + 2,
+    /// The coded type for the Data Access Object for insert table info.
+    InsertTableInfo = DAO_TYPE_INSERT_ONE_OFFSET + 3,
+    /// The coded type for the Data Access Object for insert partition info.
+    InsertPartitionInfo = DAO_TYPE_INSERT_ONE_OFFSET + 4,
+    /// The coded type for the Data Access Object for insert data commit info.
+    InsertDataCommitInfo = DAO_TYPE_INSERT_ONE_OFFSET + 5,
+    /// The coded type for the Data Access Object for insert discard compressed file info.
+    InsertDiscardCompressedFileInfo = DAO_TYPE_INSERT_ONE_OFFSET + 6,
+    /// Atomically inserts all metadata rows for a table.
+    InsertTableAtomic = DAO_TYPE_INSERT_ONE_OFFSET + 7,
+    /// Atomically inserts all metadata rows unless the table name is already claimed.
+    InsertTableIfNotExistsAtomic = DAO_TYPE_INSERT_ONE_OFFSET + 8,
+
+    // ==== Coded Transaction Insert List ====
+    /// The coded type for the Data Access Object for transaction insert partition info.
+    TransactionInsertPartitionInfo = DAO_TYPE_TRANSACTION_INSERT_LIST_OFFSET,
+    /// The coded type for the Data Access Object for transaction insert data commit info.
+    TransactionInsertDataCommitInfo = DAO_TYPE_TRANSACTION_INSERT_LIST_OFFSET + 1,
+    /// The coded type for the Data Access Object for transaction insert discard compressed file.
+    TransactionInsertDiscardCompressedFile = DAO_TYPE_TRANSACTION_INSERT_LIST_OFFSET + 2,
+
+    // ==== Coded Query Scalar ====
+    /// The coded type for the Data Access Object for get latest timestamp from partition info.
+    GetLatestTimestampFromPartitionInfo = DAO_TYPE_QUERY_SCALAR_OFFSET,
+    /// The coded type for the Data Access Object for get latest timestamp from partition info without partition description.
+    GetLatestTimestampFromPartitionInfoWithoutPartitionDesc =
+        DAO_TYPE_QUERY_SCALAR_OFFSET + 1,
+    /// The coded type for the Data Access Object for get latest version up to time from partition info.
+    GetLatestVersionUpToTimeFromPartitionInfo = DAO_TYPE_QUERY_SCALAR_OFFSET + 2,
+    /// The coded type for the Data Access Object for get latest version timestamp up to time from partition info.
+    GetLatestVersionTimestampUpToTimeFromPartitionInfo = DAO_TYPE_QUERY_SCALAR_OFFSET + 3,
+
+    // ==== Coded Update Type ====
+    /// The coded type for the Data Access Object for delete namespace by namespace.
+    DeleteNamespaceByNamespace = DAO_TYPE_UPDATE_OFFSET,
+    /// The coded type for the Data Access Object for update namespace properties by namespace.
+    UpdateNamespacePropertiesByNamespace = DAO_TYPE_UPDATE_OFFSET + 1,
+
+    // ==== Coded Update TableInfo ====
+    /// The coded type for the Data Access Object for delete table info by table id and table path.
+    DeleteTableInfoByIdAndPath = DAO_TYPE_UPDATE_OFFSET + 2,
+    /// The coded type for the Data Access Object for update table info properties by table id.
+    UpdateTableInfoPropertiesById = DAO_TYPE_UPDATE_OFFSET + 3,
+    /// The coded type for the Data Access Object for update table info by table id.
+    UpdateTableInfoById = DAO_TYPE_UPDATE_OFFSET + 4,
+
+    // ==== Coded Update TablePathId ====
+    /// The coded type for the Data Access Object for delete table path id by table path.
+    DeleteTablePathIdByTablePath = DAO_TYPE_UPDATE_OFFSET + 5,
+    /// The coded type for the Data Access Object for delete table path id by table id.
+    DeleteTablePathIdByTableId = DAO_TYPE_UPDATE_OFFSET + 6,
+
+    // ==== Coded Update TableNameId ====
+    /// The coded type for the Data Access Object for delete table name id by table name and namespace.
+    DeleteTableNameIdByTableNameAndNamespace = DAO_TYPE_UPDATE_OFFSET + 7,
+    /// The coded type for the Data Access Object for delete table name id by table id.
+    DeleteTableNameIdByTableId = DAO_TYPE_UPDATE_OFFSET + 8,
+
+    // ==== Coded Update PartitionInfo ====
+    /// The coded type for the Data Access Object for delete partition info by table id and partition description.
+    DeletePartitionInfoByTableIdAndPartitionDesc = DAO_TYPE_UPDATE_OFFSET + 9,
+    /// The coded type for the Data Access Object for delete partition info by table id.
+    DeletePartitionInfoByTableId = DAO_TYPE_UPDATE_OFFSET + 10,
+    /// The coded type for the Data Access Object for delete previous version partition.
+    DeletePreviousVersionPartition = DAO_TYPE_UPDATE_OFFSET + 11,
+
+    // ==== Coded Update DataCommitInfo ====
+    /// The coded type for the Data Access Object for delete one data commit info by table id and partition description and commit id.
+    DeleteOneDataCommitInfoByTableIdAndPartitionDescAndCommitId =
+        DAO_TYPE_UPDATE_OFFSET + 12,
+    /// The coded type for the Data Access Object for delete data commit info by table id and partition description and commit id list.
+    DeleteDataCommitInfoByTableIdAndPartitionDescAndCommitIdList =
+        DAO_TYPE_UPDATE_OFFSET + 13,
+    /// The coded type for the Data Access Object for delete data commit info by table id and partition description.
+    DeleteDataCommitInfoByTableIdAndPartitionDesc = DAO_TYPE_UPDATE_OFFSET + 14,
+    /// The coded type for the Data Access Object for delete data commit info by table id.
+    DeleteDataCommitInfoByTableId = DAO_TYPE_UPDATE_OFFSET + 15,
+
+    // ==== Coded Update DiscardCompressedFileInfo ====
+    /// The coded type for the Data Access Object for delete discard compressed file info by file path.
+    DeleteDiscardCompressedFileInfoByFilePath = DAO_TYPE_UPDATE_OFFSET + 16,
+
+    /// The coded type for the Data Access Object for delete discard compressed file by filter condition.
+    DeleteDiscardCompressedFileByFilterCondition = DAO_TYPE_UPDATE_OFFSET + 17,
+    DeleteDiscardCompressedFileInfoByTablePath = DAO_TYPE_UPDATE_OFFSET + 18,
+}
+
+fn get_query_type(dao_type: DaoType) -> QueryType {
+    if matches!(
+        dao_type,
+        DaoType::CreateSnapshot
+            | DaoType::DropSnapshot
+            | DaoType::DropTagByTableIdAndTag
+            | DaoType::CreateTag
+    ) {
+        return RW;
+    }
+    let dao_type = dao_type as i32;
+    if dao_type <= DAO_TYPE_INSERT_ONE_OFFSET
+        || (DAO_TYPE_QUERY_SCALAR_OFFSET..DAO_TYPE_UPDATE_OFFSET).contains(&dao_type)
+    {
+        RO
+    } else {
+        RW
+    }
+}
+
+/// Get the prepared statement for the coded Data Access Object.
+async fn get_prepared_statement<'a>(
+    client: &'a PooledClient,
+    dao_type: &DaoType,
+) -> Result<(PgConnection<'a>, Statement)> {
+    let statement = match dao_type {
+        // Select Namespace
+        DaoType::SelectNamespaceByNamespace =>
+            "select namespace, properties, comment, domain
+            from namespace
+            where namespace = $1::TEXT",
+        DaoType::ListNamespaces =>
+            "select namespace, properties, comment, domain
+            from namespace",
+        DaoType::ListNamespacesByDomain =>
+            "select namespace, properties, comment, domain
+            from namespace
+            where domain = $1::TEXT",
+
+        // Select TablePathId
+        DaoType::SelectTablePathIdByTablePath =>
+            "select table_path, table_id, table_namespace, domain
+            from table_path_id
+            where table_path = $1::TEXT",
+        DaoType::ListAllTablePath =>
+            "select tp.table_path, tp.table_id, tp.table_namespace, tp.domain
+            from table_path_id tp
+            where not exists (
+                select 1 from table_info ti
+                where ti.table_id = tp.table_id
+                  and ti.properties::text like '%lakesoul.ivm.internal%')",
+        DaoType::ListAllPathTablePathByNamespace =>
+            "select tp.table_path
+            from table_path_id tp
+            where tp.table_namespace = $1::TEXT
+              and not exists (
+                  select 1 from table_info ti
+                  where ti.table_id = tp.table_id
+                    and ti.properties::text like '%lakesoul.ivm.internal%')",
+
+        // Select TableNameId
+        DaoType::SelectTableNameIdByTableName =>
+            "select table_name, table_id, table_namespace, domain
+            from table_name_id
+            where table_name = $1::TEXT and table_namespace = $2::TEXT",
+        DaoType::ListTableNameByNamespace =>
+            "select tn.table_name, tn.table_id, tn.table_namespace, tn.domain
+            from table_name_id tn
+            where tn.table_namespace = $1::TEXT
+              and not exists (
+                  select 1 from table_info ti
+                  where ti.table_id = tn.table_id
+                    and ti.properties::text like '%lakesoul.ivm.internal%')",
+        DaoType::ListTableNamesByDomain =>
+            "select tn.table_name, tn.table_id, tn.table_namespace, tn.domain
+            from table_name_id tn
+            where tn.domain = $1::TEXT
+              and not exists (
+                  select 1 from table_info ti
+                  where ti.table_id = tn.table_id
+                    and ti.properties::text like '%lakesoul.ivm.internal%')",
+
+        // Select TableInfo
+        DaoType::SelectTableInfoByTableId =>
+                    "select table_id, table_name, table_path, table_schema, table_schema_arrow_ipc, table_schema_arrow_ipc_json_hash, properties, partitions, table_namespace, domain
+                    from table_info
+                    where table_id = $1::TEXT",
+                DaoType::SelectTableInfoByTableNameAndNameSpace =>
+                    "select table_id, table_name, table_path, table_schema, table_schema_arrow_ipc, table_schema_arrow_ipc_json_hash, properties, partitions, table_namespace, domain
+                    from table_info
+                    where table_name = $1::TEXT and table_namespace=$2::TEXT",
+                DaoType::SelectTableInfoByTablePath =>
+                    "select table_id, table_name, table_path, table_schema, table_schema_arrow_ipc, table_schema_arrow_ipc_json_hash, properties, partitions, table_namespace, domain
+                    from table_info
+                    where table_path = $1::TEXT",
+                DaoType::SelectTableInfoByIdAndTablePath =>
+                    "select table_id, table_name, table_path, table_schema, table_schema_arrow_ipc, table_schema_arrow_ipc_json_hash, properties, partitions, table_namespace, domain
+                    from table_info
+                    where table_id = $1::TEXT and table_path=$2::TEXT",
+
+        // Select PartitionInfo
+        DaoType::SelectPartitionVersionByTableIdAndDescAndVersion =>
+            "select table_id, partition_desc, version, commit_op, snapshot, timestamp, expression, domain, pinned
+            from partition_info
+            where table_id = $1::TEXT and partition_desc = $2::TEXT and version = $3::INT",
+        DaoType::SelectOnePartitionVersionByTableIdAndDesc =>
+            "select m.table_id, t.partition_desc, m.version, m.commit_op, m.snapshot, m.timestamp, m.expression, m.domain, m.pinned from (
+                select table_id,partition_desc,version from partition_info
+                where table_id = $1::TEXT and partition_desc = $2::TEXT order by table_id, partition_desc, version desc limit 1) t
+                left join partition_info m on t.table_id = m.table_id
+                and t.partition_desc = m.partition_desc and t.version = m.version",
+        DaoType::SelectOnePartitionVersionByTableIdAndDescAndTimestamp =>
+            "select m.table_id, t.partition_desc, m.version, m.commit_op, m.snapshot, m.timestamp, m.expression, m.domain, m.pinned from (
+                select table_id,partition_desc,version from partition_info
+                where table_id = $1::TEXT and partition_desc = $2::TEXT and timestamp <= $3::BIGINT
+                order by table_id, partition_desc, version desc limit 1) t
+                left join partition_info m on t.table_id = m.table_id
+                and t.partition_desc = m.partition_desc and t.version = m.version",
+        DaoType::ListPartitionByTableIdAndDesc =>
+            "select table_id, partition_desc, version, commit_op, snapshot, timestamp, expression, domain, pinned
+            from partition_info
+            where table_id = $1::TEXT and partition_desc = $2::TEXT ",
+        DaoType::ListPartitionByTableId =>
+            "select DISTINCT ON (table_id, partition_desc) table_id, partition_desc, version, commit_op, snapshot, timestamp, expression, domain, pinned
+             from partition_info
+             where table_id = $1::TEXT
+            ORDER BY table_id DESC, partition_desc DESC, version DESC",
+        DaoType::ListPartitionVersionByTableIdAndPartitionDescAndTimestampRange =>
+            "select table_id, partition_desc, version, commit_op, snapshot, timestamp, expression, domain, pinned
+            from partition_info
+            where table_id = $1::TEXT and partition_desc = $2::TEXT and timestamp >= $3::BIGINT and timestamp < $4::BIGINT",
+        DaoType::ListCommitOpsBetweenVersions =>
+            "select distinct(commit_op)
+            from partition_info
+            where table_id = $1::TEXT and partition_desc = $2::TEXT and version between $3::INT and $4::INT",
+        DaoType::ListPartitionVersionByTableIdAndPartitionDescAndVersionRange =>
+            "select table_id, partition_desc, version, commit_op, snapshot, timestamp, expression, domain, pinned
+            from partition_info
+            where table_id = $1::TEXT and partition_desc = $2::TEXT and version >= $3::INT and version <= $4::INT
+            order by version",
+
+        // Select DataCommitInfo
+        DaoType::SelectOneDataCommitInfoByTableIdAndPartitionDescAndCommitId =>
+            "select table_id, partition_desc, commit_id, file_ops, commit_op, timestamp, committed, domain, pinned
+            from data_commit_info
+            where table_id = $1::TEXT and partition_desc = $2::TEXT and commit_id = $3::UUID",
+        DaoType::SelectOneDataCommitInfoByTableId =>
+            "select table_id, partition_desc, commit_id, file_ops, commit_op, timestamp, committed, domain, pinned
+            from data_commit_info
+            where table_id = $1::TEXT
+            order by timestamp desc
+            limit 1",
+
+        // Select DiscardCompressedFileInfo
+        DaoType::SelectDiscardCompressedFileInfoByFilePath =>
+            "select file_path, table_path, partition_desc, timestamp, t_date
+            from discard_compressed_file_info
+            where file_path = $1::TEXT",
+        DaoType::ListAllDiscardCompressedFileInfo =>
+            "select file_path, table_path, partition_desc, timestamp, t_date
+            from discard_compressed_file_info",
+        DaoType::ListDiscardCompressedFileInfoBeforeTimestamp =>
+            "select file_path, table_path, partition_desc, timestamp, t_date
+            from discard_compressed_file_info
+            where timestamp < $1::BIGINT",
+        DaoType::ListDiscardCompressedFileByFilterCondition =>
+            "select file_path, table_path, partition_desc, timestamp, t_date
+            from discard_compressed_file_info
+            where table_path = $1::TEXT and partition_desc = $2::TEXT and timestamp < $3::BIGINT",
+        DaoType::ListPartitionByTableIdAndFilterCondition =>
+            "select m.table_id, t.partition_desc, m.version, m.commit_op, m.snapshot, m.timestamp, m.expression, m.domain, m.pinned
+            from (
+                select table_id,partition_desc,max(version) as max_version
+                from partition_info
+                where table_id = $1::TEXT
+                and to_tsvector('english', partition_desc) @@ websearch_to_tsquery('english', $2::TEXT)
+                group by table_id, partition_desc
+            ) t
+            left join partition_info m
+            on t.table_id = m.table_id and t.partition_desc = m.partition_desc and t.max_version = m.version",
+        DaoType::ListPartitionByTableIdAndTimestamp =>
+            "select DISTINCT ON (table_id, partition_desc) table_id, partition_desc, version, commit_op, snapshot, timestamp, expression, domain, pinned
+             from partition_info
+             where table_id = $1::TEXT and timestamp <= $2::BIGINT
+             ORDER BY table_id DESC, partition_desc DESC, version DESC",
+        DaoType::ListPartitionVersionsByTableIdAndMinVersion =>
+            "select table_id, partition_desc, version, commit_op, snapshot, timestamp, expression, domain, pinned
+             from partition_info
+             where table_id = $1::TEXT and version >= $2::INT
+             order by partition_desc, version",
+
+        // Snapshots and tags
+        DaoType::ListSnapshotsByTableId =>
+            "select table_id, snapshot_id, created_at, description
+            from table_snapshot
+            where table_id = $1::TEXT
+            order by snapshot_id",
+        // `snapshot_commit` does not store the position of a commit inside the
+        // frozen partition snapshot, so recover it from the (pinned)
+        // `partition_info` row that produced the snapshot. The left join keeps
+        // commits readable even if that version row is no longer available.
+        DaoType::ListSnapshotCommitsBySnapshot =>
+            "select sc.table_id, sc.snapshot_id, sc.partition_desc, sc.version, sc.commit_id
+            from snapshot_commit sc
+            left join partition_info pi
+              on pi.table_id = sc.table_id
+             and pi.partition_desc = sc.partition_desc
+             and pi.version = sc.version
+            where sc.table_id = $1::TEXT and sc.snapshot_id = $2::BIGINT
+            order by sc.partition_desc,
+                     array_position(pi.snapshot, sc.commit_id) nulls last,
+                     sc.commit_id",
+        DaoType::ListTagsByTableId =>
+            "select table_id, tag, snapshot_id, created_at, coalesce(expire_at, 0)
+            from table_snapshot_tag
+            where table_id = $1::TEXT
+            order by tag",
+        DaoType::SelectTagByTableIdAndTag =>
+            "select table_id, tag, snapshot_id, created_at, coalesce(expire_at, 0)
+            from table_snapshot_tag
+            where table_id = $1::TEXT and tag = $2::TEXT",
+        DaoType::CreateSnapshot =>
+            "with new_snapshot as (
+                insert into table_snapshot(table_id, created_at, description)
+                values ($1::TEXT, (extract(epoch from now()) * 1000)::BIGINT, $2::TEXT)
+                returning table_id, snapshot_id, created_at, description
+            ),
+            latest as (
+                select distinct on (partition_desc) partition_desc, version, snapshot
+                from partition_info
+                where table_id = $1::TEXT
+                order by partition_desc, version desc
+            ),
+            inserted as (
+                insert into snapshot_commit(table_id, snapshot_id, partition_desc, version, commit_id)
+                select distinct ns.table_id, ns.snapshot_id, l.partition_desc, l.version, c.commit_id
+                from new_snapshot ns, latest l, unnest(l.snapshot) as c(commit_id)
+                returning commit_id, partition_desc, version
+            ),
+            pin_commits as (
+                update data_commit_info dci set pinned = true
+                where dci.table_id = $1::TEXT
+                  and dci.commit_id in (select commit_id from inserted)
+                returning 1
+            ),
+            pin_versions as (
+                update partition_info pi set pinned = true
+                where pi.table_id = $1::TEXT
+                  and (pi.partition_desc, pi.version) in
+                      (select partition_desc, version from inserted)
+                returning 1
+            )
+            select table_id, snapshot_id, created_at, description from new_snapshot",
+        DaoType::DropSnapshot =>
+            "with removed as (
+                delete from table_snapshot
+                where table_id = $1::TEXT and snapshot_id = $2::BIGINT
+                returning table_id, snapshot_id, created_at, description
+            ),
+            removed_commits as (
+                delete from snapshot_commit
+                where table_id = $1::TEXT and snapshot_id = $2::BIGINT
+                returning commit_id, partition_desc, version
+            ),
+            unpin_commits as (
+                update data_commit_info dci set pinned = exists (
+                    select 1 from snapshot_commit sc
+                    where sc.table_id = $1::TEXT
+                      and sc.commit_id = dci.commit_id
+                      and sc.snapshot_id <> $2::BIGINT
+                )
+                where dci.table_id = $1::TEXT
+                returning 1
+            ),
+            unpin_versions as (
+                update partition_info pi set pinned = exists (
+                    select 1 from snapshot_commit sc
+                    where sc.table_id = $1::TEXT
+                      and sc.partition_desc = pi.partition_desc
+                      and sc.version = pi.version
+                      and sc.snapshot_id <> $2::BIGINT
+                )
+                where pi.table_id = $1::TEXT
+                returning 1
+            )
+            select table_id, snapshot_id, created_at, description from removed",
+        DaoType::CreateTag =>
+            "with inserted as (
+                insert into table_snapshot_tag(table_id, tag, snapshot_id, created_at)
+                values ($1::TEXT, $2::TEXT, $3::BIGINT,
+                        (extract(epoch from now()) * 1000)::BIGINT)
+                returning table_id, tag, snapshot_id, created_at,
+                          coalesce(expire_at, 0) as expire_at
+            )
+            select table_id, tag, snapshot_id, created_at, expire_at from inserted",
+        DaoType::DropTagByTableIdAndTag =>
+            "with removed as (
+                delete from table_snapshot_tag
+                where table_id = $1::TEXT and tag = $2::TEXT
+                returning table_id, tag, snapshot_id, created_at,
+                          coalesce(expire_at, 0) as expire_at
+            )
+            select table_id, tag, snapshot_id, created_at, expire_at from removed",
+        // Select Table Domain by id. `table_info` is the one row every table
+        // has; path-only tables have no `table_name_id` row.
+        DaoType::SelectTableDomainById =>
+            "select table_name, table_id, table_namespace, domain
+             from table_info where table_id = $1::TEXT",
+
+        // Insert
+        DaoType::InsertNamespace =>
+            "insert into namespace(
+                namespace,
+                properties,
+                comment,
+                domain)
+            values($1::TEXT, $2::JSON, $3::TEXT, $4::TEXT)",
+        DaoType::InsertTableInfo =>
+            "insert into table_info(
+                table_id,
+                table_name,
+                table_path,
+                table_schema,
+                table_schema_arrow_ipc,
+                table_schema_arrow_ipc_json_hash,
+                properties,
+                partitions,
+                table_namespace,
+                domain)
+            values($1::TEXT, $2::TEXT, $3::TEXT, $4::TEXT, $5::BYTEA, $6::TEXT, $7::JSON, $8::TEXT, $9::TEXT, $10::TEXT)",
+        DaoType::InsertTableNameId =>
+            "insert into table_name_id(
+                table_id,
+                table_name,
+                table_namespace,
+                domain)
+            values($1::TEXT, $2::TEXT, $3::TEXT, $4::TEXT)",
+        DaoType::InsertTablePathId =>
+            "insert into table_path_id(
+                table_id,
+                table_path,
+                table_namespace,
+                domain)
+            values($1::TEXT, $2::TEXT, $3::TEXT, $4::TEXT)",
+        DaoType::InsertTableAtomic =>
+            "with inserted_name as (
+                insert into table_name_id(table_id, table_name, table_namespace, domain)
+                values($1::TEXT, $2::TEXT, $9::TEXT, $10::TEXT)
+                returning table_id
+            ), inserted_path as (
+                insert into table_path_id(table_id, table_path, table_namespace, domain)
+                select $1::TEXT, $3::TEXT, $9::TEXT, $10::TEXT from inserted_name
+                returning table_id
+            )
+            insert into table_info(
+                table_id, table_name, table_path, table_schema,
+                table_schema_arrow_ipc, table_schema_arrow_ipc_json_hash,
+                properties, partitions, table_namespace, domain)
+            select $1::TEXT, $2::TEXT, $3::TEXT, $4::TEXT, $5::BYTEA, $6::TEXT,
+                   $7::JSON, $8::TEXT, $9::TEXT, $10::TEXT
+            from inserted_path",
+        DaoType::InsertTableIfNotExistsAtomic =>
+            "with inserted_name as (
+                insert into table_name_id(table_id, table_name, table_namespace, domain)
+                values($1::TEXT, $2::TEXT, $9::TEXT, $10::TEXT)
+                on conflict (table_name, table_namespace) do nothing
+                returning table_id
+            ), inserted_path as (
+                insert into table_path_id(table_id, table_path, table_namespace, domain)
+                select $1::TEXT, $3::TEXT, $9::TEXT, $10::TEXT from inserted_name
+                returning table_id
+            )
+            insert into table_info(
+                table_id, table_name, table_path, table_schema,
+                table_schema_arrow_ipc, table_schema_arrow_ipc_json_hash,
+                properties, partitions, table_namespace, domain)
+            select $1::TEXT, $2::TEXT, $3::TEXT, $4::TEXT, $5::BYTEA, $6::TEXT,
+                   $7::JSON, $8::TEXT, $9::TEXT, $10::TEXT
+            from inserted_path",
+        DaoType::InsertPartitionInfo =>
+            "insert into partition_info(
+                table_id,
+                partition_desc,
+                version,
+                commit_op,
+                snapshot,
+                expression,
+                domain)
+            values($1::TEXT, $2::TEXT, $3::INT, $4::TEXT, $5::_UUID, $6::TEXT, $7::TEXT)",
+        DaoType::InsertDataCommitInfo =>
+            "insert into data_commit_info(
+                table_id,
+                partition_desc,
+                commit_id,
+                file_ops,
+                commit_op,
+                timestamp,
+                committed,
+                domain
+            )
+            values($1::TEXT, $2::TEXT, $3::UUID, $4::_data_file_op, $5::TEXT, $6::BIGINT, $7::BOOL, $8::TEXT)",
+
+        DaoType::InsertDiscardCompressedFileInfo =>
+            "insert into discard_compressed_file_info(
+                file_path,
+                table_path,
+                partition_desc,
+                timestamp,
+                t_date
+            )
+            values($1::TEXT, $2::TEXT, $3::TEXT, $4::BIGINT, $5::DATE)",
+
+        // Query Scalar
+        DaoType::GetLatestTimestampFromPartitionInfo =>
+            "select max(timestamp) as timestamp
+            from partition_info
+            where table_id = $1::TEXT and partition_desc = $2::TEXT",
+        DaoType::GetLatestTimestampFromPartitionInfoWithoutPartitionDesc =>
+            "select max(timestamp) as timestamp
+            from partition_info
+            where table_id = $1::TEXT",
+        DaoType::GetLatestVersionUpToTimeFromPartitionInfo =>
+            "select max(version) as version
+            from partition_info
+            where table_id = $1::TEXT and partition_desc = $2::TEXT and timestamp < $3::BIGINT",
+        DaoType::GetLatestVersionTimestampUpToTimeFromPartitionInfo =>
+            "select max(timestamp) as timestamp
+            from partition_info
+            where table_id = $1::TEXT and partition_desc = $2::TEXT and timestamp < $3::BIGINT",
+
+        // Update / Delete
+        DaoType::DeleteNamespaceByNamespace =>
+            "delete from namespace
+            where namespace = $1::TEXT ",
+        DaoType::UpdateNamespacePropertiesByNamespace =>
+            "update namespace
+            set properties = $2::JSON where namespace = $1::TEXT",
+
+        DaoType::DeleteTableNameIdByTableNameAndNamespace =>
+            "delete from table_name_id
+            where table_name = $1::TEXT and table_namespace = $2::TEXT",
+        DaoType::DeleteTableNameIdByTableId =>
+            "delete from table_name_id
+            where table_id = $1::TEXT",
+
+        DaoType::DeleteTableInfoByIdAndPath =>
+            "delete from table_info
+            where table_id = $1::TEXT and table_path = $2::TEXT",
+        DaoType::UpdateTableInfoPropertiesById =>
+            "update table_info
+            set properties = $2::JSON where table_id = $1::TEXT",
+
+        DaoType::DeleteTablePathIdByTablePath =>
+            "delete from table_path_id
+            where table_path = $1::TEXT ",
+        DaoType::DeleteTablePathIdByTableId =>
+            "delete from table_path_id
+            where table_id = $1::TEXT ",
+
+        DaoType::DeleteOneDataCommitInfoByTableIdAndPartitionDescAndCommitId =>
+            "delete from data_commit_info
+            where table_id = $1::TEXT and partition_desc = $2::TEXT and commit_id = $3::UUID ",
+        DaoType::DeleteDataCommitInfoByTableIdAndPartitionDesc =>
+            "delete from data_commit_info
+            where table_id = $1::TEXT and partition_desc = $2::TEXT",
+        DaoType::DeleteDataCommitInfoByTableId =>
+            "delete from data_commit_info
+            where table_id = $1::TEXT",
+
+        DaoType::DeletePartitionInfoByTableId =>
+            "delete from partition_info
+            where table_id = $1::TEXT",
+        DaoType::DeletePartitionInfoByTableIdAndPartitionDesc =>
+            "delete from partition_info
+            where table_id = $1::TEXT and partition_desc = $2::TEXT",
+        DaoType::DeletePreviousVersionPartition =>
+            "delete from partition_info
+            where table_id = $1::TEXT and partition_desc = $2::TEXT
+              and timestamp <= $3::BIGINT and pinned = false",
+
+        DaoType::DeleteDiscardCompressedFileInfoByFilePath =>
+            "delete from discard_compressed_file_info
+            where file_path = $1::TEXT",
+        DaoType::DeleteDiscardCompressedFileInfoByTablePath =>
+            "delete from discard_compressed_file_info
+            where table_path = $1::TEXT",
+        DaoType::DeleteDiscardCompressedFileByFilterCondition =>
+            "delete from discard_compressed_file_info
+            where table_path = $1::TEXT and partition_desc = $2::TEXT and timestamp <= $3::BIGINT",
+
+        // not prepared
+        DaoType::UpdateTableInfoById |
+        DaoType::TransactionInsertDataCommitInfo |
+        DaoType::TransactionInsertPartitionInfo |
+        DaoType::TransactionInsertDiscardCompressedFile |
+        DaoType::ListDataCommitInfoByTableIdAndPartitionDescAndCommitList |
+        DaoType::ListDataCommitInfoByTableIdAndCommitIds |
+        DaoType::DeleteDataCommitInfoByTableIdAndPartitionDescAndCommitIdList |
+        DaoType::ListPartitionDescByTableIdAndParList => "",
+
+        /* _ => todo!(), */
+    };
+    client
+        .prepare_cached(statement, get_query_type(*dao_type))
+        .await
+}
+
+/// Parse the joined string to the parameters.
+fn get_params(joined_string: String) -> Vec<String> {
+    joined_string
+        .split(PARAM_DELIM)
+        .collect::<Vec<&str>>()
+        .into_iter()
+        .map(|s| s.to_string())
+        .collect::<Vec<String>>()
+}
+
+/// Separate the concatenated uuid radix string to the uuid string list.
+fn separate_uuid(concatenated_uuid: &str) -> Result<Vec<String>> {
+    let uuid_num = concatenated_uuid.len() / 32;
+    let mut uuid_list = Vec::<String>::with_capacity(uuid_num);
+    let mut idx = 0;
+    for _ in 0..uuid_num {
+        let high = u64::from_str_radix(&concatenated_uuid[idx..idx + 16], 16)?;
+        let low = u64::from_str_radix(&concatenated_uuid[idx + 16..idx + 32], 16)?;
+        uuid_list.push(uuid::Uuid::from_u64_pair(high, low).to_string());
+        idx += 32;
+    }
+    Ok(uuid_list)
+}
+
+/// Execute the query for the coded Data Access Object.
+#[instrument(
+    name = "metadata_query",
+    level = "info",
+    skip_all,
+    fields(
+        query_type,
+        dao_type = tracing::field::Empty,
+        param_count = tracing::field::Empty,
+        row_count = tracing::field::Empty,
+    ),
+    err
+)]
+pub async fn execute_query(
+    client: &PooledClient,
+    query_type: i32,
+    joined_string: String,
+) -> Result<Vec<u8>> {
+    if query_type >= DAO_TYPE_INSERT_ONE_OFFSET {
+        error!(query_type, "invalid metadata query type");
+        return Err(LakeSoulMetaDataError::from(ErrorKind::InvalidInput));
+    }
+    let query_type = DaoType::try_from(query_type)
+        .map_err(|e| LakeSoulMetaDataError::Other(Box::new(e)))?;
+    let dao_type_name = format!("{query_type:?}");
+    let span = tracing::Span::current();
+    span.record("dao_type", dao_type_name.as_str());
+    let mut request = MetadataRequestMetrics::start("query", dao_type_name);
+    let (conn, statement) = get_prepared_statement(client, &query_type).await?;
+
+    let params = get_params(joined_string);
+    span.record("param_count", params.len() as u64);
+
+    let rows = match query_type {
+        DaoType::ListNamespaces
+        | DaoType::ListAllTablePath
+        | DaoType::ListAllDiscardCompressedFileInfo
+            if params.len() == 1 && params[0].is_empty() =>
+        {
+            let result = conn.query(&statement, &[]).await;
+            match result {
+                Ok(rows) => rows,
+                Err(e) => return Err(LakeSoulMetaDataError::from(e)),
+            }
+        }
+        DaoType::ListNamespacesByDomain if params.len() == 1 => {
+            let result = conn.query(&statement, &[&params[0]]).await;
+            match result {
+                Ok(rows) => rows,
+                Err(e) => return Err(LakeSoulMetaDataError::from(e)),
+            }
+        }
+        DaoType::ListTableNamesByDomain if params.len() == 1 => {
+            let result = conn.query(&statement, &[&params[0]]).await;
+            match result {
+                Ok(rows) => rows,
+                Err(e) => return Err(LakeSoulMetaDataError::from(e)),
+            }
+        }
+        DaoType::ListTableNameByNamespace if params.len() == 1 => {
+            let result = conn.query(&statement, &[&params[0]]).await;
+            match result {
+                Ok(rows) => rows,
+                Err(e) => return Err(LakeSoulMetaDataError::from(e)),
+            }
+        }
+        DaoType::ListDiscardCompressedFileInfoBeforeTimestamp if params.len() == 1 => {
+            let result = conn.query(&statement, &[&i64::from_str(&params[0])?]).await;
+            match result {
+                Ok(rows) => rows,
+                Err(e) => return Err(LakeSoulMetaDataError::from(e)),
+            }
+        }
+        DaoType::ListDiscardCompressedFileByFilterCondition if params.len() == 3 => {
+            let result = conn
+                .query(
+                    &statement,
+                    &[&params[0], &params[1], &i64::from_str(&params[2])?],
+                )
+                .await;
+            match result {
+                Ok(rows) => rows,
+                Err(e) => return Err(LakeSoulMetaDataError::from(e)),
+            }
+        }
+        DaoType::SelectNamespaceByNamespace
+        | DaoType::SelectTableInfoByTableId
+        | DaoType::SelectTablePathIdByTablePath
+        | DaoType::SelectTableInfoByTablePath
+        | DaoType::SelectDiscardCompressedFileInfoByFilePath
+            if params.len() == 1 =>
+        {
+            let result = conn.query_opt(&statement, &[&params[0]]).await;
+            match result {
+                Ok(Some(row)) => vec![row],
+                Ok(None) => vec![],
+                Err(e) => return Err(LakeSoulMetaDataError::from(e)),
+            }
+        }
+        DaoType::ListPartitionByTableId | DaoType::ListAllPathTablePathByNamespace
+            if params.len() == 1 =>
+        {
+            let result = conn.query(&statement, &[&params[0]]).await;
+            match result {
+                Ok(rows) => rows,
+                Err(e) => return Err(LakeSoulMetaDataError::from(e)),
+            }
+        }
+        DaoType::SelectOnePartitionVersionByTableIdAndDesc
+        | DaoType::ListPartitionByTableIdAndDesc
+            if params.len() == 2 =>
+        {
+            let result = conn.query(&statement, &[&params[0], &params[1]]).await;
+            match result {
+                Ok(rows) => rows,
+                Err(e) => return Err(LakeSoulMetaDataError::from(e)),
+            }
+        }
+        DaoType::SelectOnePartitionVersionByTableIdAndDescAndTimestamp
+            if params.len() == 3 =>
+        {
+            let result = conn
+                .query_opt(
+                    &statement,
+                    &[&params[0], &params[1], &i64::from_str(&params[2])?],
+                )
+                .await;
+            match result {
+                Ok(Some(row)) => vec![row],
+                Ok(None) => vec![],
+                Err(e) => return Err(LakeSoulMetaDataError::from(e)),
+            }
+        }
+        DaoType::ListPartitionByTableIdAndTimestamp if params.len() == 2 => {
+            let result = conn
+                .query(&statement, &[&params[0], &i64::from_str(&params[1])?])
+                .await;
+            match result {
+                Ok(rows) => rows,
+                Err(e) => return Err(LakeSoulMetaDataError::from(e)),
+            }
+        }
+        DaoType::ListSnapshotsByTableId | DaoType::ListTagsByTableId
+            if params.len() == 1 =>
+        {
+            let result = conn.query(&statement, &[&params[0]]).await;
+            match result {
+                Ok(rows) => rows,
+                Err(e) => return Err(LakeSoulMetaDataError::from(e)),
+            }
+        }
+        DaoType::ListSnapshotCommitsBySnapshot | DaoType::DropSnapshot
+            if params.len() == 2 =>
+        {
+            let result = conn
+                .query(&statement, &[&params[0], &i64::from_str(&params[1])?])
+                .await;
+            match result {
+                Ok(rows) => rows,
+                Err(e) => return Err(LakeSoulMetaDataError::from(e)),
+            }
+        }
+        DaoType::SelectTagByTableIdAndTag
+        | DaoType::CreateSnapshot
+        | DaoType::DropTagByTableIdAndTag
+            if params.len() == 2 =>
+        {
+            let result = conn.query(&statement, &[&params[0], &params[1]]).await;
+            match result {
+                Ok(rows) => rows,
+                Err(e) => return Err(LakeSoulMetaDataError::from(e)),
+            }
+        }
+        DaoType::CreateTag if params.len() == 3 => {
+            let result = conn
+                .query(
+                    &statement,
+                    &[&params[0], &params[1], &i64::from_str(&params[2])?],
+                )
+                .await;
+            match result {
+                Ok(rows) => rows,
+                Err(e) => return Err(LakeSoulMetaDataError::from(e)),
+            }
+        }
+        DaoType::SelectTableNameIdByTableName
+        | DaoType::SelectTableInfoByTableNameAndNameSpace
+        | DaoType::SelectTableInfoByIdAndTablePath
+            if params.len() == 2 =>
+        {
+            let result = conn.query_opt(&statement, &[&params[0], &params[1]]).await;
+            match result {
+                Ok(Some(row)) => vec![row],
+                Ok(None) => vec![],
+                Err(e) => return Err(LakeSoulMetaDataError::from(e)),
+            }
+        }
+        DaoType::SelectOneDataCommitInfoByTableIdAndPartitionDescAndCommitId
+            if params.len() == 3 =>
+        {
+            let result = conn
+                .query_opt(
+                    &statement,
+                    &[&params[0], &params[1], &uuid::Uuid::from_str(&params[2])?],
+                )
+                .await;
+            match result {
+                Ok(Some(row)) => vec![row],
+                Ok(None) => vec![],
+                Err(e) => return Err(LakeSoulMetaDataError::from(e)),
+            }
+        }
+        DaoType::SelectOneDataCommitInfoByTableId if params.len() == 1 => {
+            let result = conn.query(&statement, &[&params[0]]).await;
+            match result {
+                Ok(rows) => rows,
+                Err(e) => return Err(LakeSoulMetaDataError::from(e)),
+            }
+        }
+        DaoType::SelectPartitionVersionByTableIdAndDescAndVersion
+            if params.len() == 3 =>
+        {
+            let result = conn
+                .query(
+                    &statement,
+                    &[&params[0], &params[1], &i32::from_str(&params[2])?],
+                )
+                .await;
+            match result {
+                Ok(rows) => rows,
+                Err(e) => return Err(LakeSoulMetaDataError::from(e)),
+            }
+        }
+        DaoType::SelectTableDomainById if params.len() == 1 => {
+            let result = conn.query(&statement, &[&params[0]]).await;
+            match result {
+                Ok(rows) => rows,
+                Err(e) => return Err(LakeSoulMetaDataError::from(e)),
+            }
+        }
+        DaoType::ListCommitOpsBetweenVersions
+        | DaoType::ListPartitionVersionByTableIdAndPartitionDescAndVersionRange
+            if params.len() == 4 =>
+        {
+            let result = conn
+                .query(
+                    &statement,
+                    &[
+                        &params[0],
+                        &params[1],
+                        &i32::from_str(&params[2])?,
+                        &i32::from_str(&params[3])?,
+                    ],
+                )
+                .await;
+            match result {
+                Ok(rows) => rows,
+                Err(e) => return Err(LakeSoulMetaDataError::from(e)),
+            }
+        }
+        DaoType::ListPartitionDescByTableIdAndParList if params.len() == 2 => {
+            let (conn, statement) = get_prepared_statement(
+                client,
+                &SelectOnePartitionVersionByTableIdAndDesc,
+            )
+            .await?;
+            let partitions = params[1].to_owned();
+            let partitions = partitions
+                .split(PARTITION_DESC_DELIM)
+                .collect::<Vec<&str>>();
+            let mut all_rows: Vec<Row> = vec![];
+            for part in partitions {
+                let result = conn.query(&statement, &[&params[0], &part]).await;
+                match result {
+                    Ok(mut rows) => all_rows.append(&mut rows),
+                    Err(e) => return Err(LakeSoulMetaDataError::from(e)),
+                }
+            }
+            all_rows
+        }
+        DaoType::ListPartitionVersionByTableIdAndPartitionDescAndTimestampRange
+            if params.len() == 4 =>
+        {
+            let result = conn
+                .query(
+                    &statement,
+                    &[
+                        &params[0],
+                        &params[1],
+                        &i64::from_str(&params[2])?,
+                        &i64::from_str(&params[3])?,
+                    ],
+                )
+                .await;
+            match result {
+                Ok(rows) => rows,
+                Err(e) => return Err(LakeSoulMetaDataError::from(e)),
+            }
+        }
+        DaoType::ListPartitionByTableIdAndFilterCondition if params.len() == 2 => {
+            let result = conn.query(&statement, &[&params[0], &params[1]]).await;
+            match result {
+                Ok(rows) => rows,
+                Err(e) => return Err(LakeSoulMetaDataError::from(e)),
+            }
+        }
+        DaoType::ListPartitionVersionsByTableIdAndMinVersion if params.len() == 2 => {
+            let min_version = params[1].parse::<i32>()?;
+            let result = conn.query(&statement, &[&params[0], &min_version]).await;
+            match result {
+                Ok(rows) => rows,
+                Err(e) => return Err(LakeSoulMetaDataError::from(e)),
+            }
+        }
+        DaoType::ListDataCommitInfoByTableIdAndCommitIds if params.len() == 2 => {
+            let concated_uuid = &params[1];
+            if !concated_uuid.len().is_multiple_of(32) {
+                eprintln!(
+                    "Invalid params of query_type={:?}, params={:?}",
+                    query_type, params
+                );
+                return Err(LakeSoulMetaDataError::from(ErrorKind::InvalidInput));
+            }
+            let uuid_list = separate_uuid(concated_uuid)?;
+            let uuid_str_list = "'".to_owned() + &uuid_list.join("','") + "'";
+            let uuid_list_str = uuid_list.join("");
+            let statement = format!(
+                "select table_id, partition_desc, commit_id, file_ops, commit_op, timestamp, committed, domain, pinned
+                from data_commit_info
+                where table_id = $1::TEXT
+                and commit_id in ({})
+                order by position(commit_id::text in '{}')",
+                uuid_str_list, uuid_list_str
+            );
+            let result = {
+                let statement = conn.prepare(&statement).await?;
+                conn.query(&statement, &[&params[0]]).await
+            };
+            match result {
+                Ok(rows) => rows,
+                Err(e) => return Err(LakeSoulMetaDataError::from(e)),
+            }
+        }
+        DaoType::ListDataCommitInfoByTableIdAndPartitionDescAndCommitList
+            if params.len() == 3 =>
+        {
+            let concated_uuid = &params[2];
+            if !concated_uuid.len().is_multiple_of(32) {
+                error!(
+                    dao_type = ?query_type,
+                    param_count = params.len(),
+                    "invalid metadata query parameters"
+                );
+                return Err(LakeSoulMetaDataError::from(ErrorKind::InvalidInput));
+            }
+
+            let uuid_list = separate_uuid(concated_uuid)?;
+
+            let uuid_str_list = "'".to_owned() + &uuid_list.join("','") + "'";
+
+            let uuid_list_str = uuid_list.join("");
+
+            let statement = format!(
+                "select table_id, partition_desc, commit_id, file_ops, commit_op, timestamp, committed, domain, pinned
+                from data_commit_info
+                where table_id = $1::TEXT and partition_desc = $2::TEXT
+                and commit_id in ({})
+                order by position(commit_id::text in '{}')",
+                uuid_str_list, uuid_list_str
+            );
+
+            let result = {
+                let statement = conn.prepare(&statement).await?;
+                conn.query(&statement, &[&params[0], &params[1]]).await
+            };
+            match result {
+                Ok(rows) => rows,
+                Err(e) => return Err(LakeSoulMetaDataError::from(e)),
+            }
+        }
+        _ => {
+            error!(
+                dao_type = ?query_type,
+                param_count = params.len(),
+                "invalid metadata query parameter count"
+            );
+            return Err(LakeSoulMetaDataError::from(ErrorKind::InvalidInput));
+        }
+    };
+
+    span.record("row_count", rows.len() as u64);
+    request.record_rows(rows.len() as u64);
+
+    // The rows are already fetched: return the pooled connection before the
+    // (possibly large) row deserialization.
+    drop(conn);
+
+    let result_type = match query_type {
+        DaoType::SelectNamespaceByNamespace
+        | DaoType::ListNamespaces
+        | DaoType::ListNamespacesByDomain => ResultType::Namespace,
+
+        DaoType::SelectTableInfoByTableId
+        | DaoType::SelectTableInfoByTableNameAndNameSpace
+        | DaoType::SelectTableInfoByTablePath
+        | DaoType::SelectTableInfoByIdAndTablePath => ResultType::TableInfo,
+
+        DaoType::SelectTablePathIdByTablePath | DaoType::ListAllTablePath => {
+            ResultType::TablePathId
+        }
+
+        DaoType::SelectTableNameIdByTableName
+        | DaoType::ListTableNameByNamespace
+        | DaoType::SelectTableDomainById
+        | DaoType::ListTableNamesByDomain => ResultType::TableNameId,
+
+        DaoType::ListPartitionByTableId
+        | DaoType::ListPartitionDescByTableIdAndParList
+        | DaoType::SelectPartitionVersionByTableIdAndDescAndVersion
+        | DaoType::SelectOnePartitionVersionByTableIdAndDesc
+        | DaoType::SelectOnePartitionVersionByTableIdAndDescAndTimestamp
+        | DaoType::ListPartitionByTableIdAndDesc
+        | DaoType::ListPartitionVersionByTableIdAndPartitionDescAndTimestampRange
+        | DaoType::ListPartitionVersionByTableIdAndPartitionDescAndVersionRange
+        | DaoType::ListPartitionByTableIdAndTimestamp
+        | DaoType::ListPartitionByTableIdAndFilterCondition
+        | DaoType::ListPartitionVersionsByTableIdAndMinVersion => {
+            ResultType::PartitionInfo
+        }
+
+        DaoType::ListSnapshotsByTableId
+        | DaoType::CreateSnapshot
+        | DaoType::DropSnapshot => ResultType::SnapshotInfo,
+
+        DaoType::ListSnapshotCommitsBySnapshot => ResultType::SnapshotCommitInfo,
+
+        DaoType::ListTagsByTableId
+        | DaoType::SelectTagByTableIdAndTag
+        | DaoType::CreateTag
+        | DaoType::DropTagByTableIdAndTag => ResultType::SnapshotTagInfo,
+
+        DaoType::SelectOneDataCommitInfoByTableIdAndPartitionDescAndCommitId
+        | DaoType::SelectOneDataCommitInfoByTableId
+        | DaoType::ListDataCommitInfoByTableIdAndPartitionDescAndCommitList
+        | DaoType::ListDataCommitInfoByTableIdAndCommitIds => ResultType::DataCommitInfo,
+
+        DaoType::ListAllPathTablePathByNamespace => ResultType::TablePathIdWithOnlyPath,
+
+        DaoType::ListCommitOpsBetweenVersions => {
+            ResultType::PartitionInfoWithOnlyCommitOp
+        }
+
+        DaoType::SelectDiscardCompressedFileInfoByFilePath
+        | DaoType::ListAllDiscardCompressedFileInfo
+        | DaoType::ListDiscardCompressedFileInfoBeforeTimestamp
+        | DaoType::ListDiscardCompressedFileByFilterCondition => {
+            ResultType::DiscardCompressedFileInfo
+        }
+        _ => {
+            error!(dao_type = ?query_type, "invalid metadata query result type");
+            return Err(LakeSoulMetaDataError::from(ErrorKind::InvalidInput));
+        }
+    };
+
+    let wrapper = match result_type {
+        ResultType::TableNameId => {
+            let table_name_id: Vec<entity::TableNameId> = rows
+                .iter()
+                .map(|row| entity::TableNameId {
+                    table_name: row.get(0),
+                    table_id: row.get(1),
+                    table_namespace: row.get(2),
+                    domain: row.get(3),
+                })
+                .collect();
+            entity::JniWrapper {
+                table_name_id,
+                ..Default::default()
+            }
+        }
+        ResultType::TablePathId => {
+            let table_path_id: Vec<entity::TablePathId> = rows
+                .iter()
+                .map(|row| entity::TablePathId {
+                    table_path: row.get(0),
+                    table_id: row.get(1),
+                    table_namespace: row.get(2),
+                    domain: row.get(3),
+                })
+                .collect();
+            entity::JniWrapper {
+                table_path_id,
+                ..Default::default()
+            }
+        }
+        ResultType::TablePathIdWithOnlyPath => {
+            let table_path_id: Vec<entity::TablePathId> = rows
+                .iter()
+                .map(|row| entity::TablePathId {
+                    table_path: row.get(0),
+                    ..Default::default()
+                })
+                .collect();
+            entity::JniWrapper {
+                table_path_id,
+                ..Default::default()
+            }
+        }
+
+        ResultType::Namespace => {
+            let namespace: Vec<entity::Namespace> = rows
+                .iter()
+                .map(|row| entity::Namespace {
+                    namespace: row.get(0),
+                    properties: row.get::<_, serde_json::Value>(1).to_string(),
+                    comment: row.get::<_, Option<String>>(2).unwrap_or(String::from("")),
+                    domain: row.get(3),
+                })
+                .collect();
+            entity::JniWrapper {
+                namespace,
+                ..Default::default()
+            }
+        }
+        ResultType::TableInfo => {
+            let table_info: Vec<entity::TableInfo> = rows
+                .iter()
+                .map(|row| entity::TableInfo {
+                    table_id: row.get(0),
+                    table_name: row.get(1),
+                    table_path: row.get(2),
+                    table_schema: row.get(3),
+                    table_schema_arrow_ipc: row
+                        .get::<_, Option<Vec<u8>>>(4)
+                        .unwrap_or_default(),
+                    table_schema_arrow_ipc_json_hash: row
+                        .get::<_, Option<String>>(5)
+                        .unwrap_or_default(),
+                    properties: row.get::<_, serde_json::Value>(6).to_string(),
+                    partitions: row.get(7),
+                    table_namespace: row.get(8),
+                    domain: row.get(9),
+                })
+                .collect();
+            entity::JniWrapper {
+                table_info,
+                ..Default::default()
+            }
+        }
+        ResultType::SnapshotInfo => {
+            let snapshot_info: Vec<entity::SnapshotInfo> = rows
+                .iter()
+                .map(|row| entity::SnapshotInfo {
+                    table_id: row.get(0),
+                    snapshot_id: row.get(1),
+                    created_at: row.get(2),
+                    description: row
+                        .get::<_, Option<String>>(3)
+                        .unwrap_or(String::from("")),
+                })
+                .collect();
+            entity::JniWrapper {
+                snapshot_info,
+                ..Default::default()
+            }
+        }
+        ResultType::SnapshotCommitInfo => {
+            let snapshot_commit_info: Vec<entity::SnapshotCommitInfo> = rows
+                .iter()
+                .map(|row| {
+                    let (high, low) = row.get::<_, uuid::Uuid>(4).as_u64_pair();
+                    entity::SnapshotCommitInfo {
+                        table_id: row.get(0),
+                        snapshot_id: row.get(1),
+                        partition_desc: row.get(2),
+                        version: row.get::<_, i32>(3),
+                        commit_id: Some(entity::Uuid { high, low }),
+                    }
+                })
+                .collect();
+            entity::JniWrapper {
+                snapshot_commit_info,
+                ..Default::default()
+            }
+        }
+        ResultType::SnapshotTagInfo => {
+            let snapshot_tag_info: Vec<entity::SnapshotTagInfo> = rows
+                .iter()
+                .map(|row| entity::SnapshotTagInfo {
+                    table_id: row.get(0),
+                    tag: row.get(1),
+                    snapshot_id: row.get(2),
+                    created_at: row.get(3),
+                    expire_at: row.get(4),
+                })
+                .collect();
+            entity::JniWrapper {
+                snapshot_tag_info,
+                ..Default::default()
+            }
+        }
+        ResultType::PartitionInfo => {
+            let partition_info: Vec<entity::PartitionInfo> = rows
+                .iter()
+                .map(|row| {
+                    Ok(entity::PartitionInfo {
+                        table_id: row.get(0),
+                        partition_desc: row.get(1),
+                        version: row.get::<_, i32>(2),
+                        commit_op: entity::CommitOp::from_str_name(row.get(3)).ok_or(
+                            LakeSoulMetaDataError::Internal("unknown commit_op".into()),
+                        )? as i32,
+                        snapshot: row_to_uuid_list(row),
+                        timestamp: row.get::<_, i64>(5),
+                        expression: row
+                            .get::<_, Option<String>>(6)
+                            .unwrap_or(String::from("")),
+                        domain: row.get(7),
+                        pinned: row.get(8),
+                    })
+                })
+                .collect::<Result<Vec<entity::PartitionInfo>>>()?;
+            entity::JniWrapper {
+                partition_info,
+                ..Default::default()
+            }
+        }
+        ResultType::PartitionInfoWithOnlyCommitOp => {
+            let partition_info: Vec<entity::PartitionInfo> = rows
+                .iter()
+                .map(|row| {
+                    Ok(entity::PartitionInfo {
+                        commit_op: entity::CommitOp::from_str_name(row.get(0)).ok_or(
+                            LakeSoulMetaDataError::Internal("unknown commit_op".into()),
+                        )? as i32,
+                        ..Default::default()
+                    })
+                })
+                .collect::<Result<Vec<entity::PartitionInfo>>>()?;
+            entity::JniWrapper {
+                partition_info,
+                ..Default::default()
+            }
+        }
+        ResultType::DataCommitInfo => {
+            let data_commit_info: Vec<entity::DataCommitInfo> = rows
+                .iter()
+                .map(|row| {
+                    Ok(entity::DataCommitInfo {
+                        table_id: row.get(0),
+                        partition_desc: row.get(1),
+                        commit_id: {
+                            let (high, low) = row.get::<_, uuid::Uuid>(2).as_u64_pair();
+                            Some(entity::Uuid { high, low })
+                        },
+                        file_ops: row
+                            .get::<_, Vec<DataFileOp>>(3)
+                            .iter()
+                            .map(|data_file_op| data_file_op.as_proto_data_file_op())
+                            .collect::<Result<Vec<entity::DataFileOp>>>()?,
+                        commit_op: entity::CommitOp::from_str_name(row.get(4)).ok_or(
+                            LakeSoulMetaDataError::Internal("unknown commit_op".into()),
+                        )? as i32,
+                        timestamp: row.get(5),
+                        committed: row.get(6),
+                        domain: row.get(7),
+                        pinned: row.get(8),
+                    })
+                })
+                .collect::<Result<Vec<entity::DataCommitInfo>>>()?;
+            entity::JniWrapper {
+                data_commit_info,
+                ..Default::default()
+            }
+        }
+        ResultType::DiscardCompressedFileInfo => {
+            let discard_compressed_file_info: Vec<entity::DiscardCompressedFileInfo> =
+                rows.iter()
+                    .map(|row| entity::DiscardCompressedFileInfo {
+                        file_path: row.get(0),
+                        table_path: row.get(1),
+                        partition_desc: row.get(2),
+                        timestamp: row.get(3),
+                        t_date: row.get::<_, NaiveDate>(4).format("%Y-%m-%d").to_string(),
+                    })
+                    .collect();
+            entity::JniWrapper {
+                discard_compressed_file_info,
+                ..Default::default()
+            }
+        }
+    };
+    request.success();
+    Ok(wrapper.encode_to_vec())
+}
+
+/// Execute the insert for the coded Data Access Object.
+#[instrument(
+    name = "metadata_insert",
+    level = "info",
+    skip_all,
+    fields(
+        insert_type,
+        dao_type = tracing::field::Empty,
+        affected_rows = tracing::field::Empty,
+    ),
+    err
+)]
+pub async fn execute_insert(
+    client: &mut PooledClient,
+    insert_type: i32,
+    wrapper: entity::JniWrapper,
+) -> Result<i32> {
+    if !(DAO_TYPE_INSERT_ONE_OFFSET..DAO_TYPE_QUERY_SCALAR_OFFSET).contains(&insert_type)
+    {
+        error!("Invalid insert_type_index: {:?}", insert_type);
+        return Err(LakeSoulMetaDataError::from(ErrorKind::InvalidInput));
+    }
+    let insert_type = DaoType::try_from(insert_type)
+        .map_err(|e| LakeSoulMetaDataError::Other(Box::new(e)))?;
+    let dao_type_name = format!("{insert_type:?}");
+    let span = tracing::Span::current();
+    span.record("dao_type", dao_type_name.as_str());
+    let mut request = MetadataRequestMetrics::start("insert", dao_type_name);
+    let (mut client, statement) = get_prepared_statement(client, &insert_type).await?;
+
+    let result = match insert_type {
+        DaoType::InsertNamespace if wrapper.namespace.len() == 1 => {
+            let namespace = wrapper.namespace.first().unwrap();
+            let properties: serde_json::Value =
+                serde_json::from_str(&namespace.properties)?;
+            client
+                .execute(
+                    &statement,
+                    &[
+                        &namespace.namespace,
+                        &properties,
+                        &namespace.comment,
+                        &namespace.domain,
+                    ],
+                )
+                .await
+        }
+        DaoType::InsertTableInfo
+        | DaoType::InsertTableAtomic
+        | DaoType::InsertTableIfNotExistsAtomic
+            if wrapper.table_info.len() == 1 =>
+        {
+            let table_info = wrapper.table_info.first().unwrap();
+            let properties: serde_json::Value =
+                serde_json::from_str(&table_info.properties)?;
+            let table_schema_arrow_ipc: Option<&[u8]> =
+                (!table_info.table_schema_arrow_ipc.is_empty())
+                    .then_some(table_info.table_schema_arrow_ipc.as_slice());
+            let table_schema_arrow_ipc_json_hash: Option<&str> =
+                (!table_info.table_schema_arrow_ipc_json_hash.is_empty())
+                    .then_some(table_info.table_schema_arrow_ipc_json_hash.as_str());
+            client
+                .execute(
+                    &statement,
+                    &[
+                        &table_info.table_id,
+                        &table_info.table_name,
+                        &table_info.table_path,
+                        &table_info.table_schema,
+                        &table_schema_arrow_ipc,
+                        &table_schema_arrow_ipc_json_hash,
+                        &properties,
+                        &table_info.partitions,
+                        &table_info.table_namespace,
+                        &table_info.domain,
+                    ],
+                )
+                .await
+        }
+        DaoType::InsertTableNameId if wrapper.table_name_id.len() == 1 => {
+            let table_name_id = wrapper.table_name_id.first().unwrap();
+            client
+                .execute(
+                    &statement,
+                    &[
+                        &table_name_id.table_id,
+                        &table_name_id.table_name,
+                        &table_name_id.table_namespace,
+                        &table_name_id.domain,
+                    ],
+                )
+                .await
+        }
+        DaoType::InsertTablePathId if wrapper.table_path_id.len() == 1 => {
+            let table_path_id = wrapper.table_path_id.first().unwrap();
+            client
+                .execute(
+                    &statement,
+                    &[
+                        &table_path_id.table_id,
+                        &table_path_id.table_path,
+                        &table_path_id.table_namespace,
+                        &table_path_id.domain,
+                    ],
+                )
+                .await
+        }
+        DaoType::InsertPartitionInfo if wrapper.partition_info.len() == 1 => {
+            let partition_info = wrapper.partition_info.first().unwrap();
+            let snapshot = partition_info
+                .snapshot
+                .iter()
+                .map(|_uuid| uuid::Uuid::from_u64_pair(_uuid.high, _uuid.low))
+                .collect::<Vec<uuid::Uuid>>();
+            client
+                .execute(
+                    &statement,
+                    &[
+                        &partition_info.table_id,
+                        &partition_info.partition_desc,
+                        &partition_info.version,
+                        &partition_info.commit_op().as_str_name(),
+                        &snapshot,
+                        &partition_info.expression,
+                        &partition_info.domain,
+                    ],
+                )
+                .await
+        }
+        DaoType::InsertDataCommitInfo if wrapper.data_commit_info.len() == 1 => {
+            let data_commit_info = wrapper.data_commit_info.first().unwrap();
+            let file_ops = data_commit_info
+                .file_ops
+                .iter()
+                .map(DataFileOp::from_proto_data_file_op)
+                .collect::<Result<Vec<DataFileOp>>>()?;
+            let commit_id = data_commit_info
+                .commit_id
+                .as_ref()
+                .ok_or(LakeSoulMetaDataError::Internal("commit_id missing".into()))?;
+            let _uuid = uuid::Uuid::from_u64_pair(commit_id.high, commit_id.low);
+
+            client
+                .execute(
+                    &statement,
+                    &[
+                        &data_commit_info.table_id,
+                        &data_commit_info.partition_desc,
+                        &_uuid,
+                        &file_ops,
+                        &data_commit_info.commit_op().as_str_name(),
+                        &data_commit_info.timestamp,
+                        &data_commit_info.committed,
+                        &data_commit_info.domain,
+                    ],
+                )
+                .await
+        }
+        DaoType::TransactionInsertPartitionInfo => {
+            let publication = wrapper.partition_info_commit.ok_or_else(|| {
+                LakeSoulMetaDataError::Internal(
+                    "partition publication request missing".to_string(),
+                )
+            })?;
+            if publication.partitions.is_empty() {
+                return Err(LakeSoulMetaDataError::Internal(
+                    "partition publication must contain at least one real partition"
+                        .to_string(),
+                ));
+            }
+            let result = {
+                let transaction = client.transaction().await?;
+                let transaction_insert_statement = match transaction
+                    .prepare(
+                        "insert into partition_info(
+                        table_id,
+                        partition_desc,
+                        version,
+                        commit_op,
+                        snapshot,
+                        expression,
+                        domain
+                    )
+                    values($1::TEXT, $2::TEXT, $3::INT, $4::TEXT, $5::_UUID, $6::TEXT, $7::TEXT)",
+                    )
+                    .await
+                {
+                    Ok(statement) => statement,
+                    Err(e) => return Err(LakeSoulMetaDataError::from(e)),
+                };
+
+                let update_statement = match transaction
+                    .prepare(
+                        "update data_commit_info set committed = 'true' \
+                         where table_id = $1::TEXT and partition_desc = $2::TEXT \
+                         and commit_id = $3::UUID",
+                    )
+                    .await
+                {
+                    Ok(statement) => statement,
+                    Err(e) => return Err(LakeSoulMetaDataError::from(e)),
+                };
+
+                for entry in &publication.partitions {
+                    let partition_info =
+                        entry.partition_info.as_ref().ok_or_else(|| {
+                            LakeSoulMetaDataError::Internal(
+                                "partition publication entry missing its partition"
+                                    .to_string(),
+                            )
+                        })?;
+                    let snapshot = partition_info
+                        .snapshot
+                        .iter()
+                        .map(|_uuid| uuid::Uuid::from_u64_pair(_uuid.high, _uuid.low))
+                        .collect::<Vec<uuid::Uuid>>();
+
+                    let result = transaction
+                        .execute(
+                            &transaction_insert_statement,
+                            &[
+                                &partition_info.table_id,
+                                &partition_info.partition_desc,
+                                &partition_info.version,
+                                &partition_info.commit_op().as_str_name(),
+                                &snapshot,
+                                &partition_info.expression,
+                                &partition_info.domain,
+                            ],
+                        )
+                        .await;
+
+                    if let Err(error) = result {
+                        let is_conflict = error.as_db_error().is_some_and(|db_error| {
+                            db_error.code()
+                                == &tokio_postgres::error::SqlState::UNIQUE_VIOLATION
+                                || db_error.code()
+                                    == &tokio_postgres::error::SqlState::T_R_SERIALIZATION_FAILURE
+                        });
+                        error!(error = %error, "partition metadata transaction insert failed");
+                        transaction.rollback().await?;
+                        if is_conflict {
+                            // A concurrent publication raced this one; report
+                            // zero rows so the coordinator rebuilds and retries.
+                            return Ok(0i32);
+                        }
+                        return Err(LakeSoulMetaDataError::from(error));
+                    };
+                    for _uuid in &entry.commit_id {
+                        let uid = uuid::Uuid::from_u64_pair(_uuid.high, _uuid.low);
+                        match transaction
+                            .execute(
+                                &update_statement,
+                                &[
+                                    &partition_info.table_id,
+                                    &partition_info.partition_desc,
+                                    &uid,
+                                ],
+                            )
+                            .await
+                        {
+                            Ok(1) => {}
+                            Ok(count) => {
+                                transaction.rollback().await?;
+                                return Err(LakeSoulMetaDataError::Internal(format!(
+                                    "expected to publish data commit {uid} on partition {}, updated {count} rows",
+                                    partition_info.partition_desc
+                                )));
+                            }
+                            Err(error) => {
+                                error!(error = %error, "metadata commit update failed");
+                                transaction.rollback().await?;
+                                return Err(LakeSoulMetaDataError::from(error));
+                            }
+                        }
+                    }
+                }
+                match transaction.commit().await {
+                    Ok(()) => Ok(publication.partitions.len() as u64),
+                    Err(error) => {
+                        let is_conflict = error.as_db_error().is_some_and(|db_error| {
+                            db_error.code()
+                                == &tokio_postgres::error::SqlState::UNIQUE_VIOLATION
+                                || db_error.code()
+                                    == &tokio_postgres::error::SqlState::T_R_SERIALIZATION_FAILURE
+                        });
+                        if is_conflict {
+                            // A concurrent publication raced this one; report
+                            // zero rows so the coordinator rebuilds and retries.
+                            Ok(0u64)
+                        } else {
+                            Err(error)
+                        }
+                    }
+                }
+            };
+            match result {
+                Ok(count) => Ok(count),
+                Err(e) => return Err(LakeSoulMetaDataError::from(e)),
+            }
+        }
+        DaoType::TransactionInsertDataCommitInfo => {
+            let data_commit_info_list = wrapper.data_commit_info;
+            let result = {
+                let transaction = client.transaction().await?;
+                let prepared = transaction
+                    .prepare(
+                        "insert into data_commit_info(
+                        table_id,
+                        partition_desc,
+                        commit_id,
+                        file_ops,
+                        commit_op,
+                        timestamp,
+                        committed,
+                        domain
+                    )
+                    values($1::TEXT, $2::TEXT, $3::UUID, $4::_data_file_op, $5::TEXT, $6::BIGINT, $7::BOOL, $8::TEXT)",
+                    )
+                    .await;
+                let statement = match prepared {
+                    Ok(statement) => statement,
+                    Err(e) => return Err(LakeSoulMetaDataError::from(e)),
+                };
+
+                for data_commit_info in &data_commit_info_list {
+                    let file_ops = data_commit_info
+                        .file_ops
+                        .iter()
+                        .map(DataFileOp::from_proto_data_file_op)
+                        .collect::<Result<Vec<DataFileOp>>>()?;
+                    let commit_id = data_commit_info.commit_id.as_ref().ok_or(
+                        LakeSoulMetaDataError::Internal("commit_id missing".to_string()),
+                    )?;
+                    let _uuid = uuid::Uuid::from_u64_pair(commit_id.high, commit_id.low);
+
+                    let result = transaction
+                        .execute(
+                            &statement,
+                            &[
+                                &data_commit_info.table_id,
+                                &data_commit_info.partition_desc,
+                                &_uuid,
+                                &file_ops,
+                                &data_commit_info.commit_op().as_str_name(),
+                                &data_commit_info.timestamp,
+                                &data_commit_info.committed,
+                                &data_commit_info.domain,
+                            ],
+                        )
+                        .await;
+                    if let Some(e) = result.err() {
+                        error!(error = %e, "data commit metadata transaction insert failed");
+                        return match transaction.rollback().await {
+                            Ok(()) => Ok(0i32),
+                            Err(e) => Err(LakeSoulMetaDataError::from(e)),
+                        };
+                    };
+                }
+                match transaction.commit().await {
+                    Ok(()) => Ok(data_commit_info_list.len() as u64),
+                    Err(e) => Err(e),
+                }
+            };
+            match result {
+                Ok(count) => Ok(count),
+                Err(e) => return Err(LakeSoulMetaDataError::from(e)),
+            }
+        }
+        DaoType::InsertDiscardCompressedFileInfo
+            if wrapper.discard_compressed_file_info.len() == 1 =>
+        {
+            let discard_compressed_file_info =
+                wrapper.discard_compressed_file_info.first().unwrap();
+            client
+                .execute(
+                    &statement,
+                    &[
+                        &discard_compressed_file_info.file_path,
+                        &discard_compressed_file_info.table_path,
+                        &discard_compressed_file_info.partition_desc,
+                        &discard_compressed_file_info.timestamp,
+                        &NaiveDate::parse_from_str(
+                            &discard_compressed_file_info.t_date,
+                            "%Y-%m-%d",
+                        )
+                        .unwrap(),
+                    ],
+                )
+                .await
+        }
+        DaoType::TransactionInsertDiscardCompressedFile => {
+            let discard_compressed_file_list = wrapper.discard_compressed_file_info;
+            let result = {
+                let transaction = client.transaction().await?;
+                let insert_statement = match transaction
+                    .prepare(
+                        "insert into discard_compressed_file_info (
+                            file_path,
+                            table_path,
+                            partition_desc,
+                            timestamp,
+                            t_date
+                        ) values ($1::TEXT, $2::TEXT, $3::TEXT, $4::BIGINT, $5::DATE)",
+                    )
+                    .await
+                {
+                    Ok(statement) => statement,
+                    Err(e) => return Err(LakeSoulMetaDataError::from(e)),
+                };
+                for discard_compressed_file_info in &discard_compressed_file_list {
+                    let result = transaction
+                        .execute(
+                            &insert_statement,
+                            &[
+                                &discard_compressed_file_info.file_path,
+                                &discard_compressed_file_info.table_path,
+                                &discard_compressed_file_info.partition_desc,
+                                &discard_compressed_file_info.timestamp,
+                                &NaiveDate::parse_from_str(
+                                    &discard_compressed_file_info.t_date,
+                                    "%Y-%m-%d",
+                                )
+                                .unwrap(),
+                            ],
+                        )
+                        .await;
+
+                    if let Some(e) = result.err() {
+                        error!(error = %e, "discard file metadata transaction insert failed");
+                        return match transaction.rollback().await {
+                            Ok(()) => Ok(0i32),
+                            Err(e) => Err(LakeSoulMetaDataError::from(e)),
+                        };
+                    };
+                }
+                match transaction.commit().await {
+                    Ok(()) => Ok(discard_compressed_file_list.len() as u64),
+                    Err(e) => Err(e),
+                }
+            };
+            match result {
+                Ok(count) => Ok(count),
+                Err(e) => return Err(LakeSoulMetaDataError::from(e)),
+            }
+        }
+        _ => {
+            error!(dao_type = ?insert_type, "invalid metadata insert payload");
+            return Err(LakeSoulMetaDataError::from(ErrorKind::InvalidInput));
+        }
+    };
+    match result {
+        Ok(count) => {
+            span.record("affected_rows", count);
+            request.record_rows(count);
+            request.success();
+            Ok(count as i32)
+        }
+        Err(e) => Err(LakeSoulMetaDataError::from(e)),
+    }
+}
+
+/// Best-effort index metadata cleanup triggered by metadata deletions.
+///
+/// The index data lives in object storage and is removed with the dropped
+/// directory, so a failed cleanup only leaves orphan control-plane rows;
+/// never fail the caller's delete for it.
+fn log_index_cleanup(result: Result<()>) {
+    if let Err(error) = result {
+        tracing::warn!("failed to clean index metadata: {error}");
+    }
+}
+
+/// Execute the update for the coded Data Access Object.
+#[instrument(
+    name = "metadata_update",
+    level = "info",
+    skip_all,
+    fields(
+        update_type,
+        dao_type = tracing::field::Empty,
+        param_count = tracing::field::Empty,
+        affected_rows = tracing::field::Empty,
+    ),
+    err
+)]
+pub async fn execute_update(
+    client: &mut PooledClient,
+    update_type: i32,
+    joined_string: String,
+) -> Result<i32> {
+    if update_type < DAO_TYPE_UPDATE_OFFSET {
+        error!("Invalid update_type_index: {:?}", update_type);
+        return Err(LakeSoulMetaDataError::from(ErrorKind::InvalidInput));
+    }
+    let update_type = DaoType::try_from(update_type)
+        .map_err(|e| LakeSoulMetaDataError::Other(Box::new(e)))?;
+    let dao_type_name = format!("{update_type:?}");
+    let span = tracing::Span::current();
+    span.record("dao_type", dao_type_name.as_str());
+    let mut request = MetadataRequestMetrics::start("update", dao_type_name);
+    let (client, statement) = get_prepared_statement(client, &update_type).await?;
+
+    let params = joined_string
+        .split(PARAM_DELIM)
+        .collect::<Vec<&str>>()
+        .iter()
+        .map(|str| str.to_string())
+        .collect::<Vec<String>>();
+    span.record("param_count", params.len() as u64);
+
+    let result = match update_type {
+        DaoType::DeleteNamespaceByNamespace
+        | DaoType::DeleteDataCommitInfoByTableId
+        | DaoType::DeleteTableNameIdByTableId
+        | DaoType::DeleteTablePathIdByTableId
+        | DaoType::DeleteTablePathIdByTablePath
+        | DaoType::DeleteDiscardCompressedFileInfoByFilePath
+        | DaoType::DeleteDiscardCompressedFileInfoByTablePath
+            if params.len() == 1 =>
+        {
+            client.execute(&statement, &[&params[0]]).await
+        }
+        // Dropping all partitions removes the whole tree of index shards;
+        // the index data under the table path is gone with it.
+        DaoType::DeletePartitionInfoByTableId if params.len() == 1 => {
+            let result = client.execute(&statement, &[&params[0]]).await;
+            log_index_cleanup(
+                crate::index_catalog::clean_for_table_id(&client, &params[0]).await,
+            );
+            result
+        }
+        DaoType::DeleteDiscardCompressedFileByFilterCondition if params.len() == 3 => {
+            client
+                .execute(
+                    &statement,
+                    &[&params[0], &params[1], &i64::from_str(&params[2])?],
+                )
+                .await
+        }
+        DaoType::DeleteTableNameIdByTableNameAndNamespace
+        | DaoType::DeleteDataCommitInfoByTableIdAndPartitionDesc
+            if params.len() == 2 =>
+        {
+            client.execute(&statement, &[&params[0], &params[1]]).await
+        }
+        // Dropping a table removes the whole index directory.
+        DaoType::DeleteTableInfoByIdAndPath if params.len() == 2 => {
+            let result = client.execute(&statement, &[&params[0], &params[1]]).await;
+            log_index_cleanup(
+                crate::index_catalog::clean_for_table_path(&client, &params[1]).await,
+            );
+            result
+        }
+        // Dropping a partition removes its index shards.
+        DaoType::DeletePartitionInfoByTableIdAndPartitionDesc if params.len() == 2 => {
+            let result = client.execute(&statement, &[&params[0], &params[1]]).await;
+            log_index_cleanup(
+                crate::index_catalog::clean_for_partition(
+                    &client, &params[0], &params[1],
+                )
+                .await,
+            );
+            result
+        }
+        DaoType::UpdateTableInfoPropertiesById
+        | DaoType::UpdateNamespacePropertiesByNamespace
+            if params.len() == 2 =>
+        {
+            let properties: serde_json::Value = serde_json::from_str(&params[1])?;
+            client.execute(&statement, &[&params[0], &properties]).await
+        }
+        DaoType::DeletePreviousVersionPartition if params.len() == 3 => {
+            let ts = i64::from_str(&params[2])?;
+            client
+                .execute(&statement, &[&params[0], &params[1], &ts])
+                .await
+        }
+        DaoType::DeleteOneDataCommitInfoByTableIdAndPartitionDescAndCommitId
+            if params.len() == 3 =>
+        {
+            let commit_id: uuid::Uuid = uuid::Uuid::from_str(&params[2])?;
+            client
+                .execute(&statement, &[&params[0], &params[1], &commit_id])
+                .await
+        }
+        DaoType::UpdateTableInfoById if params.len() == 4 => {
+            let mut statement = "update table_info set ".to_owned();
+            let mut idx = 2;
+            let mut filter_params = Vec::<String>::with_capacity(3);
+            if !params[1].is_empty() {
+                statement += format!("table_name = ${}::TEXT ", idx).as_str();
+                idx += 1;
+                filter_params.push(params[1].clone());
+            }
+            if !params[2].is_empty() {
+                if idx > 2 {
+                    statement += ",";
+                }
+                statement += format!("table_path = ${}::TEXT ", idx).as_str();
+                idx += 1;
+                filter_params.push(params[2].clone());
+            }
+            if !params[3].is_empty() {
+                if idx > 2 {
+                    statement += ",";
+                }
+                statement += format!(
+                    "table_schema = ${}::TEXT, table_schema_arrow_ipc = NULL, table_schema_arrow_ipc_json_hash = NULL ",
+                    idx
+                )
+                .as_str();
+                idx += 1;
+                filter_params.push(params[3].clone());
+            }
+            statement += " where table_id = $1::TEXT";
+            match idx {
+                3 => {
+                    client
+                        .execute(&statement, &[&params[0], &filter_params[0]])
+                        .await
+                }
+                4 => {
+                    client
+                        .execute(
+                            &statement,
+                            &[&params[0], &filter_params[0], &filter_params[1]],
+                        )
+                        .await
+                }
+                5 => {
+                    client
+                        .execute(
+                            &statement,
+                            &[
+                                &params[0],
+                                &filter_params[0],
+                                &filter_params[1],
+                                &filter_params[2],
+                            ],
+                        )
+                        .await
+                }
+                _ => todo!(),
+            }
+        }
+        DaoType::DeleteDataCommitInfoByTableIdAndPartitionDescAndCommitIdList
+            if params.len() == 3 =>
+        {
+            let concated_uuid = &params[2];
+            if concated_uuid.len() % 32 != 0 {
+                error!(
+                    dao_type = ?update_type,
+                    param_count = params.len(),
+                    "invalid metadata update parameters"
+                );
+                return Err(LakeSoulMetaDataError::from(ErrorKind::InvalidInput));
+            }
+
+            let uuid_list = separate_uuid(concated_uuid)?;
+
+            let uuid_str_list = "'".to_owned() + &uuid_list.join("','") + "'";
+
+            let statement = format!(
+                "delete from data_commit_info
+                where table_id = $1::TEXT and partition_desc = $2::TEXT
+                  and pinned = false and commit_id in ({}) ",
+                uuid_str_list
+            );
+
+            let statement = client.prepare(&statement).await?;
+            client.execute(&statement, &[&params[0], &params[1]]).await
+        }
+        _ => {
+            error!(
+                dao_type = ?update_type,
+                param_count = params.len(),
+                "invalid metadata update parameter count"
+            );
+            return Err(LakeSoulMetaDataError::from(ErrorKind::InvalidInput));
+        }
+    };
+    match result {
+        Ok(count) => {
+            span.record("affected_rows", count);
+            request.record_rows(count);
+            request.success();
+            Ok(count as i32)
+        }
+        Err(e) => Err(LakeSoulMetaDataError::from(e)),
+    }
+}
+
+/// Convert the timestamp from [`tokio_postgres::Row`] to the string.
+fn ts_string(res: Result<Option<Row>, Error>) -> Result<Option<String>> {
+    match res {
+        Ok(Some(row)) => {
+            let ts = row.get::<_, Option<i64>>(0);
+            match ts {
+                Some(ts) => Ok(Some(format!("{}", ts))),
+                None => Ok(None),
+            }
+        }
+        Err(e) => Err(LakeSoulMetaDataError::from(e)),
+        Ok(None) => Ok(None),
+    }
+}
+
+/// Execute the query scalar for the coded Data Access Object.
+#[instrument(
+    name = "metadata_query_scalar",
+    level = "info",
+    skip_all,
+    fields(
+        query_type,
+        dao_type = tracing::field::Empty,
+        param_count = tracing::field::Empty,
+    ),
+    err
+)]
+pub async fn execute_query_scalar(
+    client: &mut PooledClient,
+    query_type: i32,
+    joined_string: String,
+) -> Result<Option<String>, LakeSoulMetaDataError> {
+    if !(DAO_TYPE_QUERY_SCALAR_OFFSET..DAO_TYPE_UPDATE_OFFSET).contains(&query_type) {
+        error!("Invalid update_scalar_type_index: {:?}", query_type);
+        return Err(LakeSoulMetaDataError::from(ErrorKind::InvalidInput));
+    }
+    let query_type = DaoType::try_from(query_type)
+        .map_err(|e| LakeSoulMetaDataError::Other(Box::new(e)))?;
+    let dao_type_name = format!("{query_type:?}");
+    let span = tracing::Span::current();
+    span.record("dao_type", dao_type_name.as_str());
+    let mut request = MetadataRequestMetrics::start("query_scalar", dao_type_name);
+    let (client, statement) = get_prepared_statement(client, &query_type).await?;
+
+    let params = get_params(joined_string);
+    span.record("param_count", params.len() as u64);
+
+    let result = match query_type {
+        DaoType::GetLatestTimestampFromPartitionInfoWithoutPartitionDesc
+            if params.len() == 1 =>
+        {
+            let result = client.query_opt(&statement, &[&params[0]]).await;
+            ts_string(result)
+        }
+        DaoType::GetLatestTimestampFromPartitionInfo if params.len() == 2 => {
+            let result = client
+                .query_opt(&statement, &[&params[0], &params[1]])
+                .await;
+            match result {
+                Ok(Some(row)) => Ok(Some(format!("{}", row.get::<_, i64>(0)))),
+                Ok(None) => Ok(None),
+                Err(e) => Err(LakeSoulMetaDataError::from(e)),
+            }
+        }
+        DaoType::GetLatestVersionUpToTimeFromPartitionInfo if params.len() == 3 => {
+            let result = client
+                .query_opt(
+                    &statement,
+                    &[&params[0], &params[1], &i64::from_str(&params[2])?],
+                )
+                .await;
+            match result {
+                Ok(Some(row)) => {
+                    let ts = row.get::<_, Option<i32>>(0);
+                    match ts {
+                        Some(ts) => Ok(Some(format!("{}", ts))),
+                        None => Ok(None),
+                    }
+                }
+                Err(e) => Err(LakeSoulMetaDataError::from(e)),
+                Ok(None) => Ok(None),
+            }
+        }
+        DaoType::GetLatestVersionTimestampUpToTimeFromPartitionInfo
+            if params.len() == 3 =>
+        {
+            let result = client
+                .query_opt(
+                    &statement,
+                    &[&params[0], &params[1], &i64::from_str(&params[2])?],
+                )
+                .await;
+            ts_string(result)
+        }
+
+        _ => {
+            error!(
+                dao_type = ?query_type,
+                param_count = params.len(),
+                "invalid metadata scalar query parameters"
+            );
+            Err(LakeSoulMetaDataError::from(ErrorKind::InvalidInput))
+        }
+    };
+    if let Ok(value) = &result {
+        request.record_rows(u64::from(value.is_some()));
+        request.success();
+    }
+    result
+}
+
+pub async fn clean_meta_for_test(client: &PooledClient) -> Result<i32> {
+    let result = client
+        .batch_execute(
+            "delete from namespace;
+            delete from data_commit_info;
+            delete from table_info;
+            delete from table_path_id;
+            delete from table_name_id;
+            delete from partition_info;
+            delete from discard_compressed_file_info;
+            delete from index_shard",
+            RW,
+        )
+        .await;
+    match result {
+        Ok(_) => Ok(0i32),
+        Err(e) => Err(e),
+    }
+}
+
+/// Create a pg connection, return pg client.
+pub async fn create_connection(
+    config: String,
+    secondary_config: Option<String>,
+) -> Result<PooledClient> {
+    PooledClient::try_new(config, secondary_config).await
+}
+
+/// Convert the uuid list from [`tokio_postgres::Row`] to the [`entity::Uuid`] list.
+fn row_to_uuid_list(row: &Row) -> Vec<entity::Uuid> {
+    row.get::<_, Vec<uuid::Uuid>>(4)
+        .iter()
+        .map(|uuid| {
+            let (high, low) = uuid.as_u64_pair();
+            entity::Uuid { high, low }
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use prost::Message;
+
+    use lakesoul_metadata_proto::entity;
+
+    #[test]
+    fn test_entity() -> std::io::Result<()> {
+        let namespace = entity::Namespace {
+            namespace: "default".to_owned(),
+            properties: "{}".to_owned(),
+            comment: "".to_owned(),
+            domain: "public".to_owned(),
+        };
+        println!("{:?}", namespace);
+        println!("{:?}", entity::Namespace::default());
+
+        let table_info = entity::TableInfo {
+            table_id: uuid::Uuid::new_v4().to_string(),
+            table_namespace: "default".to_owned(),
+            table_name: "test_table_name".to_owned(),
+            table_path: "test_table_path".to_owned(),
+            table_schema: "StructType {}".to_owned(),
+            table_schema_arrow_ipc: vec![],
+            table_schema_arrow_ipc_json_hash: String::new(),
+            properties: "{}".to_owned(),
+            partitions: "".to_owned(),
+            domain: "public".to_owned(),
+        };
+        println!("{:?}", table_info);
+        println!("{:?}", table_info.encode_to_vec());
+        println!("{:?}", table_info.encode_length_delimited_to_vec());
+        println!("{:?}", table_info.encode_length_delimited_to_vec().len());
+        println!("{:?}", entity::TableInfo::default());
+
+        let meta_info = entity::MetaInfo {
+            list_partition: vec![],
+            table_info: None,
+            read_partition_info: vec![],
+        };
+        println!("{:?}", meta_info);
+        println!("{:?}", entity::MetaInfo::default());
+        println!("{:?}", entity::TableNameId::default());
+        println!("{:?}", entity::TablePathId::default());
+        println!("{:?}", entity::PartitionInfo::default());
+        println!("{:?}", entity::DataCommitInfo::default());
+
+        let mut wrapper = entity::JniWrapper::default();
+        println!("{:?}", wrapper);
+        wrapper.namespace = vec![namespace];
+        println!("{:?}", wrapper.namespace);
+
+        Ok(())
+    }
+}

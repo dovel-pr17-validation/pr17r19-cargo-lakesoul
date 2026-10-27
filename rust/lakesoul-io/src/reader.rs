@@ -1,0 +1,1408 @@
+// SPDX-FileCopyrightText: 2023 LakeSoul Contributors
+//
+// SPDX-License-Identifier: Apache-2.0
+
+//! LakeSoul Reader Module
+//!
+//! This module provides functionality for reading data from LakeSoul tables.
+//! It supports reading from various file formats (currently Parquet) and includes
+//! features like filtering, partitioning, and optimized reading with primary keys.
+//!
+//! # Examples
+//! ```no_run
+//! # fn main() -> lakesoul_io::Result<()> {
+//! # tokio_test::block_on(async {
+//! use lakesoul_io::config::LakeSoulIOConfig;
+//! use lakesoul_io::reader::LakeSoulReader;
+//!
+//! let config = LakeSoulIOConfig::builder()
+//!     .with_file("path/to/file.parquet")
+//!     .with_thread_num(1)
+//!     .with_batch_size(256)
+//!     .build();
+//!
+//! let mut reader = LakeSoulReader::new(config)?;
+//! reader.start().await?;
+//!
+//! while let Some(batch) = reader.next_rb().await {
+//!     let record_batch = batch?;
+//!     let _row_count = record_batch.num_rows();
+//! }
+//! # Ok::<(), rootcause::Report>(())
+//! # })?;
+//! # Ok(())
+//! # }
+//! ```
+
+use std::sync::Arc;
+
+use arrow_array::cast::AsArray;
+use arrow_array::{
+    Array, ArrayRef, BinaryArray, LargeBinaryArray, RecordBatch, RecordBatchReader,
+};
+use arrow_schema::{ArrowError, DataType, SchemaRef};
+use datafusion_common::DataFusionError;
+use datafusion_datasource::ListingTableUrl;
+use datafusion_execution::SendableRecordBatchStream;
+use datafusion_physical_plan::{execute_stream, stream::RecordBatchStreamAdapter};
+use datafusion_session::Session;
+use futures::{StreamExt, TryStreamExt};
+use object_store::ObjectStoreExt;
+use rootcause::{bail, compat::boxed_error::IntoBoxedError, report};
+use tokio::{runtime::Runtime, sync::Mutex, task::JoinHandle};
+use tokio_stream::wrappers::ReceiverStream;
+use tracing::Instrument;
+
+use crate::blob::{self, TaggedValue};
+
+use crate::session::GLOBAL_RUNTIME;
+use crate::{
+    Result,
+    config::LakeSoulIOConfig,
+    helpers::{
+        collect_or_conjunctive_filter_expressions, compute_scalar_hash,
+        extract_hash_bucket_id, extract_scalar_value_from_expr,
+    },
+    session::LakeSoulIOSession,
+};
+
+/// A reader for LakeSoul tables that supports efficient reading of data with various optimizations.
+///
+/// This reader provides functionality to:
+/// - Read data from Parquet files
+/// - Apply filters during reading
+/// - Support partitioned tables
+/// - Optimize reads using primary keys
+/// - Handle both local and S3 storage
+///
+/// # Thread Safety
+///
+/// The reader is designed to be used in both synchronous and asynchronous contexts.
+/// For synchronous usage, consider using `SyncSendableMutableLakeSoulReader`.
+///
+/// # Examples
+///
+/// ```no_run
+/// # fn main() -> lakesoul_io::Result<()> {
+/// # tokio_test::block_on(async {
+/// use lakesoul_io::config::LakeSoulIOConfig;
+/// use lakesoul_io::reader::LakeSoulReader;
+///
+/// let config = LakeSoulIOConfig::builder()
+///     .with_file("path/to/file.parquet")
+///     .with_thread_num(1)
+///     .with_batch_size(256)
+///     .build();
+///
+/// let mut reader = LakeSoulReader::new(config)?;
+/// reader.start().await?;
+///
+/// while let Some(batch) = reader.next_rb().await {
+///     let record_batch = batch?;
+///     let _row_count = record_batch.num_rows();
+/// }
+/// # Ok::<(), rootcause::Report>(())
+/// # })?;
+/// # Ok(())
+/// # }
+/// ```
+pub struct LakeSoulReader {
+    // not use `Arc` here
+    io_session: LakeSoulIOSession,
+    stream: Option<SendableRecordBatchStream>,
+    pub(crate) schema: Option<SchemaRef>,
+}
+
+/// Materializes tagged blob columns by reading their pack files.
+#[derive(Clone)]
+struct BlobMaterializer {
+    columns: Vec<String>,
+    runtime_env: Arc<datafusion_execution::runtime_env::RuntimeEnv>,
+    cache: moka::future::Cache<String, Arc<Vec<u8>>>,
+}
+
+impl BlobMaterializer {
+    fn try_new(io_session: &LakeSoulIOSession) -> crate::Result<Option<Self>> {
+        let options = io_session.io_config().options();
+        if blob::blob_materialize_disabled(options) {
+            return Ok(None);
+        }
+        let policies = blob::parse_blob_policies(options)?;
+        if policies.is_empty() {
+            return Ok(None);
+        }
+        Ok(Some(Self {
+            columns: policies.into_keys().collect(),
+            runtime_env: io_session.task_ctx().runtime_env(),
+            cache: moka::future::Cache::builder().max_capacity(2048).build(),
+        }))
+    }
+
+    fn materialize_stream(
+        &self,
+        stream: SendableRecordBatchStream,
+    ) -> SendableRecordBatchStream {
+        let schema = stream.schema();
+        let decoder = self.clone();
+        let mapped = stream.and_then(move |batch| {
+            let decoder = decoder.clone();
+            async move {
+                decoder.decode_batch(batch).await.map_err(|error| {
+                    DataFusionError::Execution(format!(
+                        "blob materialization failed: {error}"
+                    ))
+                })
+            }
+        });
+        Box::pin(RecordBatchStreamAdapter::new(schema, mapped))
+    }
+
+    async fn decode_batch(&self, batch: RecordBatch) -> crate::Result<RecordBatch> {
+        let mut columns: Option<Vec<ArrayRef>> = None;
+        for name in &self.columns {
+            let Ok(index) = batch.schema().index_of(name) else {
+                continue;
+            };
+            let decoded = self.decode_array(batch.column(index).as_ref()).await?;
+            if columns.is_none() {
+                columns = Some(batch.columns().to_vec());
+            }
+            if let Some(columns) = columns.as_mut() {
+                columns[index] = decoded;
+            }
+        }
+        match columns {
+            Some(columns) => {
+                RecordBatch::try_new(batch.schema(), columns).map_err(|error| {
+                    report!("failed to rebuild materialized batch: {error}")
+                })
+            }
+            None => Ok(batch),
+        }
+    }
+
+    async fn decode_array(&self, array: &dyn Array) -> crate::Result<ArrayRef> {
+        match array.data_type() {
+            DataType::Binary => {
+                let values = array.as_binary::<i32>();
+                let mut out: Vec<Option<Vec<u8>>> = Vec::with_capacity(values.len());
+                for index in 0..values.len() {
+                    if values.is_null(index) {
+                        out.push(None);
+                        continue;
+                    }
+                    out.push(Some(self.decode_value(values.value(index)).await?));
+                }
+                Ok(Arc::new(BinaryArray::from_iter(out)))
+            }
+            DataType::LargeBinary => {
+                let values = array.as_binary::<i64>();
+                let mut out: Vec<Option<Vec<u8>>> = Vec::with_capacity(values.len());
+                for index in 0..values.len() {
+                    if values.is_null(index) {
+                        out.push(None);
+                        continue;
+                    }
+                    out.push(Some(self.decode_value(values.value(index)).await?));
+                }
+                Ok(Arc::new(LargeBinaryArray::from_iter(out)))
+            }
+            other => Err(report!(
+                "blob column must be Binary or LargeBinary, got {other}"
+            )),
+        }
+    }
+
+    async fn decode_value(&self, value: &[u8]) -> crate::Result<Vec<u8>> {
+        match blob::parse_tagged(value)? {
+            TaggedValue::Inline(raw) => Ok(raw.to_vec()),
+            TaggedValue::External {
+                crc,
+                length,
+                offset,
+                pack_path,
+            } => {
+                let key = format!("{pack_path}:{offset}:{length}");
+                if let Some(bytes) = self.cache.get(&key).await {
+                    blob::verify_external(bytes.as_slice(), length, crc)?;
+                    return Ok(bytes.as_ref().clone());
+                }
+                let table_url = ListingTableUrl::parse(pack_path)?;
+                let store = self.runtime_env.object_store(table_url.object_store())?;
+                let bytes = store
+                    .get_range(table_url.prefix(), offset..offset + u64::from(length))
+                    .instrument(info_span!("object_store_blob_read", offset, length,))
+                    .await
+                    .map_err(|error| {
+                        report!("failed to read blob pack {pack_path}: {error}")
+                    })?;
+                blob::verify_external(bytes.as_ref(), length, crc)?;
+                let bytes = Arc::new(bytes.to_vec());
+                self.cache.insert(key, Arc::clone(&bytes)).await;
+                Ok(bytes.as_ref().clone())
+            }
+        }
+    }
+}
+
+/// Pull up to `prefetch_size` batches ahead of the consumer so decoding of the
+/// next batch overlaps with processing of the current one. Values below 2
+/// return the stream unchanged.
+fn maybe_prefetch(
+    stream: SendableRecordBatchStream,
+    prefetch_size: usize,
+) -> SendableRecordBatchStream {
+    if prefetch_size <= 1 {
+        return stream;
+    }
+    let schema = stream.schema();
+    let (tx, rx) = tokio::sync::mpsc::channel(prefetch_size);
+    let mut source = stream;
+    tokio::spawn(
+        async move {
+            while let Some(item) = source.next().await {
+                if tx.send(item).await.is_err() {
+                    break;
+                }
+            }
+        }
+        .in_current_span(),
+    );
+    Box::pin(RecordBatchStreamAdapter::new(
+        schema,
+        ReceiverStream::new(rx),
+    ))
+}
+
+impl LakeSoulReader {
+    /// Creates a new LakeSoulReader with the given configuration.
+    ///
+    /// # Arguments
+    ///
+    /// * `config` - The configuration for the reader, including file paths, thread count, and batch size
+    ///
+    /// # Returns
+    ///
+    /// A Result containing the new LakeSoulReader instance
+    #[instrument(skip(io_config))]
+    pub fn new(io_config: LakeSoulIOConfig) -> Result<Self> {
+        if io_config.files.is_empty() {
+            bail!("LakeSoulReader has the wrong number of files");
+        }
+        let io_session = LakeSoulIOSession::try_new(io_config)?;
+        Self::new_with_io_session(io_session)
+    }
+
+    pub fn new_with_io_session(io_session: LakeSoulIOSession) -> Result<Self> {
+        Ok(LakeSoulReader {
+            io_session,
+            stream: None,
+            schema: None,
+        })
+    }
+
+    pub fn io_config(&self) -> &LakeSoulIOConfig {
+        self.io_session.io_config()
+    }
+
+    /// Initializes the reader and prepares it for reading data.
+    ///
+    /// This method:
+    /// - Sets up the file format and table provider
+    /// - Applies any configured filters
+    /// - Optimizes the read operation if primary keys are configured
+    ///
+    /// # Returns
+    ///
+    /// A Result indicating success or failure of the initialization
+    #[instrument(level = "debug", skip(self))]
+    pub async fn start(&mut self) -> Result<()> {
+        let options = self.io_session.config().options().clone();
+        self.io_session
+            .execution_props_mut()
+            .mark_start_execution(options);
+        let table_schema = self.io_session.get_table_schema().await?;
+        let filters = {
+            let io_config = self.io_session.io_config_mut();
+            io_config
+                .get_filter_exprs(table_schema.table_schema().as_ref())
+                .await?
+        };
+        let (filters, text_candidate_scores, key_candidates, vector_distances) = self
+            .inject_index_search_filters(filters, &table_schema)
+            .await?;
+
+        let io_config = self.io_session.io_config_mut();
+
+        // Text search is only exact after a post-merge verification pass:
+        // the verify stream re-checks candidates against the current text,
+        // so the text column must be read even when the caller did not
+        // project it (the stream drops it from the output again).
+        let verify_request = crate::text::verify::text_verify_request(io_config);
+        // The caller-visible schema: may already declare the reserved score
+        // field so a lazy engine can plan against it.
+        let original_schema = io_config.target_schema.0.clone();
+        // Physical plan schema: the score field is computed by the
+        // verification stream, not read from the files.
+        let mut plan_schema = if verify_request
+            .as_ref()
+            .is_some_and(|request| request.with_scores)
+        {
+            crate::text::verify::without_text_score_field(&original_schema)
+        } else {
+            original_schema.clone()
+        };
+        // The index distance is computed by the distance stream below, not
+        // read from the files: drop the reserved field from the scan plan and
+        // add it back on the output stream.
+        let vector_distances_requested = vector_distances.is_some();
+        if vector_distances_requested {
+            plan_schema =
+                crate::vector::score::without_vector_distance_field(&plan_schema);
+        }
+        if let Some(request) = &verify_request
+            && plan_schema.field_with_name(&request.column).is_err()
+        {
+            let field = table_schema
+                .table_schema()
+                .field_with_name(&request.column)
+                .map_err(|error| {
+                    rootcause::report!(
+                        "text search column '{}' not found: {}",
+                        request.column,
+                        error
+                    )
+                })?
+                .clone();
+            let mut fields: Vec<arrow_schema::Field> = plan_schema
+                .fields()
+                .iter()
+                .map(|field| field.as_ref().clone())
+                .collect();
+            fields.push(field);
+            plan_schema = Arc::new(arrow_schema::Schema::new(fields));
+        }
+        io_config.target_schema.0 = plan_schema;
+
+        // Check if filters are or-conjunction of bucket columns.
+        //
+        // Pruning hashes individual scalar values with a single-column hash, so
+        // it is only sound when exactly one bucket column exists and the
+        // filters pin that column. With more bucket columns all of them have to
+        // be pinned and hashed together, which is not supported here yet.
+        let bucket_columns = io_config.hash_partitioning_columns_slice();
+        let skip_reader = if io_config.skip_merge_on_read()
+            && bucket_columns.len() == 1
+            && !filters.is_empty()
+        {
+            // Refactored approach for OR-conjunction optimization
+            let or_conjunctive_filter =
+                collect_or_conjunctive_filter_expressions(&filters, bucket_columns);
+
+            if !or_conjunctive_filter.is_empty() {
+                debug!(
+                    "Found {} optimizable expressions with primary keys",
+                    or_conjunctive_filter.len()
+                );
+
+                let hash_bucket_num = io_config.get_hash_bucket_num()? as u32;
+                // Collect all scalar values from optimizable expressions that match the hash bucket
+                let mut matching_scalar_values = std::collections::HashSet::new();
+
+                for expr in &or_conjunctive_filter {
+                    if let Some(scalar_value) = extract_scalar_value_from_expr(expr) {
+                        // Calculate the hash bucket for this scalar value
+                        let hash_value =
+                            compute_scalar_hash(scalar_value) % hash_bucket_num;
+
+                        // Add the scalar value to our set
+                        matching_scalar_values.insert(hash_value);
+
+                        debug!(
+                            "Found scalar value with hash {} (mod {}) = {}",
+                            scalar_value, hash_bucket_num, hash_value
+                        );
+                    }
+                }
+
+                if !matching_scalar_values.is_empty() {
+                    debug!(
+                        "Collected {} scalar values for hash bucket optimization",
+                        matching_scalar_values.len()
+                    );
+                }
+                if let Some(hash_bucket_id) = extract_hash_bucket_id(&io_config.files[0])
+                {
+                    debug!(
+                        "matching_scalar_values: {:?}, hash_bucket_id: {}",
+                        &matching_scalar_values, hash_bucket_id
+                    );
+                    !matching_scalar_values.contains(&hash_bucket_id)
+                } else {
+                    debug!(
+                        "Found optimizable expressions with primary keys, but couldn't extract hash_bucket_id"
+                    );
+                    false
+                }
+            } else {
+                debug!("No optimizable expressions found with primary keys");
+                false
+            }
+        } else {
+            false
+        };
+
+        let target_schema = io_config.target_schema.0.clone();
+        let stream = if skip_reader {
+            // Create an empty stream with the target schema
+            debug!("Skipping reader due to hash bucket optimization");
+            let empty_batch = RecordBatch::new_empty(target_schema.clone());
+            // Use the same stream type as prune_filter_and_execute returns
+            Box::pin(RecordBatchStreamAdapter::new(
+                target_schema.clone(),
+                futures::stream::once(async move { Ok(empty_batch) }).boxed(),
+            )) as SendableRecordBatchStream
+        } else {
+            let plan = self
+                .io_session
+                .build_physical_plan(filters, key_candidates.as_deref())
+                .await?;
+            if std::env::var("LAKESOUL_READER_PLAN").is_ok() {
+                eprintln!(
+                    "reader plan:\n{}",
+                    datafusion::physical_plan::displayable(plan.as_ref()).indent(true)
+                );
+            }
+            let stream = execute_stream(plan, self.io_session.task_ctx())?;
+            let stream: SendableRecordBatchStream =
+                match BlobMaterializer::try_new(&self.io_session)? {
+                    Some(materializer) => materializer.materialize_stream(stream),
+                    None => stream,
+                };
+            let prefetch_size = self.io_session.io_config().prefetch_size();
+            maybe_prefetch(stream, prefetch_size)
+        };
+        let stream: SendableRecordBatchStream = match verify_request {
+            Some(request) => {
+                let pk_column = self
+                    .io_session
+                    .io_config()
+                    .primary_keys
+                    .first()
+                    .cloned()
+                    .unwrap_or_else(|| "id".to_string());
+                let output_schema = crate::text::verify::text_verify_output_schema(
+                    &request,
+                    &original_schema,
+                );
+                let verify_stream = crate::text::verify::TextVerifyStream::try_new(
+                    stream,
+                    request,
+                    pk_column,
+                    Arc::clone(&output_schema),
+                    text_candidate_scores,
+                )?;
+                Box::pin(RecordBatchStreamAdapter::new(output_schema, verify_stream))
+            }
+            None => stream,
+        };
+        // Index-only ordering: append the index distance of every candidate
+        // row; the SQL executor orders by it and drops the column again.
+        let stream: SendableRecordBatchStream = match vector_distances {
+            Some(distances) => crate::vector::score::append_vector_distances(
+                stream,
+                distances,
+                &original_schema,
+            ),
+            None => stream,
+        };
+        let schema = stream.schema();
+        debug!("reader schema: {}", schema);
+        self.schema = Some(schema);
+        self.stream = Some(stream);
+
+        Ok(())
+    }
+
+    /// Run the configured index searches and turn their candidates into a
+    /// scan narrowing.
+    ///
+    /// Vector index results are returned as the keys stored in the index
+    /// (arrow-Row encoded primary keys) for the primary-key locator to look
+    /// up directly — no `pk IN (...)` round trip.  Text results are still
+    /// injected as a `pk IN (...)` filter.  Every index kind selected by the
+    /// reader options contributes one candidate set and the sets are ANDed.
+    async fn inject_index_search_filters(
+        &self,
+        filters: Vec<datafusion_expr::Expr>,
+        table_schema: &datafusion_datasource::TableSchema,
+    ) -> Result<(
+        Vec<datafusion_expr::Expr>,
+        std::collections::HashMap<u64, f32>,
+        Option<Vec<lakesoul_vector::IndexKey>>,
+        Option<crate::vector::score::VectorDistances>,
+    )> {
+        use lakesoul_common::IndexKind;
+
+        use crate::index::key::{KeyCodec, KeyLayout};
+        use crate::index::options::parse_search_requests;
+
+        let requests = parse_search_requests(self.io_session.io_config());
+        if requests.is_empty() {
+            return Ok((filters, std::collections::HashMap::new(), None, None));
+        }
+
+        let io_config = self.io_session.io_config();
+        let raw_prefix = io_config.prefix().trim_end_matches('/');
+        let table_path = raw_prefix
+            .trim_start_matches("file://")
+            .trim_start_matches("s3://")
+            .trim_start_matches("s3a://");
+        let table_url = datafusion_datasource::ListingTableUrl::parse(raw_prefix)
+            .map_err(|e| rootcause::report!("invalid table path: {}", e))?;
+        let store = self
+            .io_session
+            .runtime_env()
+            .object_store(table_url.object_store())
+            .map_err(|e| rootcause::report!("failed to get object store: {}", e))?;
+        let pk_column = io_config
+            .primary_keys
+            .first()
+            .cloned()
+            .unwrap_or_else(|| "id".to_string());
+        // The text index stores ids as u64; build the pk filter literal with
+        // the pk column's own type so Int64 primary keys (e.g. SQL BIGINT)
+        // compare correctly instead of failing Int64 == UInt64.
+        let pk_data_type = table_schema
+            .table_schema()
+            .field_with_name(&pk_column)
+            .map(|field| field.data_type().clone())
+            .unwrap_or(arrow_schema::DataType::UInt64);
+        // Vector keys carry the primary-key columns' arrow-Row encoding; the
+        // layout fingerprint stored in the index must match the table's, or
+        // the bytes cannot be looked up.  The codec also decodes the keys
+        // into a `pk IN (...)` narrowing filter for consumers that read the
+        // candidate rows directly (the Daft search path).
+        let key_codec = KeyCodec::new(KeyLayout::from_schema(
+            table_schema.table_schema().as_ref(),
+            io_config.primary_keys_slice(),
+        )?)?;
+        let expected_key_kind = key_codec.kind_hash();
+        tracing::debug!(
+            resolved = io_config.resolved_index_shards_slice().len(),
+            leases = io_config.index_leases().len(),
+            "index search using caller-resolved index shards"
+        );
+
+        // Index-only ordering: the index distance of every candidate becomes
+        // the ordering value, so the vector column is never read.
+        let order_by = io_config
+            .option(crate::config::OPTION_KEY_VECTOR_SEARCH_ORDER_BY)
+            .is_some_and(|value| value.eq_ignore_ascii_case("true"));
+        let mut filters = filters;
+        // BM25 score of every text candidate, keyed by primary key; carried
+        // to the verification stream so verified rows can expose it.
+        let mut text_candidate_scores = std::collections::HashMap::new();
+        let mut vector_keys: Option<Vec<lakesoul_vector::IndexKey>> = None;
+        let mut vector_distances: Option<crate::vector::score::VectorDistances> = None;
+        // Per-request converted scores (sqrt-ed L2, IP as reported) with their
+        // fusion weights; combined into the reserved distance column after the
+        // loop.
+        let mut vector_scores: Vec<(
+            f32,
+            std::collections::HashMap<lakesoul_vector::IndexKey, f32>,
+        )> = Vec::new();
+        for request in requests {
+            match request.kind {
+                IndexKind::Vector => {
+                    let hits = crate::vector::search::search_request(
+                        self.io_session.io_config(),
+                        &store,
+                        &request,
+                        table_path,
+                        expected_key_kind,
+                    )
+                    .await?;
+                    let Some(hits) = hits else {
+                        tracing::warn!(
+                            "vector index on '{}' cannot be used for this table; \
+                             scanning without index narrowing",
+                            request.column
+                        );
+                        continue;
+                    };
+                    tracing::info!(
+                        "Vector index search on '{}' returned {} candidates",
+                        request.column,
+                        hits.len()
+                    );
+                    // The newest entry of a key wins: a delta segment may
+                    // hold a newer vector under the same key, and the score
+                    // that ranks a row must be its latest version's.
+                    let mut ordered: std::collections::HashMap<
+                        lakesoul_vector::IndexKey,
+                        (u32, f32),
+                    > = std::collections::HashMap::with_capacity(hits.len());
+                    for hit in hits {
+                        match ordered.entry(hit.key) {
+                            std::collections::hash_map::Entry::Occupied(mut entry) => {
+                                if hit.version >= entry.get().0 {
+                                    entry.insert((hit.version, hit.score));
+                                }
+                            }
+                            std::collections::hash_map::Entry::Vacant(entry) => {
+                                entry.insert((hit.version, hit.score));
+                            }
+                        }
+                    }
+                    let keys: Vec<lakesoul_vector::IndexKey> =
+                        ordered.keys().cloned().collect();
+                    // Narrow the file scans to these keys exactly as the
+                    // pre-key-generalization code did; the key locator (when
+                    // available) fetches the rows directly instead.
+                    filters = crate::index::candidate::inject_key_candidates(
+                        filters,
+                        io_config.primary_keys_slice(),
+                        &key_codec,
+                        &keys,
+                    )?;
+                    vector_keys = Some(match vector_keys {
+                        None => keys,
+                        Some(previous) => intersect_keys(previous, keys),
+                    });
+                    let metric = request.metric.clone().unwrap_or_else(|| {
+                        io_config
+                            .option(&crate::index::options::option_key(
+                                IndexKind::Vector,
+                                "metric",
+                            ))
+                            .unwrap_or_else(|| "L2".to_string())
+                    });
+                    let is_l2 =
+                        !matches!(metric.to_uppercase().as_str(), "IP" | "INNERPRODUCT");
+                    vector_scores.push((
+                        request.weight,
+                        ordered
+                            .into_iter()
+                            .map(|(key, (_version, score))| {
+                                (key, if is_l2 { score.max(0.0).sqrt() } else { score })
+                            })
+                            .collect(),
+                    ));
+                }
+                IndexKind::Text => {
+                    let candidates = crate::text::search::search_request(
+                        self.io_session.io_config(),
+                        &store,
+                        &request,
+                        table_path,
+                    )
+                    .await?;
+                    tracing::info!(
+                        "Text index search on '{}' returned {} candidates",
+                        request.column,
+                        candidates.len()
+                    );
+                    text_candidate_scores.extend(candidates.iter().filter_map(
+                        |candidate| candidate.score.map(|score| (candidate.id, score)),
+                    ));
+                    filters = crate::index::candidate::inject_candidates(
+                        filters,
+                        &pk_column,
+                        &pk_data_type,
+                        &candidates,
+                    );
+                }
+            }
+        }
+        // Index-only ordering: the reserved column carries the per-request
+        // distance (one request) or the weighted fusion over the candidate
+        // intersection (several requests), so no vector column is read.
+        if order_by && !vector_scores.is_empty() {
+            let codec = KeyCodec::new(key_codec.layout().clone())?;
+            let scores = if vector_scores.len() == 1 {
+                vector_scores.pop().expect("one request").1
+            } else {
+                let mut fused = std::collections::HashMap::new();
+                for key in vector_scores[0].1.keys() {
+                    let mut total = 0.0f32;
+                    let mut present = true;
+                    for (weight, scores) in &vector_scores {
+                        match scores.get(key) {
+                            Some(score) => total += weight * score,
+                            None => {
+                                present = false;
+                                break;
+                            }
+                        }
+                    }
+                    if present {
+                        fused.insert(key.clone(), total);
+                    }
+                }
+                fused
+            };
+            vector_distances = Some(crate::vector::score::VectorDistances {
+                codec,
+                scores,
+                // Every per-request score is already the caller-facing
+                // distance (sqrt for L2), so the fusion needs no conversion.
+                sqrt: false,
+            });
+        }
+
+        Ok((
+            filters,
+            text_candidate_scores,
+            vector_keys,
+            vector_distances,
+        ))
+    }
+
+    /// Retrieves the next record batch from the reader.
+    ///
+    /// # Returns
+    ///
+    /// An Option containing a Result with the next RecordBatch, or None if there are no more batches
+    pub async fn next_rb(&mut self) -> Option<Result<RecordBatch>> {
+        if let Some(stream) = &mut self.stream {
+            stream.next().await.map(|res| res.map_err(|e| e.into()))
+        } else {
+            None
+        }
+    }
+
+    pub fn stream(&mut self) -> Option<SendableRecordBatchStream> {
+        self.stream.take()
+    }
+}
+
+/// Keep only the keys shared by two candidate sets (multi-index AND).
+fn intersect_keys(
+    previous: Vec<lakesoul_vector::IndexKey>,
+    incoming: Vec<lakesoul_vector::IndexKey>,
+) -> Vec<lakesoul_vector::IndexKey> {
+    let set: std::collections::HashSet<_> = previous.into_iter().collect();
+    incoming
+        .into_iter()
+        .filter(|key| set.contains(key))
+        .collect()
+}
+
+/// A thread-safe wrapper for LakeSoulReader that can be used in synchronous contexts.
+///
+/// This wrapper provides methods to:
+/// - Start the reader in a blocking fashion
+/// - Read record batches using callbacks
+/// - Access the reader's schema
+///
+/// # Thread Safety
+///
+/// This wrapper ensures thread-safe access to the underlying reader using Arc and Mutex.
+///
+/// # Examples
+///
+/// ```ignore
+/// use lakesoul_io::config::LakeSoulIOConfig;
+/// use lakesoul_io::reader::{LakeSoulReader, SyncSendableMutableLakeSoulReader};
+/// use tokio::runtime::Runtime;
+///
+/// let runtime = Runtime::new().unwrap();
+/// let config = LakeSoulIOConfig::builder()
+///     .with_file("path/to/file.parquet")
+///     .build();
+/// let lake_soul_reader = LakeSoulReader::new(config).unwrap();
+/// let mut reader =
+///     SyncSendableMutableLakeSoulReader::new(lake_soul_reader, runtime);
+/// reader.start_blocked().unwrap();
+///
+/// let (tx, rx) = std::sync::mpsc::channel();
+/// reader.next_rb_callback(Box::new(move |batch| {
+///     tx.send(batch).unwrap();
+/// }));
+/// ```
+pub struct SyncSendableMutableLakeSoulReader {
+    inner: Arc<Mutex<LakeSoulReader>>,
+    runtime: Arc<Runtime>,
+    schema: Option<SchemaRef>,
+}
+
+impl SyncSendableMutableLakeSoulReader {
+    /// Creates a new SyncSendableMutableLakeSoulReader with the given reader and runtime.
+    ///
+    /// # Arguments
+    ///
+    /// * `reader` - The LakeSoulReader instance to wrap
+    /// * `runtime` - The Tokio runtime to use for async operations
+    pub fn new(reader: LakeSoulReader, runtime: Runtime) -> Self {
+        SyncSendableMutableLakeSoulReader {
+            inner: Arc::new(Mutex::new(reader)),
+            runtime: Arc::new(runtime),
+            schema: None,
+        }
+    }
+
+    /// Creates a new SyncSendableMutableLakeSoulReader with the given reader and use global runtime.
+    ///
+    /// # Arguments
+    ///
+    /// * `reader` - The LakeSoulReader instance to wrap
+    pub fn new_with_global_runtime(reader: LakeSoulReader) -> Self {
+        SyncSendableMutableLakeSoulReader {
+            inner: Arc::new(Mutex::new(reader)),
+            runtime: GLOBAL_RUNTIME.clone(),
+            schema: None,
+        }
+    }
+
+    /// Starts the reader in a blocking fashion.
+    ///
+    /// # Returns
+    ///
+    /// A Result indicating success or failure of the initialization
+    pub fn start_blocked(&mut self) -> Result<()> {
+        let inner_reader = self.inner.clone();
+        let runtime = self.get_runtime();
+        runtime.block_on(async {
+            let mut reader = inner_reader.lock().await;
+            reader.start().await?;
+            self.schema = reader.schema.clone();
+            Ok(())
+        })
+    }
+
+    /// Registers a callback to be called with the next record batch.
+    ///
+    /// # Arguments
+    ///
+    /// * `f` - The callback function to be called with the next batch
+    ///
+    /// # Returns
+    ///
+    /// A JoinHandle that can be used to wait for the callback to complete
+    pub fn next_rb_callback(
+        &self,
+        f: Box<dyn FnOnce(Option<Result<RecordBatch>>) + Send + Sync>,
+    ) -> JoinHandle<()> {
+        let inner_reader = self.get_inner_reader();
+        let runtime = self.get_runtime();
+        runtime.spawn(async move {
+            let mut reader = inner_reader.lock().await;
+            let rb = reader.next_rb().await;
+            f(rb);
+        })
+    }
+
+    /// Retrieves the next record batch in a blocking fashion.
+    ///
+    /// # Returns
+    ///
+    /// An Option containing a Result with the next RecordBatch, or None if there are no more batches
+    pub fn next_rb_blocked(&self) -> Option<Result<RecordBatch>> {
+        let inner_reader = self.get_inner_reader();
+        let runtime = self.get_runtime();
+
+        runtime.block_on(async move {
+            let mut reader = inner_reader.lock().await;
+            reader.next_rb().await
+        })
+    }
+
+    /// Gets the schema of the reader.
+    ///
+    /// # Returns
+    ///
+    /// An Option containing the SchemaRef, or None if the schema is not yet available
+    pub fn get_schema(&self) -> Option<SchemaRef> {
+        self.schema.clone()
+    }
+
+    fn get_runtime(&self) -> Arc<Runtime> {
+        self.runtime.clone()
+    }
+
+    fn get_inner_reader(&self) -> Arc<Mutex<LakeSoulReader>> {
+        self.inner.clone()
+    }
+}
+
+impl RecordBatchReader for SyncSendableMutableLakeSoulReader {
+    fn schema(&self) -> SchemaRef {
+        self.get_schema().expect("reader has no schema")
+    }
+}
+
+impl Iterator for SyncSendableMutableLakeSoulReader {
+    type Item = Result<RecordBatch, ArrowError>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        self.next_rb_blocked()
+            .map(|res| res.map_err(|e| ArrowError::ExternalError(e.into_boxed_error())))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::config::LakeSoulIOConfigBuilder;
+    use crate::writer::SyncSendableMutableLakeSoulWriter;
+
+    use super::*;
+    use arrow::array::as_primitive_array;
+    use arrow_array::{ArrayRef, Int64Array, StringArray};
+
+    use rand::distr::SampleString;
+
+    use std::sync::atomic::AtomicUsize;
+    use std::sync::atomic::Ordering::Relaxed;
+    use std::sync::mpsc::sync_channel;
+    use std::thread;
+    use std::time::{Duration, Instant};
+    use tokio::runtime::Builder;
+
+    use arrow::datatypes::{DataType, Field, Schema, TimestampSecondType};
+    use arrow::util::pretty::print_batches;
+
+    use rand::Rng;
+
+    #[test]
+    fn test_reader_local_blocked() -> Result<()> {
+        let project_dir = std::env::current_dir()?;
+        let reader_io_config = LakeSoulIOConfigBuilder::new()
+            .with_files(vec![
+                project_dir.join("../../native-io/lakesoul-io-java/src/test/resources/sample-data-files/part-00000-a9e77425-5fb4-456f-ba52-f821123bd193-c000.snappy.parquet").into_os_string().into_string().unwrap(),
+                project_dir.join("../../native-io/lakesoul-io-java/src/test/resources/sample-data-files/part-00000-a9e77425-5fb4-456f-ba52-f821123bd193-c000.snappy.vortex").into_os_string().into_string().unwrap()
+            ])
+            .with_thread_num(2)
+            .with_batch_size(11)
+            .with_primary_keys(vec!["id".to_string()])
+            .with_schema(Arc::new(Schema::new(vec![
+                Field::new("id", DataType::Int64, false),
+            ])))
+            .build();
+        let runtime = Builder::new_multi_thread()
+            .worker_threads(reader_io_config.thread_num)
+            .build()
+            .unwrap();
+        let reader = LakeSoulReader::new(reader_io_config)?;
+        let mut reader = SyncSendableMutableLakeSoulReader::new(reader, runtime);
+        reader.start_blocked()?;
+        let mut rng = rand::rng();
+        loop {
+            let (tx, rx) = sync_channel(1);
+            let start = Instant::now();
+            let f = move |rb: Option<Result<RecordBatch>>| match rb {
+                None => tx.send(true).unwrap(),
+                Some(rb) => {
+                    thread::sleep(Duration::from_millis(200));
+                    let _ = print_batches(&[rb.as_ref().unwrap().clone()]);
+
+                    println!("time cost: {:?} ms", start.elapsed().as_millis()); // ms
+                    tx.send(false).unwrap();
+                }
+            };
+            thread::sleep(Duration::from_millis(rng.random_range(600..1200)));
+
+            reader.next_rb_callback(Box::new(f));
+            let done = rx.recv().unwrap();
+            if done {
+                break;
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn test_reader_partition() -> Result<()> {
+        let project_dir = std::env::current_dir()?;
+        let reader_io_config = LakeSoulIOConfigBuilder::new()
+            .with_files(vec![
+                project_dir.join("../../native-io/lakesoul-io-java/src/test/resources/sample-data-files/part-00000-a9e77425-5fb4-456f-ba52-f821123bd193-c000.snappy.parquet").into_os_string().into_string().unwrap(),
+                    project_dir.join("../../native-io/lakesoul-io-java/src/test/resources/sample-data-files/part-00000-a9e77425-5fb4-456f-ba52-f821123bd193-c000.snappy.vortex").into_os_string().into_string().unwrap()
+            ])
+            .with_thread_num(1)
+            .with_batch_size(8192)
+            .build();
+        let runtime = Builder::new_multi_thread()
+            .worker_threads(reader_io_config.thread_num)
+            .build()
+            .unwrap();
+        let reader = LakeSoulReader::new(reader_io_config)?;
+        let mut reader = SyncSendableMutableLakeSoulReader::new(reader, runtime);
+        reader.start_blocked()?;
+        let row_cnt = Arc::new(AtomicUsize::new(0));
+        loop {
+            let (tx, rx) = sync_channel(1);
+            let cnt = Arc::clone(&row_cnt);
+            let f = move |rb: Option<Result<RecordBatch>>| match rb {
+                None => tx.send(true).unwrap(),
+                Some(rb) => {
+                    let rb = rb.unwrap();
+                    let num_rows = rb.num_rows();
+                    cnt.fetch_add(num_rows, Relaxed);
+                    tx.send(false).unwrap();
+                }
+            };
+            reader.next_rb_callback(Box::new(f));
+            let done = rx.recv().unwrap();
+            if done {
+                break;
+            }
+        }
+        assert_eq!(row_cnt.load(Relaxed), 2000);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_as_primitive_array_timestamp_second_type() -> Result<()> {
+        use arrow_array::{Array, TimestampSecondArray};
+        use std::sync::Arc;
+
+        // 创建一个 TimestampSecondArray
+        let data = vec![Some(1627846260), Some(1627846261), None, Some(1627846263)];
+        let array = Arc::new(TimestampSecondArray::from(data)) as ArrayRef;
+
+        // 调用 as_primitive_array::<TimestampSecondType>(&array)
+        let primitive_array = as_primitive_array::<TimestampSecondType>(&array);
+
+        // 验证结果
+        assert_eq!(primitive_array.value(0), 1627846260);
+        assert_eq!(primitive_array.value(1), 1627846261);
+        assert!(primitive_array.is_null(2));
+        assert_eq!(primitive_array.value(3), 1627846263);
+        Ok(())
+    }
+
+    #[test]
+    fn test_primary_key_generator() -> Result<()> {
+        let mut generator = LinearPKGenerator::new(2, 3);
+        assert_eq!(generator.next_pk(), 3); // x=0: 2*0 + 3
+        assert_eq!(generator.next_pk(), 5); // x=1: 2*1 + 3
+        assert_eq!(generator.next_pk(), 7); // x=2: 2*2 + 3
+        Ok(())
+    }
+
+    struct LinearPKGenerator {
+        a: i64,
+        b: i64,
+        current: i64,
+    }
+
+    impl LinearPKGenerator {
+        fn new(a: i64, b: i64) -> Self {
+            LinearPKGenerator { a, b, current: 0 }
+        }
+
+        fn next_pk(&mut self) -> i64 {
+            let pk = self.a * self.current + self.b;
+            self.current += 1;
+            pk
+        }
+    }
+
+    fn create_batch(
+        num_columns: usize,
+        num_rows: usize,
+        str_len: usize,
+        pk_generator: &mut Option<LinearPKGenerator>,
+    ) -> RecordBatch {
+        let mut rng = rand::rng();
+        let mut len_rng = rand::rng();
+        let mut iter = vec![];
+        if let Some(generator) = pk_generator {
+            let pk_iter = (0..num_rows).map(|_| generator.next_pk());
+            iter.push((
+                "pk".to_string(),
+                Arc::new(Int64Array::from_iter_values(pk_iter)) as ArrayRef,
+                true,
+            ));
+        }
+        for i in 0..num_columns {
+            iter.push((
+                format!("col_{}", i),
+                Arc::new(StringArray::from(
+                    (0..num_rows)
+                        .map(|_| {
+                            rand::distr::Alphanumeric.sample_string(
+                                &mut rng,
+                                len_rng.random_range(str_len..str_len * 3),
+                            )
+                        })
+                        .collect::<Vec<_>>(),
+                )) as ArrayRef,
+                true,
+            ));
+        }
+        RecordBatch::try_from_iter_with_nullable(iter).unwrap()
+    }
+
+    fn create_schema(num_columns: usize, with_pk: bool) -> Schema {
+        let mut fields = vec![];
+        if with_pk {
+            fields.push(Field::new("pk", DataType::Int64, true));
+        }
+        for i in 0..num_columns {
+            fields.push(Field::new(format!("col_{}", i), DataType::Utf8, true));
+        }
+        Schema::new(fields)
+    }
+
+    #[test]
+    #[ignore]
+    fn profiling_2ways_merge_on_read() -> Result<()> {
+        let num_batch = 10;
+        let num_rows = 1000;
+        let num_columns = 100;
+        let str_len = 4;
+        let _temp_dir = tempfile::tempdir()?.keep();
+        let temp_dir = std::env::current_dir()?.join("temp_dir");
+        let with_pk = true;
+        let to_write_schema = create_schema(num_columns, with_pk);
+
+        for i in 0..2 {
+            let mut generator = if with_pk {
+                Some(LinearPKGenerator::new(i + 2, 0))
+            } else {
+                None
+            };
+            let to_write = create_batch(num_columns, num_rows, str_len, &mut generator);
+            let path = temp_dir
+                .clone()
+                .join(format!("test{}.parquet", i))
+                .into_os_string()
+                .into_string()
+                .unwrap();
+            let writer_conf = LakeSoulIOConfigBuilder::new()
+                .with_files(vec![path.clone()])
+                // .with_prefix(tempfile::tempdir()?.into_path().into_os_string().into_string().unwrap())
+                .with_thread_num(2)
+                .with_batch_size(num_rows)
+                // .with_max_row_group_size(2000)
+                // .with_max_row_group_num_values(4_00_000)
+                .with_schema(to_write.schema())
+                .with_primary_keys(vec!["pk".to_string()])
+                // .with_aux_sort_column("col2".to_string())
+                // .with_option(OPTION_KEY_MEM_LIMIT, format!("{}", 1024 * 1024 * 48))
+                // .set_dynamic_partition(true)
+                .with_hash_bucket_num("4".to_string())
+                // .with_max_file_size(1024 * 1024 * 32)
+                .build();
+            let io_session = Arc::new(LakeSoulIOSession::try_new(writer_conf)?);
+
+            let mut writer = SyncSendableMutableLakeSoulWriter::try_new(
+                io_session.clone(),
+                Builder::new_multi_thread().enable_all().build().unwrap(),
+            )?;
+
+            let _start = Instant::now();
+            for _ in 0..num_batch {
+                let once_start = Instant::now();
+                writer.write_batch(create_batch(
+                    num_columns,
+                    num_rows,
+                    str_len,
+                    &mut generator,
+                ))?;
+                println!(
+                    "write batch once cost: {}",
+                    once_start.elapsed().as_millis()
+                );
+            }
+            let _flush_start = Instant::now();
+            writer.flush_and_close()?;
+        }
+
+        let reader_conf = LakeSoulIOConfigBuilder::new()
+            .with_files(
+                (0..2)
+                    .map(|i| {
+                        temp_dir
+                            .join(format!("test{}.parquet", i))
+                            .into_os_string()
+                            .into_string()
+                            .unwrap()
+                    })
+                    .collect::<Vec<_>>(),
+            )
+            .with_thread_num(2)
+            .with_batch_size(num_rows)
+            .with_schema(Arc::new(to_write_schema))
+            .with_primary_keys(vec!["pk".to_string()])
+            .build();
+
+        let runtime = Builder::new_multi_thread().enable_all().build().unwrap();
+        let lakesoul_reader = LakeSoulReader::new(reader_conf)?;
+        let mut reader = SyncSendableMutableLakeSoulReader::new(lakesoul_reader, runtime);
+        let _ = reader.start_blocked();
+        let start = Instant::now();
+        while let Some(rb) = reader.next_rb_blocked() {
+            dbg!(&rb.unwrap().num_rows());
+        }
+        println!("time cost: {:?}ms", start.elapsed().as_millis()); // ms
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod prefetch_tests {
+    use std::sync::Arc;
+
+    use arrow_array::{ArrayRef, Int32Array, RecordBatch};
+    use arrow_schema::{DataType, Field, Schema};
+    use datafusion_common::DataFusionError;
+    use datafusion_execution::SendableRecordBatchStream;
+    use datafusion_physical_plan::stream::RecordBatchStreamAdapter;
+    use futures::StreamExt;
+    use futures::stream;
+
+    use super::maybe_prefetch;
+
+    fn batch(values: &[i32]) -> RecordBatch {
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "value",
+            DataType::Int32,
+            false,
+        )]));
+        RecordBatch::try_new(
+            schema,
+            vec![Arc::new(Int32Array::from(values.to_vec())) as ArrayRef],
+        )
+        .unwrap()
+    }
+
+    fn stream_of(
+        items: Vec<Result<RecordBatch, DataFusionError>>,
+    ) -> SendableRecordBatchStream {
+        let schema = batch(&[]).schema();
+        Box::pin(RecordBatchStreamAdapter::new(
+            schema,
+            stream::iter(items).boxed(),
+        ))
+    }
+
+    #[tokio::test]
+    async fn prefetch_preserves_order_and_errors() {
+        let error = DataFusionError::Execution("boom".to_string());
+        let mut stream = maybe_prefetch(
+            stream_of(vec![Ok(batch(&[1])), Err(error), Ok(batch(&[2, 3]))]),
+            2,
+        );
+
+        let mut seen = Vec::new();
+        while let Some(item) = stream.next().await {
+            seen.push(item);
+        }
+
+        assert_eq!(seen.len(), 3);
+        assert_eq!(seen[0].as_ref().unwrap().num_rows(), 1);
+        assert!(seen[1].is_err());
+        assert_eq!(seen[2].as_ref().unwrap().num_rows(), 2);
+    }
+
+    #[tokio::test]
+    async fn prefetch_size_one_passes_through() {
+        let mut stream = maybe_prefetch(stream_of(vec![Ok(batch(&[7]))]), 1);
+
+        let first = stream.next().await.unwrap().unwrap();
+        assert_eq!(first.num_rows(), 1);
+        assert!(stream.next().await.is_none());
+    }
+}
+
+#[cfg(test)]
+mod blob_materializer_tests {
+    use std::sync::Arc;
+
+    use arrow_array::BinaryArray;
+    use arrow_schema::{DataType, Field, Schema};
+    use datafusion_execution::runtime_env::RuntimeEnvBuilder;
+
+    use super::*;
+    use crate::blob::{PackBuffer, tagged_external, tagged_inline};
+
+    fn materializer(columns: &[&str]) -> BlobMaterializer {
+        BlobMaterializer {
+            columns: columns.iter().map(|column| column.to_string()).collect(),
+            runtime_env: RuntimeEnvBuilder::new().build_arc().unwrap(),
+            cache: moka::future::Cache::builder().max_capacity(16).build(),
+        }
+    }
+
+    fn frame_batch(values: Vec<Option<Vec<u8>>>) -> RecordBatch {
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "frame",
+            DataType::Binary,
+            true,
+        )]));
+        RecordBatch::try_new(schema, vec![Arc::new(BinaryArray::from_iter(values))])
+            .unwrap()
+    }
+
+    fn pack_dir(name: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "lakesoul-blob-{}-{}",
+            name,
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[tokio::test]
+    async fn decodes_inline_external_and_nulls() {
+        let dir = pack_dir("ok");
+        let pack = dir.join("data.parquet.frame.blob");
+        let mut buffer = PackBuffer::default();
+        let (offset, length, crc) = buffer.append(b"external-payload").unwrap();
+        std::fs::write(&pack, buffer.data()).unwrap();
+        let pack_url = format!("file://{}", pack.display());
+
+        let decoded = materializer(&["frame"])
+            .decode_batch(frame_batch(vec![
+                Some(tagged_inline(b"raw")),
+                Some(tagged_external(&pack_url, offset, length, crc)),
+                None,
+            ]))
+            .await
+            .unwrap();
+        let values = decoded.column(0).as_binary::<i32>();
+        assert_eq!(values.value(0), b"raw");
+        assert_eq!(values.value(1), b"external-payload");
+        assert!(values.is_null(2));
+    }
+
+    #[tokio::test]
+    async fn rejects_missing_or_corrupt_packs() {
+        let dir = pack_dir("bad");
+        let missing = dir.join("missing.parquet.frame.blob");
+        let missing_url = format!("file://{}", missing.display());
+        let external = tagged_external(&missing_url, 0, 3, 0);
+        assert!(
+            materializer(&["frame"])
+                .decode_batch(frame_batch(vec![Some(external)]))
+                .await
+                .is_err()
+        );
+
+        let pack = dir.join("corrupt.parquet.frame.blob");
+        let mut buffer = PackBuffer::default();
+        let (offset, length, crc) = buffer.append(b"expected").unwrap();
+        std::fs::write(&pack, b"tampered").unwrap();
+        let corrupt_url = format!("file://{}", pack.display());
+        let external = tagged_external(&corrupt_url, offset, length, crc);
+        assert!(
+            materializer(&["frame"])
+                .decode_batch(frame_batch(vec![Some(external)]))
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn ignores_unconfigured_columns() {
+        let decoded = materializer(&["absent"])
+            .decode_batch(frame_batch(vec![Some(b"untouched".to_vec())]))
+            .await
+            .unwrap();
+        assert_eq!(decoded.column(0).as_binary::<i32>().value(0), b"untouched");
+    }
+}

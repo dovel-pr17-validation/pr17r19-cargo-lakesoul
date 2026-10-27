@@ -1,0 +1,374 @@
+# SPDX-FileCopyrightText: 2023 LakeSoul Contributors
+#
+# SPDX-License-Identifier: Apache-2.0
+
+name: CI with Presto cdc Test
+
+on:
+  push:
+    paths-ignore:
+      - "javadoc/**"
+      - "website/**"
+      - "cpp/**"
+      - "python/**"
+      - "**.md"
+      - "rust/lakesoul-datafusion/**"
+      - "rust/lakesoul-es-gateway/**"
+      - "rust/lakesoul-ivm/**"
+      - "rust/lakesoul-text/**"
+      - "rust/lakesoul-vector/**"
+      - "rust/postgres-lakesoul/**"
+      - "script/benchmark/embodied/**"
+      - "script/benchmark/text/**"
+      - "script/benchmark/vector/**"
+      - "script/weknora-es-harness/**"
+    branches:
+      - "main"
+  pull_request:
+    paths-ignore:
+      - "javadoc/**"
+      - "website/**"
+      - "cpp/**"
+      - "python/**"
+      - "**.md"
+      - "rust/lakesoul-datafusion/**"
+      - "rust/lakesoul-es-gateway/**"
+      - "rust/lakesoul-ivm/**"
+      - "rust/lakesoul-text/**"
+      - "rust/lakesoul-vector/**"
+      - "rust/postgres-lakesoul/**"
+      - "script/benchmark/embodied/**"
+      - "script/benchmark/text/**"
+      - "script/benchmark/vector/**"
+      - "script/weknora-es-harness/**"
+    branches:
+      - "main"
+      - "release/**"
+  workflow_dispatch:
+
+defaults:
+  run:
+    shell: bash
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    env:
+      RUSTFLAGS: "-Awarnings"
+
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up JDK 11
+        uses: actions/setup-java@v5
+        with:
+          java-version: "11"
+          distribution: "temurin"
+          cache: maven
+      - name: Set up Python 3.9
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.9"
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip setuptools wheel
+          pip install pymysql cryptography jproperties --no-cache-dir
+          download() {
+            local url="$1" out="$2"
+            for attempt in 1 2 3; do
+              if wget -q --tries=1 --timeout=30 --read-timeout=60 "$url" -O "$out" && [ -s "$out" ]; then
+                return 0
+              fi
+              echo "download failed (attempt $attempt): $url" >&2
+              sleep 5
+            done
+            return 1
+          }
+          hadoop_tar="$HOME/hadoop-3.3.6.tar.gz"
+          download https://dlcdn.apache.org/hadoop/common/hadoop-3.3.6/hadoop-3.3.6.tar.gz "$hadoop_tar" ||
+            download https://archive.apache.org/dist/hadoop/common/hadoop-3.3.6/hadoop-3.3.6.tar.gz "$hadoop_tar" ||
+            download https://mirrors.aliyun.com/apache/hadoop/common/hadoop-3.3.6/hadoop-3.3.6.tar.gz "$hadoop_tar"
+          tar xf "$hadoop_tar" -C "$HOME"
+          echo "HADOOP_HOME=$HOME/hadoop-3.3.6" >> "$GITHUB_ENV"
+          wget -q https://repo1.maven.org/maven2/org/apache/flink/flink-s3-fs-hadoop/1.20.5/flink-s3-fs-hadoop-1.20.5.jar -O "$HOME/flink-s3-fs-hadoop-1.20.5.jar"
+          wget -q https://repo1.maven.org/maven2/org/apache/parquet/parquet-hadoop-bundle/1.12.3/parquet-hadoop-bundle-1.12.3.jar -O "$HOME/parquet-hadoop-bundle-1.12.3.jar"
+          wget -q https://repo1.maven.org/maven2/org/apache/flink/flink-parquet/1.20.5/flink-parquet-1.20.5.jar -O "$HOME/flink-parquet-1.20.5.jar"
+          wget -q https://repo1.maven.org/maven2/com/mysql/mysql-connector-j/8.0.33/mysql-connector-j-8.0.33.jar -O "$HOME/mysql-connector-j-8.0.33.jar"
+
+      - name: Install Protoc
+        uses: arduino/setup-protoc@v2
+        with:
+          version: "23.x"
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: stable
+      - uses: ./.github/actions/setup-flatc
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: ". -> rust/target"
+          shared-key: "native-glibc217-v2"
+          save-if: false
+      - name: Install Zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: 0.14.1
+          use-cache: false
+      - name: Install cargo-zigbuild
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-zigbuild@0.18.3
+      - name: Prefetch images
+        run: |
+          (
+            docker pull -q swr.ap-southeast-3.myhuaweicloud.com/dmetasoul-repo/spark:3.5.8-py310-hadoop334 &
+            docker pull -q swr.ap-southeast-3.myhuaweicloud.com/dmetasoul-repo/presto:0.296 &
+            docker pull -q swr.ap-southeast-3.myhuaweicloud.com/dmetasoul-repo/prestissimo-runtime:0.296-hotfix &
+            (cd docker/lakesoul-docker-compose-env && docker compose --profile s3 pull -q) &
+            wait
+            touch /tmp/images-ready
+          ) > /tmp/image-pull.log 2>&1 &
+          echo "image prefetch started in background"
+
+      - name: Build Rust libraries
+        env:
+          CARGO_PROFILE_RELEASE_STRIP: none
+        run: |
+          unset HADOOP_HOME HDFS_LIB_DIR
+          cargo -q zigbuild --release --target x86_64-unknown-linux-gnu.2.17 --package lakesoul-io-c --package lakesoul-metadata-c
+      - name: Build with Maven
+        run: |
+          mkdir -p rust/target/release
+          cp rust/target/x86_64-unknown-linux-gnu/release/liblakesoul_io_c.so rust/target/release
+          cp rust/target/x86_64-unknown-linux-gnu/release/liblakesoul_metadata_c.so rust/target/release
+          MAVEN_OPTS="-Xmx4000m" mvn -B install -f pom.xml -pl "!:lakesoul-presto-0.296" -Pcross-build -DskipTests
+      - name: Set up JDK 17
+        uses: actions/setup-java@v5
+        with:
+          java-version: "17"
+          distribution: "temurin"
+          cache: maven
+      - name: Build LakeSoul Presto with Java 17
+        run: |
+          MAVEN_OPTS="-Xmx4000m" mvn -B package -f pom.xml -pl :lakesoul-presto-0.296 -Pcross-build -DskipTests -e
+      - name: Get jar names
+        run: |
+          {
+            echo "FLINK_JAR_NAME=$(python script/get_jar_name.py lakesoul-flink)"
+            echo "FLINK_TEST_JAR_NAME=$(python script/get_jar_name.py lakesoul-flink | sed -e 's/.jar/-tests.jar/g')"
+            echo "SPARK_JAR_NAME=$(python script/get_jar_name.py lakesoul-spark)"
+            echo "SPARK_TEST_JAR_NAME=$(python script/get_jar_name.py lakesoul-spark | sed -e 's/.jar/-tests.jar/g')"
+            echo "PRESTO_JAR_NAME=$(python script/get_jar_name.py lakesoul-presto)"
+            echo "PRESTO_TEST_JAR_NAME=$(python script/get_jar_name.py lakesoul-presto | sed -e 's/.jar/-tests.jar/g')"
+          } >> "$GITHUB_ENV"
+      - name: Copy built jar to work-dir
+        run: |
+          cp "./lakesoul-flink/target/$FLINK_JAR_NAME" ./script/benchmark/work-dir
+          cp "./lakesoul-flink/target/$FLINK_TEST_JAR_NAME" ./script/benchmark/work-dir
+          cp "./lakesoul-spark/target/$SPARK_JAR_NAME" ./script/benchmark/work-dir
+          cp "./lakesoul-spark/target/$SPARK_TEST_JAR_NAME" ./script/benchmark/work-dir
+          cp "./lakesoul-presto/target/$PRESTO_JAR_NAME" ./script/benchmark/work-dir
+          cp "./lakesoul-presto/target/$PRESTO_TEST_JAR_NAME" ./script/benchmark/work-dir
+      - name: Deploy cluster
+        run: |
+          sed -i 's/if NEW.version - rs_version >= 10 then/if NEW.version - rs_version >= 1 then/' script/meta_init.sql
+          sed -i 's/if NEW.version >= 10 then/if NEW.version >= 1 then/' script/meta_init.sql
+          cd ./docker/lakesoul-docker-compose-env
+          for i in $(seq 1 180); do [ -f /tmp/images-ready ] && break; sleep 2; done
+          export LAKESOUL_IO_USE_V2_MERGE=true
+          docker compose --profile s3 up -d
+          for i in $(seq 1 30); do
+            if docker exec lakesoul-docker-compose-env-jobmanager-1 flink list >/dev/null 2>&1 &&
+               docker exec lakesoul-docker-compose-env-mysql-1 mysqladmin ping -h 127.0.0.1 -uroot -proot --silent >/dev/null 2>&1; then
+              echo "cluster ready after $((i * 2))s"
+              break
+            fi
+            sleep 2
+          done
+      - name: Deploy Presto Server
+        run: |
+          echo "deploy presto server pwd: ${PWD}"
+          docker run -d \
+            --net lakesoul-docker-compose-env_default \
+            --name=presto \
+            --network-alias presto-discovery \
+            --env LAKESOUL_IO_USE_V2_MERGE=true \
+            --env RUST_LOG=info \
+            --env RUST_BACKTRACE=full \
+            -v "${PWD}/script/benchmark/work-dir/${PRESTO_JAR_NAME}:/opt/presto-server/plugin/lakesoul/${PRESTO_JAR_NAME}" \
+            -v "${PWD}/script/benchmark/presto-native-coordinator/catalog:/opt/presto-server/etc/catalog" \
+            -v "${PWD}/script/benchmark/presto-native-coordinator/config.properties:/opt/presto-server/etc/config.properties" \
+            -v "${PWD}/script/benchmark/presto-native-coordinator/jvm.config:/opt/presto-server/etc/jvm.config" \
+            -v "${PWD}/script/benchmark/work-dir:/opt/spark/work-dir" \
+            -v "${PWD}/script/benchmark/presto-native-coordinator/lakesoul.properties:/root/lakesoul.properties" \
+            --env lakesoul_home=/root/lakesoul.properties \
+            swr.ap-southeast-3.myhuaweicloud.com/dmetasoul-repo/presto:0.296
+          sleep 15s
+          docker run -d \
+            --net lakesoul-docker-compose-env_default \
+            --name=presto-worker \
+            --env LAKESOUL_IO_USE_V2_MERGE=true \
+            -v "${PWD}/rust/target/release/liblakesoul_io_c.so:/usr/lib64/prestissimo-libs/liblakesoul_io_c.so" \
+            -v "${PWD}/script/benchmark/presto-native-worker:/opt/presto-server/etc" \
+            -v "${PWD}/script/benchmark/presto-native-worker/catalog:/opt/presto-server/etc/catalog" \
+            --env RUST_BACKTRACE=full \
+            -v "${PWD}/script/benchmark/presto-native-worker/config.properties:/opt/etc/config.properties" \
+            -v "${PWD}/script/benchmark/presto-native-worker/lakesoul.properties:/root/lakesoul.properties" \
+            swr.ap-southeast-3.myhuaweicloud.com/dmetasoul-repo/prestissimo-runtime:0.296-hotfix
+      - name: Wait for Presto worker to become active
+        run: |
+          TIMEOUT_SECONDS=20 ./script/benchmark/wait_presto_worker.sh
+      - name: Start compaction task
+        run: |
+          cd ./script/benchmark/work-dir
+          nohup docker run --cpus 2 -m 5000m --net lakesoul-docker-compose-env_default --rm -t \
+            -v "${PWD}:/opt/spark/work-dir" \
+            --env lakesoul_home=/opt/spark/work-dir/lakesoul.properties \
+            --env LAKESOUL_IO_USE_V2_MERGE=true \
+            --env RUST_LOG=info \
+            swr.ap-southeast-3.myhuaweicloud.com/dmetasoul-repo/spark:3.5.8-py310-hadoop334 \
+            spark-submit --driver-memory 2G --executor-memory 2G \
+            --conf spark.driver.memoryOverhead=1500m \
+            --conf spark.executor.memoryOverhead=1500m \
+            --conf spark.hadoop.fs.s3.buffer.dir=/tmp \
+            --conf spark.hadoop.fs.s3a.buffer.dir=/tmp \
+            --conf spark.hadoop.fs.s3.impl=org.apache.hadoop.fs.s3a.S3AFileSystem \
+            --conf spark.hadoop.fs.s3a.path.style.access=true \
+            --conf spark.hadoop.fs.s3a.endpoint=http://rustfs:9000 \
+            --conf spark.hadoop.fs.s3a.access.key=rustfsadmin \
+            --conf spark.hadoop.fs.s3a.secret.key=rustfsadmin \
+            --conf spark.sql.warehouse.dir=s3://lakesoul-test-bucket/ \
+            --conf spark.hadoop.fs.s3a.fast.upload.buffer=disk \
+            --conf spark.hadoop.fs.s3a.fast.upload=true \
+            --conf spark.dmetasoul.lakesoul.native.io.enable=true \
+            --conf spark.dmetasoul.lakesoul.compaction.level1.file.number.limit=5 \
+            --conf spark.dmetasoul.lakesoul.compaction.level1.file.merge.num.limit=2 \
+            --class com.dmetasoul.lakesoul.spark.compaction.NewCompactionTask \
+            --master "local[4]" \
+            "/opt/spark/work-dir/$SPARK_JAR_NAME" \
+            --threadpool.size=10 --database="" --file_num_limit=5 --file_size_limit=10KB \
+            > compaction.log 2>&1 &
+      - name: Start flink mysql cdc task-1
+        run: |
+          docker exec -t lakesoul-docker-compose-env-jobmanager-1 flink run -d -c org.apache.flink.lakesoul.entry.MysqlCdc "/opt/flink/work-dir/$FLINK_JAR_NAME" --source_db.host mysql --source_db.port 3306 --source_db.db_name test_cdc --source_db.user root --source_db.password root --source.parallelism 2 --sink_db_name default --sink.parallelism 4 --use.cdc true --warehouse_path s3://lakesoul-test-bucket/data/ --flink.checkpoint s3://lakesoul-test-bucket/chk --flink.savepoint s3://lakesoul-test-bucket/svp --job.checkpoint_interval 5000 --server_time_zone UTC
+          for i in $(seq 1 60); do
+            if docker exec lakesoul-test-pg psql -U lakesoul_test -d lakesoul_test -tAc "select 1 from table_info where table_name='s_test_cdc_default_init' limit 1" 2>/dev/null | grep -q 1; then
+              echo "cdc source table ready after $((i * 3))s"
+              break
+            fi
+            sleep 3
+          done
+      - name: Start flink source to sink task-2
+        run: |
+          docker exec -t lakesoul-docker-compose-env-jobmanager-1 flink run -d -c org.apache.flink.lakesoul.test.benchmark.LakeSoulSourceToSinkTable -C "file:///opt/flink/work-dir/$FLINK_JAR_NAME" "/opt/flink/work-dir/$FLINK_TEST_JAR_NAME" --source.database.name default --source.table.name s_test_cdc_default_init --sink.database.name flink_sink --sink.table.name default_init --use.cdc true --hash.bucket.number 2 --job.checkpoint_interval 10000 --server_time_zone UTC --warehouse.path s3://lakesoul-test-bucket/flink-sink/data --flink.checkpoint s3://lakesoul-test-bucket/flink-sink/chk
+          for i in $(seq 1 30); do
+            if docker exec -t lakesoul-docker-compose-env-jobmanager-1 flink list -r 2>/dev/null | grep -q "LakeSoulSourceToSink"; then
+              echo "source-to-sink job running after $((i * 2))s"
+              break
+            fi
+            sleep 2
+          done
+      - name: Download mysql driver jar
+        run: |
+          cd ./script/benchmark/work-dir
+          if [ ! -e mysql-connector-j-8.0.33.jar ]; then cp "$HOME/mysql-connector-j-8.0.33.jar" .; fi
+          if [ ! -e presto-jdbc-0.292.jar ]; then wget -q --tries=3 --timeout=30 --retry-connrefused https://repo1.maven.org/maven2/com/facebook/presto/presto-jdbc/0.292/presto-jdbc-0.292.jar; fi
+      - name: Create table and insert data
+        run: |
+          cd ./script/benchmark
+          python 1_create_table.py
+          docker exec -i lakesoul-docker-compose-env-mysql-1 bash /2_insert_table_data.sh
+          sleep 30s
+      - name: Presto worker health check
+        run: |
+          TIMEOUT_SECONDS=20 ./script/benchmark/wait_presto_worker.sh
+      - name: "[Check] Mysql cdc data accuracy verification task"
+        run: |
+          cd ./script/benchmark
+          docker run --cpus 2 -m 5000m --net container:presto --rm -t -v "${PWD}/work-dir:/root" eclipse-temurin:17-jre-jammy java -cp "/root/$PRESTO_TEST_JAR_NAME:/root/$PRESTO_JAR_NAME:/root/mysql-connector-j-8.0.33.jar:/root/presto-jdbc-0.292.jar" com.facebook.presto.benchmark.Benchmark
+      - name: "[Check] Presto source to sink data accuracy verification task"
+        run: |
+          cd ./script/benchmark
+          docker run --cpus 2 -m 5000m --net container:presto --rm -t -v "${PWD}/work-dir:/root" eclipse-temurin:17-jre-jammy java -cp "/root/$PRESTO_TEST_JAR_NAME:/root/$PRESTO_JAR_NAME:/root/mysql-connector-j-8.0.33.jar:/root/presto-jdbc-0.292.jar" com.facebook.presto.benchmark.Benchmark --cdc.contract false --single.table.contract true
+      - name: Adding columns for tables and deleting some data from tables
+        run: |
+          cd ./script/benchmark
+          python3 3_add_column.py
+          python3 delete_data.py
+          docker exec -i lakesoul-docker-compose-env-mysql-1 bash /2_insert_table_data.sh
+          sleep 60s
+      - name: Presto worker health check
+        run: |
+          TIMEOUT_SECONDS=20 ./script/benchmark/wait_presto_worker.sh
+      - name: "[Check] Mysql cdc data accuracy verification task"
+        run: |
+          cd ./script/benchmark
+          docker run --cpus 2 -m 5000m --net container:presto --rm -t -v "${PWD}/work-dir:/root" eclipse-temurin:17-jre-jammy java -cp "/root/$PRESTO_TEST_JAR_NAME:/root/$PRESTO_JAR_NAME:/root/mysql-connector-j-8.0.33.jar:/root/presto-jdbc-0.292.jar" com.facebook.presto.benchmark.Benchmark
+      - name: "[Check] Presto source to sink data accuracy verification task"
+        run: |
+          cd ./script/benchmark
+          docker run --cpus 2 -m 5000m --net container:presto --rm -t -v "${PWD}/work-dir:/root" eclipse-temurin:17-jre-jammy java -cp "/root/$PRESTO_TEST_JAR_NAME:/root/$PRESTO_JAR_NAME:/root/mysql-connector-j-8.0.33.jar:/root/presto-jdbc-0.292.jar" com.facebook.presto.benchmark.Benchmark --cdc.contract false --single.table.contract true
+      - name: Updating data in tables
+        run: |
+          cd ./script/benchmark
+          python3 4_update_data.py
+          sleep 60s
+      - name: Presto worker health check
+        run: |
+          TIMEOUT_SECONDS=20 ./script/benchmark/wait_presto_worker.sh
+      - name: "[Check] Mysql cdc data accuracy verification task"
+        run: |
+          cd ./script/benchmark
+          docker run --cpus 2 -m 5000m --net container:presto --rm -t -v "${PWD}/work-dir:/root" eclipse-temurin:17-jre-jammy java -cp "/root/$PRESTO_TEST_JAR_NAME:/root/$PRESTO_JAR_NAME:/root/mysql-connector-j-8.0.33.jar:/root/presto-jdbc-0.292.jar" com.facebook.presto.benchmark.Benchmark
+      - name: "[Check] Presto source to sink data accuracy verification task"
+        run: |
+          cd ./script/benchmark
+          docker run --cpus 2 -m 5000m --net container:presto --rm -t -v "${PWD}/work-dir:/root" eclipse-temurin:17-jre-jammy java -cp "/root/$PRESTO_TEST_JAR_NAME:/root/$PRESTO_JAR_NAME:/root/mysql-connector-j-8.0.33.jar:/root/presto-jdbc-0.292.jar" com.facebook.presto.benchmark.Benchmark --cdc.contract false --single.table.contract true
+      - name: Dropping columns and deleting some data in tables
+        run: |
+          cd ./script/benchmark
+          python3 6_drop_column.py
+          python3 delete_data.py
+          docker exec -i lakesoul-docker-compose-env-mysql-1 bash /2_insert_table_data.sh
+          sleep 60s
+      - name: Presto worker health check
+        run: |
+          TIMEOUT_SECONDS=20 ./script/benchmark/wait_presto_worker.sh
+      - name: "[Check] Mysql cdc data accuracy verification task"
+        run: |
+          cd ./script/benchmark
+          docker run --cpus 2 -m 5000m --net container:presto --rm -t -v "${PWD}/work-dir:/root" eclipse-temurin:17-jre-jammy java -cp "/root/$PRESTO_TEST_JAR_NAME:/root/$PRESTO_JAR_NAME:/root/mysql-connector-j-8.0.33.jar:/root/presto-jdbc-0.292.jar" com.facebook.presto.benchmark.Benchmark
+      - name: "[Check] Presto source to sink data accuracy verification task"
+        run: |
+          cd ./script/benchmark
+          docker run --cpus 2 -m 5000m --net container:presto --rm -t -v "${PWD}/work-dir:/root" eclipse-temurin:17-jre-jammy java -cp "/root/$PRESTO_TEST_JAR_NAME:/root/$PRESTO_JAR_NAME:/root/mysql-connector-j-8.0.33.jar:/root/presto-jdbc-0.292.jar" com.facebook.presto.benchmark.Benchmark --cdc.contract false --single.table.contract true
+      - name: Print Flink Log
+        if: always()
+        run: |
+          docker logs lakesoul-docker-compose-env-jobmanager-1 > flink-job-manager.log
+          docker logs lakesoul-docker-compose-env-taskmanager-1 > flink-task-manager-1.log
+          docker logs lakesoul-docker-compose-env-taskmanager-2 > flink-task-manager-2.log
+          docker logs presto > presto-server.log 2>&1
+          docker logs presto-worker > presto-worker.log 2>&1
+      - name: Upload Log
+        if: always()
+        continue-on-error: true
+        uses: actions/upload-artifact@v4
+        with:
+          name: flink-presto-cluster-log
+          path: |
+            flink-*.log
+            presto-server.log
+          retention-days: 5
+          if-no-files-found: error
+      - name: Upload Compaction Log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: lakesoul-compaction-log
+          path: ./script/benchmark/work-dir/compaction.log
+          retention-days: 3
+          if-no-files-found: error

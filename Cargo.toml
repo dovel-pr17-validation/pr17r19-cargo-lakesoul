@@ -1,0 +1,173 @@
+# SPDX-FileCopyrightText: 2023 LakeSoul Contributors
+#
+# SPDX-License-Identifier: Apache-2.0
+
+
+[workspace]
+members = [
+  "rust/lakesoul-build-info",
+  "rust/lakesoul-metadata-proto",
+  "rust/lakesoul-metadata",
+  "rust/lakesoul-metadata-c",
+  "rust/lakesoul-io",
+  "rust/lakesoul-io-c",
+  "rust/lakesoul-datafusion",
+  "rust/lakesoul-flight",
+  "rust/lakesoul-s3-proxy",
+  "rust/lakesoul-console",
+  "rust/lakesoul-common",
+  "rust/lakesoul-observability",
+  "rust/lakesoul-vector",
+  "rust/lakesoul-ivm",
+  "rust/lakesoul-text",
+  "rust/lakesoul-es-gateway",
+  "python",
+  "rust/postgres-lakesoul",
+]
+default-members = [
+  "rust/lakesoul-build-info",
+  "rust/lakesoul-metadata-proto",
+  "rust/lakesoul-metadata",
+  "rust/lakesoul-io",
+  "rust/lakesoul-datafusion",
+  "rust/lakesoul-console",
+  "rust/lakesoul-common",
+  "rust/lakesoul-vector",
+]
+resolver = "3"
+
+[workspace.package]
+authors = ["LakeSoul Contributors"]
+edition = "2024"
+homepage = "https://github.com/lakesoul-io/LakeSoul"
+license = "Apache-2.0"
+readme = "README.md"
+version = "4.1.0-dev.0"
+
+
+[profile.dev]
+debug = "line-tables-only"
+
+[profile.dev-full]
+inherits = "dev"
+debug = "full"
+
+[profile.bench]
+debug = true
+strip = false
+
+[profile.profiling]
+inherits = "release"
+debug = true
+opt-level = 2
+
+[profile.test-fast]
+inherits = "test"
+# Use a slightly better optimization level for ci-tests
+opt-level = 1
+# Do not embed debug info in test binaries.  With `line-tables-only` every
+# integration test linked ~700 MB of debug sections (~900 MB per binary);
+# `cargo test --tests` links dozens of them, which makes rust-lld IO-bound and
+# dominates the build.  Tests still get symbol names in panics/backtraces.
+debug = 0
+
+[workspace.dependencies]
+# datafusion
+datafusion = { version = "55" }
+datafusion-common = { version = "55" }
+datafusion-common-runtime = { version = "55" }
+datafusion-session = { version = "55" }
+datafusion-catalog-listing = { version = "55" }
+datafusion-expr = { version = "55" }
+datafusion-physical-expr = { version = "55" }
+datafusion-physical-plan = { version = "55" }
+datafusion-execution = { version = "55" }
+datafusion-datasource = { version = "55" }
+datafusion-datasource-parquet = { version = "55" }
+datafusion-substrait = { version = "55" }
+datafusion-distributed = { version = "4.0.0" }
+datafusion-proto = { version = "55" }
+# arrow
+arrow = { version = "59", features = ["prettyprint"] }
+arrow-schema = { version = "59", features = ["serde"] }
+arrow-array = { version = "59", features = ["chrono-tz", "ffi"] }
+arrow-buffer = { version = "59" }
+arrow-cast = { version = "59" }
+arrow-arith = { version = "59" }
+arrow-ipc = { version = "59" }
+arrow-flight = { version = "59", features = ["flight-sql-experimental"] }
+arrow-pyarrow = { version = "59" }
+parquet = { version = "59", default-features = true, features = [
+  "async",
+  "encryption",
+] }
+object_store = { version = "0.13", features = ["aws", "http"] }
+# vortex
+vortex = { git = "https://github.com/mag1c1an1/vortex.git", rev = "794a6f413" }
+vortex-datafusion = { git = "https://github.com/mag1c1an1/vortex.git", rev = "794a6f413" }
+# async
+futures = "0.3"
+async-trait = "0.1"
+# async runtime
+tokio = { version = "1", features = ["full"] }
+tokio-util = { version = "0.7", features = ["io", "compat"] }
+tokio-stream = "0.1.9"
+# web
+tower = "0.4.13"
+tonic = "0.14"
+tonic-build = "0.14"
+http = "1"
+axum = "0.8"
+toml = "0.9"
+metrics = "0.24"
+metrics-exporter-prometheus = "0.16"
+# cache
+cached = { version = "0.54.0", features = ["async_tokio_rt_multi_thread"] }
+# cli
+clap = { version = "4.4", features = ["derive", "env"] }
+atomic_refcell = "0.1.8"
+bytes = "1"
+chrono = { version = "0.4", features = ["clock", "unstable-locales"] }
+dashmap = { version = "6.1" }
+hex = "0.4"
+jsonwebtoken = { version = "9", default-features = false }
+url = "2"
+half = "^2.1"
+uuid = { version = "1", features = ["v4", "fast-rng", "macro-diagnostics"] }
+derivative = "2.2.0"
+regex = "1.11"
+itertools = "0.14"
+lazy_static = "1.4.0"
+log = "0.4.27"
+# serialization
+serde_json = "1.0"
+serde = { version = "1.0", features = ["derive", "std", "rc"] }
+# protobuf
+prost = "0.14"
+prost-build = "0.14"
+# random
+rand = "0.9"
+rand_distr = "0.5"
+rand_chacha = "0.9"
+# logging
+tracing = { version = "0.1.40", features = ["log"] }
+tracing-subscriber = { version = "0.3.19", features = [
+  "default",
+  "chrono",
+  "env-filter",
+] }
+# for test
+test-log = { version = "0.2", features = ["trace"] }
+tempfile = "3.3.0"
+# error handling
+thiserror = "1.0"
+anyhow = "1"
+rootcause = "0.13"
+reqwest = "0.13"
+# sync
+parking_lot = "0.12"
+
+[workspace.lints.clippy]
+
+[workspace.lints.rust]
+deprecated = "allow"

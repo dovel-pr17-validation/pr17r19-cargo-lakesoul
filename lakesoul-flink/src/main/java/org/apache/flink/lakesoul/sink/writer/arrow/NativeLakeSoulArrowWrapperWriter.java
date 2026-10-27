@@ -1,0 +1,199 @@
+// SPDX-FileCopyrightText: 2023 LakeSoul Contributors
+//
+// SPDX-License-Identifier: Apache-2.0
+
+package org.apache.flink.lakesoul.sink.writer.arrow;
+
+import static org.apache.flink.lakesoul.tool.LakeSoulSinkOptions.*;
+
+import com.dmetasoul.lakesoul.lakesoul.io.NativeIOWriter;
+
+import org.apache.arrow.vector.types.pojo.Schema;
+import org.apache.flink.configuration.Configuration;
+import org.apache.flink.core.fs.Path;
+import org.apache.flink.lakesoul.sink.writer.NativeLakeSoulWriter;
+import org.apache.flink.lakesoul.tool.FlinkUtil;
+import org.apache.flink.lakesoul.tool.LakeSoulSinkOptions;
+import org.apache.flink.lakesoul.types.arrow.LakeSoulArrowWrapper;
+import org.apache.flink.streaming.api.functions.sink.filesystem.InProgressFileWriter;
+import org.apache.flink.table.runtime.arrow.ArrowUtils;
+import org.apache.flink.table.types.logical.RowType;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import java.io.IOException;
+import java.io.UnsupportedEncodingException;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.stream.Collectors;
+
+public class NativeLakeSoulArrowWrapperWriter
+        implements InProgressFileWriter<LakeSoulArrowWrapper, String> {
+
+    private static final Logger LOG =
+            LoggerFactory.getLogger(NativeLakeSoulArrowWrapperWriter.class);
+
+    private final RowType rowType;
+
+    private final List<String> primaryKeys;
+
+    private final List<String> rangeColumns;
+
+    private final Configuration conf;
+
+    private NativeIOWriter nativeWriter;
+
+    private final int maxRowGroupRows;
+
+    private final long creationTime;
+
+    long lastUpdateTime;
+
+    String prefix;
+
+    private long totalRows = 0;
+
+    public NativeLakeSoulArrowWrapperWriter(
+            RowType rowType,
+            List<String> primaryKeys,
+            List<String> rangeColumns,
+            Path path,
+            long creationTime,
+            Configuration conf)
+            throws IOException {
+        this.maxRowGroupRows = conf.getInteger(MAX_ROW_GROUP_SIZE);
+        this.creationTime = creationTime;
+        this.rowType = rowType;
+        this.primaryKeys = primaryKeys;
+        this.rangeColumns = rangeColumns;
+        this.prefix = path.makeQualified(path.getFileSystem()).toString();
+        this.conf = conf;
+        initNativeWriter();
+    }
+
+    private void initNativeWriter() throws IOException {
+        ArrowUtils.setLocalTimeZone(FlinkUtil.getLocalTimeZone(conf));
+        Schema arrowSchema = ArrowUtils.toArrowSchema(rowType);
+        nativeWriter = new NativeIOWriter(arrowSchema);
+        nativeWriter.setPrimaryKeys(primaryKeys);
+
+        nativeWriter.setRangePartitions(rangeColumns);
+        nativeWriter.setHashBucketNum(conf.getInteger(LakeSoulSinkOptions.HASH_BUCKET_NUM));
+
+        nativeWriter.setRowGroupRowNumber(this.maxRowGroupRows);
+        nativeWriter.setBatchSize(conf.get(BATCH_SIZE));
+        int maxRowGroupValueNumber = conf.getInteger(MAX_ROW_GROUP_VALUE_NUMBER);
+        LOG.info("maxRowGroupValueNumber={}", maxRowGroupValueNumber);
+        if (maxRowGroupValueNumber != -1)
+            nativeWriter.setRowGroupValueNumber(maxRowGroupValueNumber);
+
+        nativeWriter.withPrefix(this.prefix);
+        nativeWriter.useDynamicPartition(true);
+
+        FlinkUtil.setIOConfigs(conf, nativeWriter);
+        if (!primaryKeys.isEmpty()) {
+            nativeWriter.setOption(STABLE_SORT, "true");
+        }
+        nativeWriter.initializeWriter();
+        //        LOG.info("Initialized NativeLakeSoulArrowWrapperWriter: {}", this);
+    }
+
+    @Override
+    public void write(LakeSoulArrowWrapper element, long currentTime) throws IOException {
+        totalRows += nativeWriter.writeIpc(element.getEncodedBatch());
+    }
+
+    @Override
+    public InProgressFileRecoverable persist() throws IOException {
+        // we currently do not support persist
+        return null;
+    }
+
+    @Override
+    public PendingFileRecoverable closeForCommit() throws IOException {
+        throw new UnsupportedEncodingException();
+    }
+
+    public Map<String, List<PendingFileRecoverable>> closeForCommitWithRecoverableMap()
+            throws IOException {
+        long timer = System.currentTimeMillis();
+        Map<String, List<PendingFileRecoverable>> recoverableMap = new HashMap<>();
+
+        HashMap<String, List<NativeIOWriter.FlushResult>> partitionDescAndFilesMap =
+                this.nativeWriter.flush();
+        for (Map.Entry<String, List<NativeIOWriter.FlushResult>> entry :
+                partitionDescAndFilesMap.entrySet()) {
+            recoverableMap.put(
+                    entry.getKey(),
+                    entry.getValue().stream()
+                            .map(
+                                    result ->
+                                            new NativeLakeSoulWriter
+                                                    .NativeWriterPendingFileRecoverable(
+                                                    result.getFilePath(), creationTime))
+                            .collect(Collectors.toList()));
+        }
+
+        try {
+            this.nativeWriter.close();
+        } catch (Exception e) {
+            throw new RuntimeException(e);
+        }
+
+        LOG.info(
+                "CloseForCommitWithRecoverableMap done, costTime={}ms, recoverableMap={}",
+                String.format("%06d", System.currentTimeMillis() - timer),
+                recoverableMap);
+        return recoverableMap;
+    }
+
+    @Override
+    public void dispose() {
+        try {
+            this.nativeWriter.close();
+            this.nativeWriter = null;
+        } catch (Exception e) {
+            throw new RuntimeException(e);
+        }
+    }
+
+    @Override
+    public String getBucketId() {
+        return DYNAMIC_BUCKET;
+    }
+
+    @Override
+    public long getCreationTime() {
+        return this.creationTime;
+    }
+
+    @Override
+    public long getSize() throws IOException {
+        return totalRows;
+    }
+
+    @Override
+    public long getLastUpdateTime() {
+        return this.lastUpdateTime;
+    }
+
+    @Override
+    public String toString() {
+        return "NativeLakeSoulArrowWrapperWriter{"
+                + "rowType="
+                + rowType
+                + ", primaryKeys="
+                + primaryKeys
+                + ", rangeColumns="
+                + rangeColumns
+                + ", maxRowGroupRows="
+                + maxRowGroupRows
+                + ", creationTime="
+                + creationTime
+                + ", prefix='"
+                + prefix
+                + '\''
+                + '}';
+    }
+}

@@ -1,0 +1,815 @@
+// SPDX-FileCopyrightText: 2026 LakeSoul Contributors
+//
+// SPDX-License-Identifier: Apache-2.0
+
+//! Read-only statement policy for the PostgreSQL wire server.
+//!
+//! The server exposes LakeSoul tables for analytical queries only. Anything
+//! that is not a query, an `EXPLAIN` of a query, or a session/transaction
+//! control statement is rejected with SQLSTATE `0A000`
+//! (feature_not_supported) before it reaches DataFusion execution, so a
+//! write or DDL can never run against LakeSoul metadata or data files.
+//!
+//! [`ReadOnlyStatementGuard`] is installed as the *last* statement hook of
+//! the connection-local `DfSessionService`, after the upstream
+//! cursor/set-show/transaction hooks: those keep handling their statements
+//! and can still short-circuit (e.g. with PostgreSQL's "current transaction
+//! is aborted" error) before the guard sees anything else. Rejections happen
+//!
+//! - in the simple protocol: per statement, before `SessionContext::sql`
+//!   executes it;
+//! - in the extended protocol: at `Parse` time, so clients get one
+//!   consistent read-only error instead of DataFusion's "unsupported
+//!   statement" planning error.
+//!
+//! A simple-protocol batch runs its statements before the first rejected
+//! one; those can only be reads or session-local control statements, so no
+//! persistent state changes before the error.
+//!
+//! Transaction *isolation* is checked by [`ReadCommittedOnlyGuard`], which
+//! runs before the upstream transaction hook: the session has no
+//! multi-statement snapshot, so only `READ COMMITTED` (or no explicit level)
+//! is accepted — in transaction syntax (`BEGIN ISOLATION LEVEL ...`,
+//! `SET TRANSACTION ...`) and via the `default_transaction_isolation` GUC,
+//! which the upstream `SET` hook would otherwise acknowledge without
+//! applying. The same check runs at connection startup
+//! ([`rejected_startup_isolation`]), where a conflicting request is a
+//! `FATAL` error.
+
+use std::collections::HashMap;
+use std::sync::Arc;
+
+use async_trait::async_trait;
+use datafusion::common::ParamValues;
+use datafusion::logical_expr::LogicalPlan;
+use datafusion::prelude::SessionContext;
+use datafusion::sql::sqlparser::ast::{
+    CloseCursor, Expr, ObjectName, Set, Statement, TransactionIsolationLevel,
+    TransactionMode,
+};
+use datafusion_postgres::QueryHook;
+use datafusion_postgres::hooks::HookClient;
+use datafusion_postgres::hooks::cursor::CursorStatementHook;
+use datafusion_postgres::hooks::set_show::SetShowHook;
+use datafusion_postgres::hooks::transactions::TransactionStatementHook;
+use datafusion_postgres::pgwire;
+use pgwire::api::ClientInfo;
+use pgwire::api::results::Response;
+use pgwire::error::{ErrorInfo, PgWireError, PgWireResult};
+
+use crate::server::ConnectionSession;
+
+/// SQLSTATE for rejected statements (read-only error mapping).
+const FEATURE_NOT_SUPPORTED: &str = "0A000";
+
+/// Statement hooks executed by every connection-local service.
+///
+/// The read-only guard runs last so the upstream hooks keep first claim on
+/// cursor, `SET`/`SHOW` and transaction statements; the isolation guard runs
+/// first because it must see `BEGIN`/`SET TRANSACTION` before the transaction
+/// hook answers them.
+pub(crate) fn statement_hooks() -> Vec<Arc<dyn QueryHook>> {
+    vec![
+        Arc::new(ReadCommittedOnlyGuard),   // new
+        Arc::new(UncancellableCursorGuard), // new
+        Arc::new(PortalCloseCleanup),       // new
+        Arc::new(CursorStatementHook),
+        Arc::new(SetShowHook),
+        Arc::new(TransactionStatementHook),
+        Arc::new(ReadOnlyStatementGuard), // new
+    ]
+}
+
+/// Removes the cancellation state of portals closed through SQL.
+///
+/// SQL `CLOSE name` and `CLOSE ALL` are answered by the upstream cursor hook,
+/// which only removes the portal from pgwire's store: a portal that the
+/// extended protocol created (and whose statement the cancellation map keeps
+/// for cancel requests) would then stay registered forever. This hook runs
+/// before it and forgets what the closed portal kept; it never claims the
+/// statement, so the upstream close keeps answering it.
+struct PortalCloseCleanup;
+
+fn forget_closed_portal(statement: &Statement, client: &dyn HookClient) {
+    let Statement::Close { cursor } = statement else {
+        return;
+    };
+    let Some(session) = client.session_extensions().get::<ConnectionSession>() else {
+        return;
+    };
+    match cursor {
+        CloseCursor::Specific { name } => session.cancellation.forget_portal(&name.value),
+        CloseCursor::All => session.cancellation.forget_all_portals(),
+    }
+}
+
+#[async_trait]
+impl QueryHook for PortalCloseCleanup {
+    async fn handle_simple_query(
+        &self,
+        statement: &Statement,
+        _session_context: &SessionContext,
+        client: &mut dyn HookClient,
+    ) -> Option<PgWireResult<Response>> {
+        forget_closed_portal(statement, client);
+        None
+    }
+
+    async fn handle_extended_parse_query(
+        &self,
+        _statement: &Statement,
+        _session_context: &SessionContext,
+        _client: &(dyn ClientInfo + Send + Sync),
+    ) -> Option<PgWireResult<LogicalPlan>> {
+        // A portal's statement is registered when it executes, so parse time
+        // has nothing to forget.
+        None
+    }
+
+    async fn handle_extended_query(
+        &self,
+        statement: &Statement,
+        _logical_plan: &LogicalPlan,
+        _params: &ParamValues,
+        _session_context: &SessionContext,
+        client: &mut dyn HookClient,
+    ) -> Option<PgWireResult<Response>> {
+        forget_closed_portal(statement, client);
+        None
+    }
+}
+
+/// Rejects transaction isolation levels the server cannot honor.
+///
+/// A read-only LakeSoul session has no multi-statement snapshot: every
+/// statement re-reads the latest LakeSoul metadata, which is `READ COMMITTED`
+/// behaviour. Accepting `REPEATABLE READ` or `SERIALIZABLE` would silently
+/// deliver weaker guarantees than the client asked for, so those are refused
+/// with SQLSTATE `0A000`.
+struct ReadCommittedOnlyGuard;
+
+impl ReadCommittedOnlyGuard {
+    /// The unsupported isolation level requested by `statement`, if any.
+    fn unsupported_isolation(statement: &Statement) -> Option<String> {
+        match statement {
+            Statement::StartTransaction { modes, .. }
+            // `SET TRANSACTION ISOLATION LEVEL ...` (and `SET SESSION
+            // CHARACTERISTICS AS TRANSACTION ...`) parse as
+            // `Set(SetTransaction { modes, .. })` in this sqlparser release.
+            | Statement::Set(Set::SetTransaction { modes, .. }) => unsupported_mode(modes),
+            // `SET default_transaction_isolation = ...` parses as an
+            // ordinary assignment. The upstream `SET` hook acknowledges such
+            // assignments without applying them, so they must be validated
+            // here, before that hook claims the statement.
+            Statement::Set(Set::SingleAssignment { variable, values, .. }) => {
+                isolation_assignment(variable, values.iter())
+            }
+            Statement::Set(Set::MultipleAssignments { assignments }) => assignments
+                .iter()
+                .find_map(|assignment| {
+                    isolation_assignment(
+                        &assignment.name,
+                        core::iter::once(&assignment.value),
+                    )
+                }),
+            _ => None,
+        }
+    }
+}
+
+fn unsupported_mode(modes: &[TransactionMode]) -> Option<String> {
+    modes.iter().find_map(|mode| match mode {
+        TransactionMode::IsolationLevel(level)
+            if *level != TransactionIsolationLevel::ReadCommitted =>
+        {
+            Some(level.to_string())
+        }
+        _ => None,
+    })
+}
+
+/// Validates one GUC assignment. Returns the rejected isolation level when
+/// `variable` is `default_transaction_isolation` and the assigned value
+/// promises a level stronger than `READ COMMITTED`.
+fn isolation_assignment<'a>(
+    variable: &ObjectName,
+    mut values: impl Iterator<Item = &'a Expr>,
+) -> Option<String> {
+    let name = variable.0.last()?.as_ident()?.value.to_lowercase();
+    if name != "default_transaction_isolation" {
+        return None;
+    }
+    values.find_map(|value| {
+        let requested = match value {
+            Expr::Value(literal) => literal.clone().into_string(),
+            Expr::Identifier(ident) => Some(ident.value.clone()),
+            _ => None,
+        }?;
+        rejected_default_isolation(&requested).map(str::to_string)
+    })
+}
+
+/// Maps a textual default-isolation value to its PostgreSQL display name
+/// when the value promises a level this server cannot honor.
+/// `READ UNCOMMITTED` and the numeric aliases behave as `READ COMMITTED` in
+/// PostgreSQL, and `DEFAULT` is this server's own default; all three are
+/// accepted. Values that are not isolation levels at all stay with the
+/// upstream `SET` handling (warn + acknowledged).
+fn rejected_default_isolation(value: &str) -> Option<&'static str> {
+    match value.trim().to_lowercase().as_str() {
+        "read committed" | "read uncommitted" | "0" | "1" | "default" => None,
+        "repeatable read" | "2" => Some("REPEATABLE READ"),
+        "serializable" | "3" => Some("SERIALIZABLE"),
+        _ => None,
+    }
+}
+
+fn isolation_error(level: &str) -> PgWireError {
+    PgWireError::UserError(Box::new(ErrorInfo::new(
+        "ERROR".to_string(),
+        FEATURE_NOT_SUPPORTED.to_string(),
+        format!(
+            "isolation level {level} is not supported in a read-only LakeSoul \
+             session: only READ COMMITTED is available"
+        ),
+    )))
+}
+
+/// Startup counterpart of the isolation guard: refuses connections whose
+/// startup parameters request a default isolation level stronger than
+/// `READ COMMITTED`. Clients pass it either as a plain startup GUC or
+/// inside the libpq `options` string (`-c name=value ...`); both are
+/// validated, because a session that starts under a promised-but-unhonored
+/// isolation level cannot be repaired later by statement hooks.
+pub(crate) fn rejected_startup_isolation(
+    metadata: &HashMap<String, String>,
+) -> Option<PgWireError> {
+    let requested = metadata
+        .get("default_transaction_isolation")
+        .cloned()
+        .or_else(|| {
+            metadata.get("options").and_then(|options| {
+                libpq_option("default_transaction_isolation", options)
+            })
+        })?;
+    let level = rejected_default_isolation(&requested)?;
+    Some(PgWireError::UserError(Box::new(ErrorInfo::new(
+        "FATAL".to_string(),
+        FEATURE_NOT_SUPPORTED.to_string(),
+        format!(
+            "startup parameter default_transaction_isolation = {requested} is not \
+             supported in a read-only LakeSoul session: isolation level {level} \
+             is not available, only READ COMMITTED"
+        ),
+    ))))
+}
+
+/// Extracts the value of `name` from libpq's `-c name=value` pairs in an
+/// `options` startup string. Backslash escaping inside libpq options is not
+/// supported; the GUC values relevant here (isolation level keywords or
+/// their numeric aliases) contain no whitespace.
+fn libpq_option(name: &str, options: &str) -> Option<String> {
+    let mut tokens = options.split_whitespace();
+    while let Some(token) = tokens.next() {
+        let Some(rest) = token.strip_prefix("-c") else {
+            continue;
+        };
+        let pair = if rest.is_empty() {
+            tokens.next()
+        } else {
+            Some(rest)
+        };
+        let Some(pair) = pair else {
+            break;
+        };
+        if let Some((candidate, value)) = pair.split_once('=')
+            && candidate.eq_ignore_ascii_case(name)
+        {
+            return Some(value.to_string());
+        }
+    }
+    None
+}
+
+/// Rejects SQL cursors (`DECLARE`/`FETCH`).
+///
+/// The upstream cursor hook stores the statement's row stream in the portal and
+/// polls it from `do_query`, so no cancellation token or deadline reaches the
+/// execution, and cancelling a `FETCH` would only drop the fetch while the
+/// portal kept the distributed stream alive — the workers would keep reading.
+/// Until cursors can be made cancellation-aware, they are refused like any
+/// other statement the server cannot honour.
+struct UncancellableCursorGuard;
+
+fn cursor_error(verb: &str) -> PgWireError {
+    PgWireError::UserError(Box::new(ErrorInfo::new(
+        "ERROR".to_string(),
+        FEATURE_NOT_SUPPORTED.to_string(),
+        format!(
+            "{verb} is not supported: a cursor's rows are produced outside the \
+             statement's cancellation and statement_timeout, so it cannot be \
+             interrupted"
+        ),
+    )))
+}
+
+#[async_trait]
+impl QueryHook for UncancellableCursorGuard {
+    async fn handle_simple_query(
+        &self,
+        statement: &Statement,
+        _session_context: &SessionContext,
+        _client: &mut dyn HookClient,
+    ) -> Option<PgWireResult<Response>> {
+        match statement {
+            Statement::Declare { .. } => Some(Err(cursor_error("DECLARE"))),
+            Statement::Fetch { .. } => Some(Err(cursor_error("FETCH"))),
+            _ => None,
+        }
+    }
+
+    async fn handle_extended_parse_query(
+        &self,
+        statement: &Statement,
+        _session_context: &SessionContext,
+        _client: &(dyn ClientInfo + Send + Sync),
+    ) -> Option<PgWireResult<LogicalPlan>> {
+        match statement {
+            Statement::Declare { .. } => Some(Err(cursor_error("DECLARE"))),
+            Statement::Fetch { .. } => Some(Err(cursor_error("FETCH"))),
+            _ => None,
+        }
+    }
+
+    async fn handle_extended_query(
+        &self,
+        statement: &Statement,
+        _logical_plan: &LogicalPlan,
+        _params: &ParamValues,
+        _session_context: &SessionContext,
+        _client: &mut dyn HookClient,
+    ) -> Option<PgWireResult<Response>> {
+        match statement {
+            Statement::Declare { .. } => Some(Err(cursor_error("DECLARE"))),
+            Statement::Fetch { .. } => Some(Err(cursor_error("FETCH"))),
+            _ => None,
+        }
+    }
+}
+
+#[async_trait]
+impl QueryHook for ReadCommittedOnlyGuard {
+    async fn handle_simple_query(
+        &self,
+        statement: &Statement,
+        _session_context: &SessionContext,
+        _client: &mut dyn HookClient,
+    ) -> Option<PgWireResult<Response>> {
+        Self::unsupported_isolation(statement).map(|level| Err(isolation_error(&level)))
+    }
+
+    async fn handle_extended_parse_query(
+        &self,
+        statement: &Statement,
+        _session_context: &SessionContext,
+        _client: &(dyn ClientInfo + Send + Sync),
+    ) -> Option<PgWireResult<LogicalPlan>> {
+        Self::unsupported_isolation(statement).map(|level| Err(isolation_error(&level)))
+    }
+
+    async fn handle_extended_query(
+        &self,
+        statement: &Statement,
+        _logical_plan: &LogicalPlan,
+        _params: &ParamValues,
+        _session_context: &SessionContext,
+        _client: &mut dyn HookClient,
+    ) -> Option<PgWireResult<Response>> {
+        Self::unsupported_isolation(statement).map(|level| Err(isolation_error(&level)))
+    }
+}
+
+/// Rejects every statement the read-only server does not support.
+struct ReadOnlyStatementGuard;
+
+impl ReadOnlyStatementGuard {
+    /// Statements the server accepts: queries, `DESCRIBE <table>`,
+    /// session-local `SET`/`SHOW` and transaction control. Cursors are refused
+    /// by [`UncancellableCursorGuard`]; `EXPLAIN` is allowed only for a query,
+    /// so `EXPLAIN INSERT` is rejected like the
+    /// statement it wraps.
+    fn allow(statement: &Statement) -> bool {
+        match statement {
+            Statement::Query(_)
+            | Statement::ExplainTable { .. }
+            | Statement::Set(_)
+            | Statement::ShowVariable { .. }
+            | Statement::ShowStatus { .. }
+            | Statement::ShowVariables { .. }
+            | Statement::ShowCatalogs { .. }
+            | Statement::ShowTables { .. }
+            | Statement::ShowColumns { .. }
+            | Statement::ShowFunctions { .. }
+            | Statement::ShowCreate { .. }
+            | Statement::ShowDatabases { .. }
+            | Statement::ShowSchemas { .. }
+            | Statement::ShowObjects { .. }
+            | Statement::ShowViews { .. }
+            | Statement::ShowProcessList { .. }
+            | Statement::ShowCharset { .. }
+            | Statement::ShowCollation { .. }
+            | Statement::StartTransaction { .. }
+            | Statement::Commit { .. }
+            | Statement::Rollback { .. }
+            | Statement::Close { .. } => true,
+            Statement::Explain {
+                statement: inner, ..
+            } => {
+                matches!(&**inner, Statement::Query(_))
+            }
+            _ => false,
+        }
+    }
+}
+
+/// Verb used in rejection messages.
+fn verb(statement: &Statement) -> &'static str {
+    match statement {
+        Statement::Insert { .. } => "INSERT",
+        Statement::Update { .. } => "UPDATE",
+        Statement::Delete { .. } => "DELETE",
+        Statement::Merge { .. } => "MERGE",
+        Statement::Copy { .. } | Statement::CopyIntoSnowflake { .. } => "COPY",
+        Statement::Truncate { .. } => "TRUNCATE",
+        Statement::Prepare { .. } => "PREPARE",
+        Statement::Execute { .. } => "EXECUTE",
+        Statement::Deallocate { .. } => "DEALLOCATE",
+        Statement::Savepoint { .. } => "SAVEPOINT",
+        Statement::ReleaseSavepoint { .. } => "RELEASE SAVEPOINT",
+        Statement::Grant { .. } | Statement::Revoke { .. } | Statement::Deny { .. } => {
+            "GRANT/REVOKE"
+        }
+        Statement::Drop { .. } => "DROP",
+        Statement::CreateTable { .. } | Statement::CreateVirtualTable { .. } => {
+            "CREATE TABLE"
+        }
+        Statement::CreateView { .. } => "CREATE VIEW",
+        Statement::CreateSchema { .. } => "CREATE SCHEMA",
+        Statement::CreateDatabase { .. } => "CREATE DATABASE",
+        Statement::CreateIndex { .. } => "CREATE INDEX",
+        Statement::AlterTable { .. } => "ALTER TABLE",
+        _ => "this statement",
+    }
+}
+
+fn reject_message(statement: &Statement) -> String {
+    match statement {
+        // Unwrapped so `EXPLAIN INSERT` reports the statement it wraps instead
+        // of "this statement".
+        Statement::Explain {
+            statement: inner, ..
+        } => format!(
+            "cannot execute EXPLAIN {} in a read-only LakeSoul session",
+            verb(inner)
+        ),
+        other => format!(
+            "cannot execute {} in a read-only LakeSoul session",
+            verb(other)
+        ),
+    }
+}
+
+fn reject_error(statement: &Statement) -> PgWireError {
+    PgWireError::UserError(Box::new(ErrorInfo::new(
+        "ERROR".to_string(),
+        FEATURE_NOT_SUPPORTED.to_string(),
+        reject_message(statement),
+    )))
+}
+
+#[async_trait]
+impl QueryHook for ReadOnlyStatementGuard {
+    async fn handle_simple_query(
+        &self,
+        statement: &Statement,
+        _session_context: &SessionContext,
+        _client: &mut dyn HookClient,
+    ) -> Option<PgWireResult<Response>> {
+        if Self::allow(statement) {
+            return None;
+        }
+        Some(Err(reject_error(statement)))
+    }
+
+    async fn handle_extended_parse_query(
+        &self,
+        statement: &Statement,
+        _session_context: &SessionContext,
+        _client: &(dyn ClientInfo + Send + Sync),
+    ) -> Option<PgWireResult<LogicalPlan>> {
+        // Fail at Parse time: the client gets the read-only error before any
+        // Bind/Execute instead of a DataFusion planning error.
+        if Self::allow(statement) {
+            return None;
+        }
+        Some(Err(reject_error(statement)))
+    }
+
+    async fn handle_extended_query(
+        &self,
+        statement: &Statement,
+        _logical_plan: &LogicalPlan,
+        _params: &ParamValues,
+        _session_context: &SessionContext,
+        _client: &mut dyn HookClient,
+    ) -> Option<PgWireResult<Response>> {
+        // Defense in depth: unreachable while the parse hook rejects first,
+        // but keeps the execute phase safe if hook ordering ever changes.
+        if Self::allow(statement) {
+            return None;
+        }
+        Some(Err(reject_error(statement)))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use datafusion::common::DFSchema;
+    use datafusion::logical_expr::{EmptyRelation, LogicalPlan};
+    use datafusion::prelude::SessionContext;
+    use datafusion_postgres::DfSessionService;
+    use datafusion_postgres::datafusion_pg_catalog::sql::PostgresCompatibilityParser;
+    use datafusion_postgres::pgwire;
+    use datafusion_postgres::testing::MockClient;
+    use pgwire::api::query::{ExtendedQueryHandler, SimpleQueryHandler};
+    use pgwire::api::results::Response;
+    use pgwire::api::stmt::QueryParser;
+    use pgwire::error::PgWireError;
+
+    use super::*;
+
+    fn service() -> DfSessionService {
+        DfSessionService::new_with_hooks(
+            Arc::new(SessionContext::new()),
+            statement_hooks(),
+        )
+    }
+
+    fn dummy_plan() -> LogicalPlan {
+        LogicalPlan::EmptyRelation(EmptyRelation {
+            produce_one_row: false,
+            schema: Arc::new(DFSchema::empty()),
+        })
+    }
+
+    fn sql_state(error: &PgWireError) -> Option<&str> {
+        match error {
+            PgWireError::UserError(info) => Some(info.code.as_str()),
+            _ => None,
+        }
+    }
+
+    async fn parse(service: &DfSessionService, sql: &str) -> PgWireResult<()> {
+        let parser = <DfSessionService as ExtendedQueryHandler>::query_parser(service);
+        let client = MockClient::new();
+        parser.parse_sql(&client, sql, &[]).await.map(|_| ())
+    }
+
+    const REJECTED: &[&str] = &[
+        "INSERT INTO t VALUES (1)",
+        "UPDATE t SET a = 1",
+        "DELETE FROM t",
+        "MERGE INTO t USING s ON t.id = s.id WHEN MATCHED THEN UPDATE SET a = 1",
+        "COPY t TO STDOUT",
+        "COPY t FROM STDIN",
+        "TRUNCATE t",
+        "CREATE TABLE t (a INT)",
+        "CREATE TABLE t AS SELECT 1",
+        "CREATE VIEW v AS SELECT 1",
+        "CREATE SCHEMA s",
+        "DROP TABLE t",
+        "ALTER TABLE t ADD COLUMN b INT",
+        "GRANT SELECT ON t TO u",
+        "REVOKE SELECT ON t FROM u",
+        "PREPARE p AS SELECT 1",
+        "EXPLAIN INSERT INTO t VALUES (1)",
+        "SAVEPOINT sp",
+        "BEGIN ISOLATION LEVEL REPEATABLE READ",
+        "START TRANSACTION ISOLATION LEVEL SERIALIZABLE",
+        "SET TRANSACTION ISOLATION LEVEL REPEATABLE READ",
+        "SET TRANSACTION ISOLATION LEVEL SERIALIZABLE",
+    ];
+
+    const ALLOWED: &[&str] = &[
+        "SELECT 1",
+        "SELECT 1 WHERE 1 = 0",
+        "WITH x AS (SELECT 1 AS a) SELECT * FROM x",
+        "VALUES (1)",
+        "EXPLAIN SELECT 1",
+        "EXPLAIN ANALYZE SELECT 1",
+        "SET a = 1",
+        "SET TIME ZONE 'UTC'",
+        "SHOW server_version",
+        "BEGIN",
+        "BEGIN TRANSACTION READ ONLY",
+        "BEGIN ISOLATION LEVEL READ COMMITTED",
+        "START TRANSACTION READ ONLY",
+        "SET TRANSACTION ISOLATION LEVEL READ COMMITTED",
+        "COMMIT",
+        "ROLLBACK",
+        // `CLOSE` stays allowed: with `DECLARE` refused there is no cursor to
+        // close, and the statement itself is harmless.
+        "CLOSE c",
+    ];
+
+    /// Cursors are refused until their execution can be cancelled: the upstream
+    /// cursor hook stores the row stream in the portal, so no token or deadline
+    /// reaches it.
+    #[tokio::test]
+    async fn cursors_are_rejected_as_uncancellable() {
+        let service = service();
+        for sql in ["DECLARE c CURSOR FOR SELECT 1", "FETCH 1 FROM c"] {
+            let error = parse(&service, sql).await.expect_err(sql);
+            assert_eq!(sql_state(&error), Some("0A000"), "sql: {sql}");
+            let message = match error {
+                PgWireError::UserError(info) => info.message,
+                other => panic!("unexpected error: {other:?}"),
+            };
+            assert!(message.contains("cursor"), "{message}");
+
+            let mut client = MockClient::new();
+            let error = <DfSessionService as SimpleQueryHandler>::do_query(
+                &service,
+                &mut client,
+                sql,
+            )
+            .await
+            .expect_err(sql);
+            assert_eq!(sql_state(&error), Some("0A000"), "sql: {sql}");
+        }
+    }
+
+    #[tokio::test]
+    async fn extended_parse_rejects_writes_and_ddl() {
+        let service = service();
+        for sql in REJECTED {
+            let error = parse(&service, sql).await.expect_err(sql);
+            assert_eq!(sql_state(&error), Some("0A000"), "sql: {sql}");
+        }
+    }
+
+    #[tokio::test]
+    async fn extended_parse_allows_queries_and_session_control() {
+        let service = service();
+        for sql in ALLOWED {
+            parse(&service, sql)
+                .await
+                .unwrap_or_else(|e| panic!("{sql}: {e}"));
+        }
+    }
+
+    #[tokio::test]
+    async fn simple_protocol_rejects_writes_before_execution() {
+        let service = service();
+        let mut client = MockClient::new();
+        // The trailing statement of a batch is rejected as well, so no
+        // statement after the first rejected one can ever execute.
+        for sql in [
+            "INSERT INTO t VALUES (1)",
+            "CREATE TABLE t (a INT)",
+            "SELECT 1; DELETE FROM t",
+        ] {
+            let error = <DfSessionService as SimpleQueryHandler>::do_query(
+                &service,
+                &mut client,
+                sql,
+            )
+            .await
+            .expect_err(sql);
+            assert_eq!(sql_state(&error), Some("0A000"), "sql: {sql}");
+        }
+    }
+
+    #[tokio::test]
+    async fn simple_protocol_allows_queries() {
+        let service = service();
+        let mut client = MockClient::new();
+        let responses = <DfSessionService as SimpleQueryHandler>::do_query(
+            &service,
+            &mut client,
+            "SELECT 1; SELECT 2",
+        )
+        .await
+        .expect("SELECT statements should run");
+        assert_eq!(responses.len(), 2);
+        assert!(matches!(responses[0], Response::Query(_)));
+    }
+
+    #[tokio::test]
+    async fn unsupported_isolation_level_is_named_in_the_error() {
+        let service = service();
+        let error = parse(&service, "BEGIN ISOLATION LEVEL SERIALIZABLE")
+            .await
+            .expect_err("SERIALIZABLE must be rejected");
+        assert_eq!(sql_state(&error), Some("0A000"));
+        let message = match error {
+            PgWireError::UserError(info) => info.message,
+            other => panic!("unexpected error: {other:?}"),
+        };
+        assert!(message.contains("SERIALIZABLE"), "{message}");
+    }
+
+    #[tokio::test]
+    async fn default_isolation_assignment_is_guarded() {
+        // `SET default_transaction_isolation = ...` parses as
+        // `Set::SingleAssignment`, which `unsupported_isolation` must also
+        // validate: the upstream `SET` hook reports success without applying
+        // the setting, so a later plain `BEGIN` would silently run with
+        // weaker isolation semantics than the client asked for.
+        let service = service();
+        for sql in [
+            "SET default_transaction_isolation = 'serializable'",
+            "SET default_transaction_isolation = 'repeatable read'",
+            "SET default_transaction_isolation TO 'repeatable read'",
+            "SET SESSION default_transaction_isolation TO 'serializable'",
+            "SET LOCAL default_transaction_isolation = 'serializable'",
+        ] {
+            let error = parse(&service, sql).await.expect_err(sql);
+            assert_eq!(sql_state(&error), Some("0A000"), "sql: {sql}");
+        }
+        // The read-committed default stays assignable.
+        for sql in [
+            "SET default_transaction_isolation = 'read committed'",
+            "SET SESSION default_transaction_isolation TO 'read committed'",
+        ] {
+            parse(&service, sql)
+                .await
+                .unwrap_or_else(|e| panic!("{sql}: {e}"));
+        }
+    }
+
+    #[tokio::test]
+    async fn simple_protocol_rejects_default_isolation_assignment() {
+        let service = service();
+        let mut client = MockClient::new();
+        let error = <DfSessionService as SimpleQueryHandler>::do_query(
+            &service,
+            &mut client,
+            "SET default_transaction_isolation = 'serializable'",
+        )
+        .await
+        .expect_err("serializable default must be rejected, not acknowledged");
+        assert_eq!(sql_state(&error), Some("0A000"));
+    }
+
+    #[tokio::test]
+    async fn rejected_default_isolation_assignment_keeps_session_usable() {
+        // A rejected `SET` is a plain statement error, not an aborted
+        // transaction: the session stays usable for reads afterwards.
+        let service = service();
+        let mut client = MockClient::new();
+        let error = <DfSessionService as SimpleQueryHandler>::do_query(
+            &service,
+            &mut client,
+            "SET default_transaction_isolation = 'serializable'",
+        )
+        .await
+        .expect_err("serializable default must be rejected");
+        assert_eq!(sql_state(&error), Some("0A000"));
+
+        let responses = <DfSessionService as SimpleQueryHandler>::do_query(
+            &service,
+            &mut client,
+            "SELECT 1",
+        )
+        .await
+        .expect("session must stay usable after a rejected SET");
+        assert!(matches!(responses[0], Response::Query(_)));
+    }
+
+    #[tokio::test]
+    async fn extended_execute_phase_rejects_writes() {
+        // Second line of defense behind the parse hook: feed a write
+        // statement straight into the execute-phase hook.
+        let statements = PostgresCompatibilityParser::new()
+            .parse("INSERT INTO t VALUES (1)")
+            .expect("parse");
+        let statement = statements.first().expect("statement");
+        let mut client = MockClient::new();
+        let context = SessionContext::new();
+
+        let result = ReadOnlyStatementGuard
+            .handle_extended_query(
+                statement,
+                &dummy_plan(),
+                &ParamValues::List(vec![]),
+                &context,
+                &mut client,
+            )
+            .await
+            .expect("write statement must be rejected");
+        assert_eq!(sql_state(&result.unwrap_err()), Some("0A000"));
+    }
+}

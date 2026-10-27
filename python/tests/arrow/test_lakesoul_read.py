@@ -1,0 +1,308 @@
+# SPDX-FileCopyrightText: 2025 LakeSoul Contributors
+#
+# SPDX-License-Identifier: Apache-2.0
+
+
+import pyarrow as pa
+import pytest
+from duckdb import BinderException
+
+from lakesoul import LakeSoulCatalog
+
+
+_CATALOG: LakeSoulCatalog | None = None
+
+
+def _catalog() -> LakeSoulCatalog:
+    global _CATALOG
+    if _CATALOG is None:
+        _CATALOG = LakeSoulCatalog.from_env()
+    return _CATALOG
+
+
+def _dataset(table_name: str, **kwargs):
+    return _catalog().scan(table_name, **kwargs).to_arrow_dataset()
+
+
+def test_lakesoul_dataset():
+    # before this make share tpch data(0.1) is ready
+    lds = _dataset("part", batch_size=1024)
+
+    total_rows = 0
+    total_cols = 0
+    for batch in lds.to_batches():
+        total_rows += batch.num_rows
+        assert batch.num_columns == 9
+        total_cols += batch.num_columns
+
+    assert total_rows == 20000
+
+
+def test_unsharded_dataset_ignores_torch_distributed(monkeypatch) -> None:
+    dist = pytest.importorskip("torch.distributed")
+    from lakesoul.arrow import Dataset, LakeSoulScanConfig
+    from lakesoul.metadata import LakeSoulScanPlanPartition
+
+    monkeypatch.setattr(dist, "get_rank", lambda: 1)
+    monkeypatch.setattr(dist, "get_world_size", lambda: 2)
+    scan_partitions = (
+        LakeSoulScanPlanPartition(["file:///tmp/part-0.parquet"], ["id"]),
+        LakeSoulScanPlanPartition(["file:///tmp/part-1.parquet"], ["id"]),
+    )
+    dataset = Dataset(
+        LakeSoulScanConfig(
+            table_name="target",
+            namespace="analytics",
+            schema=pa.schema([pa.field("id", pa.int64())]),
+            partition_schema=None,
+            scan_partitions=scan_partitions,
+            partitions={},
+            object_store_options={},
+        )
+    )
+
+    assert dataset.file_urls() == [
+        ["file:///tmp/part-0.parquet"],
+        ["file:///tmp/part-1.parquet"],
+    ]
+
+
+def test_dataset_parameters():
+    lds = _dataset("part")
+    with pytest.raises(NotImplementedError) as _:
+        _ = lds.scanner(columns=1)
+    with pytest.raises(NotImplementedError) as _:
+        _ = lds.scanner(columns=[1])
+    with pytest.raises(NotImplementedError) as _:
+        _ = lds.scanner(filter="")
+    with pytest.raises(ValueError, match="batch_readahead"):
+        _ = lds.scanner(batch_readahead=0)
+    with pytest.raises(ValueError, match="fragment_readahead"):
+        _ = lds.scanner(fragment_readahead=-1)
+    with pytest.raises(NotImplementedError) as _:
+        _ = lds.scanner(fragment_scan_options="")
+    with pytest.raises(NotImplementedError) as _:
+        _ = lds.scanner(cache_metadata=True)
+    with pytest.raises(NotImplementedError) as _:
+        _ = lds.scanner(memory_pool=False)
+
+
+def test_scanner_maps_readahead_to_native_prefetch() -> None:
+    from lakesoul.arrow import Dataset, LakeSoulScanConfig
+
+    dataset = Dataset(
+        LakeSoulScanConfig(
+            table_name="target",
+            namespace="analytics",
+            schema=pa.schema([pa.field("id", pa.int64())]),
+            partition_schema=None,
+            scan_partitions=(),
+            partitions={},
+            object_store_options={},
+        )
+    )
+
+    scanner = dataset.scanner(batch_readahead=3, fragment_readahead=2)
+
+    assert scanner._reader_options["prefetch_size"] == "3"
+    with pytest.raises(ValueError, match="batch_readahead"):
+        dataset.scanner(batch_readahead=True)
+
+
+def test_dataset_to_table():
+    lds = _dataset("part")
+    table = lds.to_table()
+    assert table.num_rows == 20000
+
+
+def test_invalid_filter():
+    import pyarrow.compute as pc
+
+    with pytest.raises(pa.ArrowInvalid) as _:
+        filter = pc.field("no_in_schema") == 50
+        scanner = _dataset("part").scanner(filter=filter)
+        _ = scanner.to_table()
+
+
+def test_dataset_with_filter():
+    import decimal
+
+    import pyarrow.compute as pc
+
+    filter = pc.field("p_size") == 50
+    scanner = _dataset("part").scanner(filter=filter)
+    table = scanner.to_table()
+    assert len(table) == 392
+
+    val = pa.array([decimal.Decimal("1500.00")], type=pa.decimal128(15, 2))
+    filter = pc.field("p_retailprice") >= val[0]
+    scanner = _dataset("part").scanner(filter=filter)
+    table = scanner.to_table()
+    assert len(table) == 8190
+
+    lds = _dataset("part")
+    lds.filter(filter)
+    scanner = lds.scanner()
+    table = scanner.to_table()
+    assert len(table) == 8190
+
+    filter = (pc.field("p_retailprice") >= val[0]) & (pc.field("p_size") == 50)
+    scanner = _dataset("part").scanner(filter=filter)
+    table = scanner.to_table()
+    assert len(table) == 176
+
+
+def test_fragment_with_filter():
+    import decimal
+
+    import pyarrow.compute as pc
+
+    val = pa.array([decimal.Decimal("1500.00")], type=pa.decimal128(15, 2))
+    filter = (pc.field("p_retailprice") >= val[0]) & (pc.field("p_size") == 50)
+    fragment = list(_dataset("part").get_fragments(filter=filter))[0]
+    scanner = fragment.scanner()
+    table = scanner.to_table()
+    assert len(table) == 176
+
+
+def test_filter_override():
+    import decimal
+
+    import pyarrow.compute as pc
+
+    val = pa.array([decimal.Decimal("1500.00")], type=pa.decimal128(15, 2))
+    decimal_filter = pc.field("p_retailprice") >= val[0]
+    int_filter = pc.field("p_size") == 50
+    # dataset
+    lds = _dataset("part")
+    lds.filter(decimal_filter)
+    scanner = lds.scanner(filter=int_filter)
+    table = scanner.to_table()
+    assert len(table) == 392
+    # fragments
+    fragment = list(_dataset("part").get_fragments(filter=decimal_filter))[0]
+    scanner = fragment.scanner(filter=int_filter)
+    table = scanner.to_table()
+    assert len(table) == 392
+
+
+def test_prune_columns():
+    # dataset
+    cols = ["p_name"]
+    scanner = _dataset("part").scanner(columns=cols)
+    table = scanner.to_table()
+    assert len(table.columns) == 1
+
+    # fragment
+    fragment = list(_dataset("part").get_fragments())[0]
+    scanner = fragment.scanner(columns=cols)
+    table = scanner.to_table()
+    assert len(table.columns) == 1
+
+    cols = ["p_name", "p_size"]
+    scanner = _dataset("part").scanner(columns=cols)
+    table = scanner.to_table()
+    assert len(table.columns) == 2
+
+    fragment = list(_dataset("part").get_fragments())[0]
+    scanner = fragment.scanner(columns=cols)
+    table = scanner.to_table()
+    assert len(table.columns) == 2
+
+    with pytest.raises(ValueError) as _:
+        # no such field
+        scanner = _dataset("part").scanner(columns=["not existed"])
+        table = scanner.to_table()
+        _ = scanner.to_table()
+
+    with pytest.raises(ValueError) as _:
+        # no such field
+        fragment = list(_dataset("part").get_fragments())[0]
+        scanner = fragment.scanner(columns=["not existed"])
+        _ = scanner.to_table()
+
+    with pytest.raises(ValueError) as _:
+        # no such field
+        fragment = list(_dataset("part").get_fragments())[0]
+        scanner = fragment.scanner(columns=["p_name", "not existed"])
+        _ = scanner.to_table()
+
+
+def test_duckdb_compatibility():
+    import duckdb
+
+    conn = duckdb.connect()
+    _lds = _dataset("part")
+    results = conn.sql("select * from _lds").arrow().read_all()
+    assert len(results) == 20000
+
+
+def test_duckdb_compatibility_with_filter_and_projections():
+    import duckdb
+
+    conn = duckdb.connect()
+    _lds = _dataset("part")
+    results = conn.execute("select * from _lds where p_size = 50").arrow().read_all()
+    assert len(results) == 392
+
+    results = conn.sql("select * from _lds where p_size = 50").arrow().read_all()
+    assert len(results) == 392
+
+    results = (
+        conn.execute("select p_size,p_name from _lds where p_size = 50")
+        .arrow()
+        .read_all()
+    )
+    assert len(results) == 392
+    expected = ["p_size", "p_name"]
+    actual = [f.name for f in results.schema]
+    assert actual == expected
+    assert len(results.columns) == 2
+
+    results = (
+        conn.sql("select p_size, p_name from _lds where p_size = 50").arrow().read_all()
+    )
+    assert len(results) == 392
+    expected = ["p_size", "p_name"]
+    actual = [f.name for f in results.schema]
+    assert actual == expected
+    assert len(results.columns) == 2
+
+    results = (
+        conn.sql("select p_name,p_size from _lds where p_size = 50").arrow().read_all()
+    )
+    assert len(results) == 392
+    expected = ["p_name", "p_size"]
+    actual = [f.name for f in results.schema]
+    assert actual == expected
+    assert len(results.columns) == 2
+
+    results = (
+        conn.execute("select p_name,p_size from _lds where p_size = 50")
+        .arrow()
+        .read_all()
+    )
+    assert len(results) == 392
+    expected = ["p_name", "p_size"]
+    actual = [f.name for f in results.schema]
+    assert actual == expected
+    assert len(results.columns) == 2
+
+    with pytest.raises(BinderException) as _:
+        # no such field
+        results = conn.execute("select not_existed from _lds").arrow().read_all()
+
+
+def test_normal_lakesoul_table():
+    lds = _dataset("test_lfs", batch_size=1024)
+
+    total_rows = 0
+    for batch in lds.to_batches():
+        total_rows += batch.num_rows
+
+    assert total_rows == 7
+
+
+def test_debug():
+    lds = _dataset("test_lfs", batch_size=1024, retain_partition_columns=True)
+    print(lds.schema)

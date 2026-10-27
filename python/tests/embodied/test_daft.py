@@ -1,0 +1,848 @@
+# SPDX-FileCopyrightText: 2026 LakeSoul Contributors
+#
+# SPDX-License-Identifier: Apache-2.0
+from __future__ import annotations
+
+import io
+import json
+from pathlib import Path
+
+import numpy as np
+import pyarrow as pa
+import pytest
+
+pytest.importorskip("daft")
+
+from embodied.test_lerobot import STATE_DIM, _table_name, _write_dataset
+from lakesoul import LakeSoulCatalog
+from lakesoul.embodied import (
+    EmbodiedDataset,
+    GopVideo,
+    SecondaryStream,
+    align,
+    import_lerobot,
+)
+from lakesoul.embodied.daft import (
+    align_daft,
+    import_lerobot_gop,
+    read_gop_frames,
+    read_samples,
+)
+from lakesoul.embodied.daft import import_lerobot as import_lerobot_daft
+from lakesoul.embodied.daft import import_mcap as import_mcap_daft
+
+
+def test_import_lerobot_daft_frames(tmp_path: Path) -> None:
+    root = tmp_path / "dataset"
+    _write_dataset(root, with_video=True)
+    catalog = LakeSoulCatalog.from_env()
+    table_name = _table_name("daft")
+    table_path = (tmp_path / "lake" / table_name).as_uri()
+
+    try:
+        summary = import_lerobot_daft(
+            root,
+            table=table_name,
+            path=table_path,
+            episodes=[0, 1],
+            cameras=["cam"],
+            physical_format="parquet",
+        )
+        assert summary.rows == 9
+        assert summary.episodes == 2
+        assert summary.video_frames == 9
+        assert "observation_state" in summary.columns
+        assert "cam" in summary.columns
+
+        table = catalog.table(table_name)
+        scanned = table.scan().to_arrow_table()
+        assert scanned.num_rows == 9
+        assert set(scanned.column("episode_id").to_pylist()) == {
+            "ep000000",
+            "ep000001",
+        }
+
+        dataset = EmbodiedDataset(
+            table.scan(),
+            window={"observation_state": (0, 2), "action": (0, 2)},
+            stride=1,
+            episodes=["ep000001"],
+        )
+        samples = list(dataset.iter_epoch(0))
+        assert len(samples) == 3
+        assert samples[0]["observation_state"].shape == (2, STATE_DIM)
+        assert samples[0]["action"].shape == (2, 2)
+
+        from PIL import Image
+
+        images = scanned.column("cam").to_pylist()
+        assert all(image and image.startswith(b"\xff\xd8") for image in images)
+        assert Image.open(io.BytesIO(images[0])).size == (8, 8)
+    finally:
+        catalog.drop_table(table_name, if_exists=True)
+
+
+def test_import_lerobot_daft_overwrite_guard(tmp_path: Path) -> None:
+    root = tmp_path / "dataset"
+    _write_dataset(root)
+    catalog = LakeSoulCatalog.from_env()
+    table_name = _table_name("daft_overwrite")
+    table_path = (tmp_path / "lake" / table_name).as_uri()
+    kwargs = {
+        "table": table_name,
+        "path": table_path,
+        "physical_format": "parquet",
+    }
+
+    try:
+        summary = import_lerobot_daft(root, **kwargs)
+        assert summary.rows == 15
+        assert summary.episodes == 3
+        assert summary.video_frames == 0
+
+        with pytest.raises(ValueError, match="already exists"):
+            import_lerobot_daft(root, **kwargs)
+        import_lerobot_daft(root, overwrite=True, **kwargs)
+    finally:
+        catalog.drop_table(table_name, if_exists=True)
+
+
+def test_import_lerobot_daft_unknown_camera(tmp_path: Path) -> None:
+    root = tmp_path / "dataset"
+    _write_dataset(root, with_video=True)
+
+    with pytest.raises(ValueError, match="unknown camera"):
+        import_lerobot_daft(
+            root,
+            table=_table_name("daft_camera"),
+            path=(tmp_path / "lake").as_uri(),
+            cameras=["missing"],
+            catalog=object(),  # type: ignore[arg-type]
+        )
+
+
+def test_import_lerobot_daft_gop(tmp_path: Path) -> None:
+    root = tmp_path / "dataset"
+    _write_dataset(root, with_video=True)
+    catalog = LakeSoulCatalog.from_env()
+    table_name = _table_name("daft_gop")
+    table_path = (tmp_path / "lake" / table_name).as_uri()
+
+    try:
+        summary = import_lerobot_gop(
+            root,
+            table=table_name,
+            path=table_path,
+            episodes=[0, 1],
+            cameras=["cam"],
+            physical_format="parquet",
+        )
+        assert summary.tables == (
+            table_name,
+            f"{table_name}_gops",
+            f"{table_name}_frames",
+        )
+        assert summary.rows == 9
+        assert summary.video_frames == 9
+
+        ticks = catalog.table(table_name).scan().to_arrow_table()
+        assert ticks.num_rows == 9
+        assert "cam" not in ticks.column_names
+        assert (
+            catalog.table(f"{table_name}_frames").scan().to_arrow_table().num_rows == 9
+        )
+
+        video = GopVideo(
+            catalog.table(f"{table_name}_gops"),
+            catalog.table(f"{table_name}_frames"),
+        )
+        decoded = video.for_episode("ep000001").frames(0, 4)
+        assert decoded["cam"].shape == (4, 8, 8, 3)
+        assert [float(frame[0, 0, 0]) for frame in decoded["cam"]] == pytest.approx(
+            [50.0, 60.0, 70.0, 80.0], abs=6.0
+        )
+
+        dataset = EmbodiedDataset(
+            catalog.table(table_name).scan(),
+            window={"observation_state": (-2, 0)},
+            video=video,
+            boundary="clamp",
+        )
+        samples = list(dataset.iter_epoch(0))
+        assert samples
+        assert all(
+            sample["cam"].shape[0] == sample["observation_state"].shape[0]
+            for sample in samples
+        )
+    finally:
+        catalog.drop_table(f"{table_name}_frames", if_exists=True)
+        catalog.drop_table(f"{table_name}_gops", if_exists=True)
+        catalog.drop_table(table_name, if_exists=True)
+
+
+WINDOW = {"observation_state": (-2, 0), "action": (0, 2)}
+
+
+def _sample_key(sample) -> tuple:
+    values = [np.asarray(sample[name]).round(4).flatten().tolist() for name in WINDOW]
+    return tuple(item for row in values for item in row)
+
+
+def test_read_samples_matches_embodied_dataset(tmp_path: Path) -> None:
+    root = tmp_path / "dataset"
+    _write_dataset(root)
+    catalog = LakeSoulCatalog.from_env()
+    table_name = _table_name("daft_samples")
+    table_path = (tmp_path / "lake" / table_name).as_uri()
+
+    try:
+        import_lerobot(
+            root, table=table_name, path=table_path, physical_format="parquet"
+        )
+        table = catalog.table(table_name)
+
+        daft_rows = read_samples(table.scan(), window=WINDOW, stride=1).collect()
+        daft_keys = sorted(_sample_key(sample) for sample in daft_rows.to_pylist())
+
+        dataset = EmbodiedDataset(table.scan(), window=WINDOW, stride=1)
+        baseline_keys = sorted(_sample_key(sample) for sample in dataset.iter_epoch(0))
+
+        assert len(daft_keys) == len(baseline_keys)
+        assert daft_keys == baseline_keys
+        assert {"episode_id", "anchor", *WINDOW} == set(daft_rows.column_names)
+
+        strided = read_samples(table.scan(), window=WINDOW, stride=2).collect()
+        strided_keys = sorted(_sample_key(sample) for sample in strided.to_pylist())
+        baseline_strided = sorted(
+            _sample_key(sample)
+            for sample in EmbodiedDataset(
+                table.scan(), window=WINDOW, stride=2
+            ).iter_epoch(0)
+        )
+        assert len(strided_keys) == len(baseline_strided)
+        assert strided_keys == baseline_strided
+    finally:
+        catalog.drop_table(table_name, if_exists=True)
+
+
+def test_read_samples_clamp_keeps_edge_anchors(tmp_path: Path) -> None:
+    root = tmp_path / "dataset"
+    _write_dataset(root)
+    catalog = LakeSoulCatalog.from_env()
+    table_name = _table_name("daft_clamp")
+    table_path = (tmp_path / "lake" / table_name).as_uri()
+
+    try:
+        import_lerobot(
+            root, table=table_name, path=table_path, physical_format="parquet"
+        )
+        table = catalog.table(table_name)
+        samples = (
+            read_samples(table.scan(), window=WINDOW, stride=1, boundary="clamp")
+            .collect()
+            .to_pylist()
+        )
+        baseline = list(
+            EmbodiedDataset(
+                table.scan(), window=WINDOW, stride=1, boundary="clamp"
+            ).iter_epoch(0)
+        )
+        assert len(samples) == len(baseline)
+        keys = sorted(_sample_key(sample) for sample in samples)
+        assert keys == sorted(_sample_key(sample) for sample in baseline)
+    finally:
+        catalog.drop_table(table_name, if_exists=True)
+
+
+def test_read_samples_rejects_unknown_boundary() -> None:
+    with pytest.raises(ValueError, match="boundary must be one of"):
+        read_samples(object(), window=WINDOW, boundary="pad")  # type: ignore[arg-type]
+
+
+def test_read_gop_frames_decodes_distributed(tmp_path: Path) -> None:
+    root = tmp_path / "dataset"
+    _write_dataset(root, with_video=True)
+    catalog = LakeSoulCatalog.from_env()
+    table_name = _table_name("daft_gop_frames")
+    table_path = (tmp_path / "lake" / table_name).as_uri()
+
+    try:
+        import_lerobot(
+            root,
+            table=table_name,
+            path=table_path,
+            physical_format="parquet",
+            video_layout="gop",
+        )
+        gops = catalog.table(f"{table_name}_gops")
+        frames = catalog.table(f"{table_name}_frames")
+
+        decoded = read_gop_frames(gops.scan(), frames.scan()).collect().to_pylist()
+        assert len(decoded) == 15
+        episode_one = [row for row in decoded if row["episode_id"] == "ep000001"]
+        assert [round(row["timestamp"], 2) for row in episode_one] == [
+            0.5,
+            0.6,
+            0.7,
+            0.8,
+        ]
+        from PIL import Image
+
+        values = [
+            int(Image.open(io.BytesIO(row["image"])).getpixel((0, 0))[0])
+            for row in episode_one
+        ]
+        assert values == pytest.approx([50, 60, 70, 80], abs=6.0)
+        assert all(row["width"] == 8 and row["height"] == 8 for row in decoded)
+
+        raw = (
+            read_gop_frames(
+                gops.scan(),
+                frames.scan(),
+                cameras=["cam"],
+                image_format=None,
+            )
+            .collect()
+            .to_pylist()
+        )
+        assert len(raw) == 15
+        assert len(raw[0]["image"]) == 8 * 8 * 3
+    finally:
+        catalog.drop_table(f"{table_name}_frames", if_exists=True)
+        catalog.drop_table(f"{table_name}_gops", if_exists=True)
+        catalog.drop_table(table_name, if_exists=True)
+
+
+def test_import_mcap_daft_frames(tmp_path: Path) -> None:
+    from embodied.test_mcap import FAKE_JPEG, TICKS, _write_mcap
+
+    sources = []
+    for index in range(2):
+        path = tmp_path / f"ep{index:02d}.mcap"
+        _write_mcap(path)
+        sources.append(path)
+    catalog = LakeSoulCatalog.from_env()
+    table_name = _table_name("daft_mcap")
+    table_path = (tmp_path / "lake" / table_name).as_uri()
+
+    try:
+        summary = import_mcap_daft(
+            sources,
+            table=table_name,
+            path=table_path,
+            columns={
+                "observation_state": "control_tick:state",
+                "reward": "control_tick:reward",
+            },
+            cameras={"cam_high": "camera_high"},
+            row_topic="control_tick",
+            physical_format="parquet",
+        )
+        assert summary.episodes == 2
+        assert summary.rows == 2 * TICKS
+        assert summary.video_frames == 2 * TICKS
+
+        scanned = catalog.table(table_name).scan().to_arrow_table()
+        assert scanned.num_rows == 2 * TICKS
+        assert set(scanned.column("episode_id").to_pylist()) == {"ep00", "ep01"}
+        assert scanned.column("cam_high").to_pylist() == [FAKE_JPEG] * (2 * TICKS)
+        episode_one = [
+            row
+            for row in scanned.to_pylist()
+            if row["episode_id"] == "ep01" and row["frame_index"] == 3
+        ]
+        assert episode_one[0]["observation_state"] == pytest.approx([3.0, 4.0, 5.0])
+        assert episode_one[0]["reward"] == pytest.approx(3.5)
+    finally:
+        catalog.drop_table(table_name, if_exists=True)
+
+
+def test_read_gop_frames_externalized_blob(tmp_path: Path) -> None:
+    root = tmp_path / "dataset"
+    _write_dataset(root, with_video=True)
+    catalog = LakeSoulCatalog.from_env()
+    table_name = _table_name("daft_gop_blob")
+    table_path = (tmp_path / "lake" / table_name).as_uri()
+
+    try:
+        import_lerobot(
+            root,
+            table=table_name,
+            path=table_path,
+            cameras=["cam"],
+            video_layout="gop",
+            physical_format="parquet",
+            properties={"blob_columns": json.dumps({"data": {"mode": "external"}})},
+        )
+        decoded = (
+            read_gop_frames(
+                catalog.table(f"{table_name}_gops").scan(),
+                catalog.table(f"{table_name}_frames").scan(),
+                cameras=["cam"],
+            )
+            .collect()
+            .to_pylist()
+        )
+        assert len(decoded) == 15
+        episode_one = [row for row in decoded if row["episode_id"] == "ep000001"]
+        from PIL import Image
+
+        values = [
+            int(Image.open(io.BytesIO(row["image"])).getpixel((0, 0))[0])
+            for row in episode_one
+        ]
+        assert [round(row["timestamp"], 2) for row in episode_one] == [
+            0.5,
+            0.6,
+            0.7,
+            0.8,
+        ]
+        assert values == pytest.approx([50, 60, 70, 80], abs=6.0)
+    finally:
+        catalog.drop_table(f"{table_name}_frames", if_exists=True)
+        catalog.drop_table(f"{table_name}_gops", if_exists=True)
+        catalog.drop_table(table_name, if_exists=True)
+
+
+def test_import_mcap_daft_gop(tmp_path: Path) -> None:
+    pytest.importorskip("av")
+    from embodied.test_mcap import _h264_annexb_frames, _write_h264_mcap
+
+    frames = _h264_annexb_frames(tmp_path)
+    source = tmp_path / "ep_gop_daft.mcap"
+    _write_h264_mcap(source, frames)
+    catalog = LakeSoulCatalog.from_env()
+    table_name = _table_name("daft_mcap_gop")
+    table_path = (tmp_path / "lake" / table_name).as_uri()
+
+    try:
+        summary = import_mcap_daft(
+            source,
+            table=table_name,
+            path=table_path,
+            columns={"reward": "control_tick:reward"},
+            cameras={"cam_high": "camera_high"},
+            row_topic="control_tick",
+            video_layout="gop",
+            physical_format="parquet",
+        )
+        assert summary.tables == (
+            table_name,
+            f"{table_name}_gops",
+            f"{table_name}_frames",
+        )
+        assert summary.rows == len(frames)
+        assert summary.video_frames == len(frames)
+
+        ticks = catalog.table(table_name).scan().to_arrow_table()
+        assert "cam_high" not in ticks.column_names
+
+        decoded = (
+            read_gop_frames(
+                catalog.table(f"{table_name}_gops").scan(),
+                catalog.table(f"{table_name}_frames").scan(),
+            )
+            .collect()
+            .to_pylist()
+        )
+        assert len(decoded) == len(frames)
+        from PIL import Image
+
+        values = [
+            int(Image.open(io.BytesIO(row["image"])).getpixel((0, 0))[0])
+            for row in decoded[:4]
+        ]
+        assert values == pytest.approx([0, 10, 20, 30], abs=6.0)
+    finally:
+        catalog.drop_table(f"{table_name}_frames", if_exists=True)
+        catalog.drop_table(f"{table_name}_gops", if_exists=True)
+        catalog.drop_table(table_name, if_exists=True)
+
+
+def test_import_lerobot_daft_frames_blob_external(tmp_path: Path) -> None:
+    root = tmp_path / "dataset"
+    _write_dataset(root, with_video=True)
+    catalog = LakeSoulCatalog.from_env()
+    table_name = _table_name("daft_frames_blob")
+    table_path = (tmp_path / "lake" / table_name).as_uri()
+
+    try:
+        summary = import_lerobot_daft(
+            root,
+            table=table_name,
+            path=table_path,
+            episodes=[0, 1],
+            cameras=["cam"],
+            physical_format="parquet",
+            properties={"blob_columns": json.dumps({"cam": {"mode": "external"}})},
+        )
+        assert summary.rows == 9
+
+        table_dir = tmp_path / "lake" / table_name
+        assert list(table_dir.rglob("_blob/cam/*.blob")), "cam packs"
+        assert list(table_dir.rglob("*.blobref")), "sidecars"
+        assert catalog.table(table_name).properties["blob_columns"] == json.dumps(
+            {"cam": {"mode": "external"}}
+        )
+
+        images = (
+            catalog.table(table_name).scan().to_arrow_table().column("cam").to_pylist()
+        )
+        assert images and all(image.startswith(b"\xff\xd8") for image in images)
+    finally:
+        catalog.drop_table(table_name, if_exists=True)
+
+
+def test_import_lerobot_gop_daft_blob_external(tmp_path: Path) -> None:
+    root = tmp_path / "dataset"
+    _write_dataset(root, with_video=True)
+    catalog = LakeSoulCatalog.from_env()
+    table_name = _table_name("daft_gop_blob")
+    table_path = (tmp_path / "lake" / table_name).as_uri()
+
+    try:
+        summary = import_lerobot_gop(
+            root,
+            table=table_name,
+            path=table_path,
+            episodes=[0, 1],
+            cameras=["cam"],
+            physical_format="parquet",
+            properties={
+                "blob_columns": json.dumps(
+                    {"data": {"mode": "external"}, "cam": {"mode": "external"}}
+                )
+            },
+        )
+        assert summary.rows == 9
+
+        gops_dir = tmp_path / "lake" / f"{table_name}_gops"
+        assert list(gops_dir.rglob("_blob/data/*.blob")), "gop packs"
+        assert list(gops_dir.rglob("*.blobref")), "gop sidecars"
+        # The ticks table has neither ``data`` nor ``cam``: the property is filtered away.
+        assert "blob_columns" not in dict(catalog.table(table_name).properties)
+        assert catalog.table(f"{table_name}_gops").properties["blob_columns"] == (
+            json.dumps({"data": {"mode": "external"}})
+        )
+
+        decoded = (
+            read_gop_frames(
+                catalog.table(f"{table_name}_gops").scan(),
+                catalog.table(f"{table_name}_frames").scan(),
+            )
+            .collect()
+            .to_pylist()
+        )
+        assert decoded and decoded[0]["image"]
+    finally:
+        catalog.drop_table(f"{table_name}_frames", if_exists=True)
+        catalog.drop_table(f"{table_name}_gops", if_exists=True)
+        catalog.drop_table(table_name, if_exists=True)
+
+
+def test_read_samples_from_manifest(tmp_path: Path) -> None:
+    root = tmp_path / "dataset"
+    _write_dataset(root)
+    catalog = LakeSoulCatalog.from_env()
+    table_name = _table_name("daft_manifest")
+    table_path = (tmp_path / "lake" / table_name).as_uri()
+
+    try:
+        import_lerobot(
+            root, table=table_name, path=table_path, physical_format="parquet"
+        )
+        table = catalog.table(table_name)
+        baseline = (
+            read_samples(table.scan(), window=WINDOW, stride=1).collect().to_pylist()
+        )
+        assert baseline
+        selected = sorted(baseline, key=lambda row: (row["episode_id"], row["anchor"]))[
+            :3
+        ]
+        samples = pa.table(
+            {
+                "episode_id": pa.array(
+                    [row["episode_id"] for row in selected], type=pa.string()
+                ),
+                "anchor": pa.array(
+                    [row["anchor"] for row in selected], type=pa.int64()
+                ),
+                "rank": pa.array(list(reversed(range(len(selected)))), type=pa.int64()),
+            }
+        )
+        catalog.create_manifest(
+            table,
+            "eval",
+            samples,
+            params={"window": {name: list(bounds) for name, bounds in WINDOW.items()}},
+        )
+
+        rows = read_samples(table.scan(), manifest="eval").collect().to_pylist()
+        by_key = {(row["episode_id"], row["anchor"]): row for row in rows}
+        assert set(by_key) == {(row["episode_id"], row["anchor"]) for row in selected}
+        for row in selected:
+            actual = by_key[(row["episode_id"], row["anchor"])]
+            assert actual["observation_state"] == row["observation_state"]
+            assert actual["action"] == row["action"]
+        assert {
+            by_key[(row["episode_id"], row["anchor"])]["rank"] for row in selected
+        } == set(range(len(selected)))
+
+        rows2 = (
+            read_samples(manifest="eval", table=table_name, catalog=catalog)
+            .collect()
+            .to_pylist()
+        )
+        assert {(row["episode_id"], row["anchor"]) for row in rows2} == set(by_key)
+    finally:
+        catalog.drop_table(table_name, if_exists=True)
+
+
+def test_import_mcap_daft_gop_blob_external(tmp_path: Path) -> None:
+    pytest.importorskip("av")
+    from embodied.test_mcap import _h264_annexb_frames, _write_h264_mcap
+
+    frames = _h264_annexb_frames(tmp_path)
+    source = tmp_path / "ep_gop_blob.mcap"
+    _write_h264_mcap(source, frames)
+    catalog = LakeSoulCatalog.from_env()
+    table_name = _table_name("daft_mcap_blob")
+    table_path = (tmp_path / "lake" / table_name).as_uri()
+
+    try:
+        import_mcap_daft(
+            source,
+            table=table_name,
+            path=table_path,
+            columns={"reward": "control_tick:reward"},
+            cameras={"cam_high": "camera_high"},
+            row_topic="control_tick",
+            video_layout="gop",
+            physical_format="parquet",
+            properties={"blob_columns": json.dumps({"data": {"mode": "external"}})},
+        )
+
+        gops_dir = tmp_path / "lake" / f"{table_name}_gops"
+        assert list(gops_dir.rglob("_blob/data/*.blob")), "gop packs"
+        assert catalog.table(f"{table_name}_gops").properties["blob_columns"] == (
+            json.dumps({"data": {"mode": "external"}})
+        )
+        decoded = (
+            read_gop_frames(
+                catalog.table(f"{table_name}_gops").scan(),
+                catalog.table(f"{table_name}_frames").scan(),
+            )
+            .collect()
+            .to_pylist()
+        )
+        assert decoded and decoded[0]["image"]
+    finally:
+        catalog.drop_table(f"{table_name}_frames", if_exists=True)
+        catalog.drop_table(f"{table_name}_gops", if_exists=True)
+        catalog.drop_table(table_name, if_exists=True)
+
+
+def test_read_samples_with_streams(tmp_path: Path) -> None:
+    catalog = LakeSoulCatalog.from_env()
+    primary_name = _table_name("daft_stream_p")
+    secondary_name = _table_name("daft_stream_s")
+    from embodied.test_align import PRIMARY_SCHEMA, STREAM_SCHEMA, _primary, _stream
+
+    primary = catalog.create_table(
+        primary_name,
+        path=(tmp_path / primary_name).as_uri(),
+        schema=PRIMARY_SCHEMA,
+        partition_by=("episode_id",),
+    )
+    secondary = catalog.create_table(
+        secondary_name,
+        path=(tmp_path / secondary_name).as_uri(),
+        schema=STREAM_SCHEMA,
+        partition_by=("episode_id",),
+    )
+    sparse_name = _table_name("daft_stream_sparse")
+
+    def _normalize(row: dict, key: str) -> list:
+        return [None if value is None else float(value) for value in row[key]]
+
+    try:
+        primary.write_arrow(_primary(), format="parquet")
+        secondary.write_arrow(
+            _stream([0.5, 2.5, 4.5], [10.0, 20.0, 30.0]), format="parquet"
+        )
+        stream = SecondaryStream(secondary.scan(), columns=("grip",), tolerance=0.6)
+
+        dataset = EmbodiedDataset(
+            primary.scan(), window={"state": (0, 2)}, streams=[stream]
+        )
+        expected = {
+            int(sample["state"][0]): (
+                sample["state"].tolist(),
+                _normalize(sample, "grip"),
+            )
+            for sample in dataset.iter_epoch(0)
+        }
+        rows = (
+            read_samples(primary.scan(), window={"state": (0, 2)}, streams=[stream])
+            .collect()
+            .to_pylist()
+        )
+        actual = {
+            int(row["anchor"]): (row["state"], _normalize(row, "grip")) for row in rows
+        }
+        assert actual == expected
+
+        sparse = catalog.create_table(
+            sparse_name,
+            path=(tmp_path / sparse_name).as_uri(),
+            schema=STREAM_SCHEMA,
+            partition_by=("episode_id",),
+        )
+        sparse.write_arrow(_stream([0.0, 2.0], [10.0, 20.0]), format="parquet")
+        skip_stream = SecondaryStream(
+            sparse.scan(), columns=("grip",), tolerance=1.0, missing="skip"
+        )
+        skip_expected = {
+            int(sample["state"][0])
+            for sample in EmbodiedDataset(
+                primary.scan(), window={"state": (0, 2)}, streams=[skip_stream]
+            ).iter_epoch(0)
+        }
+        skip_rows = (
+            read_samples(
+                primary.scan(), window={"state": (0, 2)}, streams=[skip_stream]
+            )
+            .collect()
+            .to_pylist()
+        )
+        assert {int(row["anchor"]) for row in skip_rows} == skip_expected
+
+        snapshot_id = catalog.create_snapshot(secondary)
+        secondary.write_arrow(_stream([1.0], [99.0]), format="parquet")
+        pinned_rows = (
+            read_samples(
+                primary.scan(),
+                window={"state": (0, 2)},
+                streams=[
+                    SecondaryStream(
+                        secondary.scan(),
+                        columns=("grip",),
+                        tolerance=0.6,
+                        snapshot=snapshot_id,
+                    )
+                ],
+            )
+            .collect()
+            .to_pylist()
+        )
+        live_rows = (
+            read_samples(primary.scan(), window={"state": (0, 2)}, streams=[stream])
+            .collect()
+            .to_pylist()
+        )
+        assert any(99.0 in _normalize(row, "grip") for row in live_rows)
+        assert all(99.0 not in _normalize(row, "grip") for row in pinned_rows)
+    finally:
+        catalog.drop_table(sparse_name, if_exists=True)
+        catalog.drop_table(primary_name, if_exists=True)
+        catalog.drop_table(secondary_name, if_exists=True)
+
+
+def test_align_daft_matches_single_machine(tmp_path: Path) -> None:
+    catalog = LakeSoulCatalog.from_env()
+    primary_name = _table_name("daft_align_p")
+    secondary_name = _table_name("daft_align_s")
+    sparse_name = _table_name("daft_align_sparse")
+    output_name = _table_name("daft_align_out")
+    from embodied.test_align import PRIMARY_SCHEMA, STREAM_SCHEMA, _primary, _stream
+
+    primary = catalog.create_table(
+        primary_name,
+        path=(tmp_path / primary_name).as_uri(),
+        schema=PRIMARY_SCHEMA,
+        partition_by=("episode_id",),
+    )
+    secondary = catalog.create_table(
+        secondary_name,
+        path=(tmp_path / secondary_name).as_uri(),
+        schema=STREAM_SCHEMA,
+        partition_by=("episode_id",),
+    )
+    sparse = catalog.create_table(
+        sparse_name,
+        path=(tmp_path / sparse_name).as_uri(),
+        schema=STREAM_SCHEMA,
+        partition_by=("episode_id",),
+    )
+
+    def _sort(rows: list[dict]) -> list[dict]:
+        return sorted(rows, key=lambda row: row["state"])
+
+    try:
+        primary.write_arrow(_primary(), format="parquet")
+        secondary.write_arrow(
+            _stream([0.5, 2.5, 4.5], [10.0, 20.0, 30.0]), format="parquet"
+        )
+        sparse.write_arrow(_stream([0.0, 2.0], [10.0, 20.0]), format="parquet")
+
+        expected = align(
+            primary.scan(), secondary.scan(), columns=("grip",), tolerance=0.6
+        )
+        rows = _sort(
+            align_daft(
+                primary.scan(), secondary.scan(), columns=("grip",), tolerance=0.6
+            )
+            .collect()
+            .to_pylist()
+        )
+        assert [row["state"] for row in rows] == expected.column("state").to_pylist()
+        assert [float(row["grip_r"]) for row in rows] == expected.column(
+            "grip_r"
+        ).to_pylist()
+
+        expected_skip = align(
+            primary.scan(),
+            sparse.scan(),
+            columns=("grip",),
+            tolerance=1.0,
+            missing="skip",
+        )
+        rows_skip = _sort(
+            align_daft(
+                primary.scan(),
+                sparse.scan(),
+                columns=("grip",),
+                tolerance=1.0,
+                missing="skip",
+            )
+            .collect()
+            .to_pylist()
+        )
+        assert [row["state"] for row in rows_skip] == expected_skip.column(
+            "state"
+        ).to_pylist()
+
+        output_schema = pa.schema([*PRIMARY_SCHEMA, pa.field("grip_r", pa.float64())])
+        target = catalog.create_table(
+            output_name,
+            path=(tmp_path / output_name).as_uri(),
+            schema=output_schema,
+            partition_by=("episode_id",),
+        )
+        align_daft(
+            primary.scan(),
+            secondary.scan(),
+            columns=("grip",),
+            tolerance=0.6,
+            into=target,
+        )
+        written = target.scan().to_arrow_table()
+        assert written.num_rows == 6
+        assert sorted(written.column("grip_r").to_pylist()) == sorted(
+            expected.column("grip_r").to_pylist()
+        )
+    finally:
+        catalog.drop_table(output_name, if_exists=True)
+        catalog.drop_table(sparse_name, if_exists=True)
+        catalog.drop_table(primary_name, if_exists=True)
+        catalog.drop_table(secondary_name, if_exists=True)

@@ -1,0 +1,110 @@
+# SPDX-FileCopyrightText: 2023 LakeSoul Contributors
+#
+# SPDX-License-Identifier: Apache-2.0
+
+[project]
+name = "lakesoul"
+version = "2.1.0.dev0"
+authors = [
+  { name = "LakeSoul Team", email = "lakesoul-technical-discuss@lists.lfaidata.foundation" },
+]
+description = "Python APIs for using LakeSoul"
+readme = "README.md"
+license = { text = "Apache-2.0" }
+requires-python = ">=3.10"
+keywords = ["lakesoul", "bigdata", "ai"]
+classifiers = [
+  "Development Status :: 5 - Production/Stable",
+  "Intended Audience :: Developers",
+  "License :: OSI Approved :: Apache Software License",
+  "Operating System :: OS Independent",
+  "Topic :: Software Development :: Libraries :: Python Modules",
+  "Programming Language :: Python :: 3",
+]
+dependencies = [
+  "pyarrow>=16,<21",
+  "numpy",
+  "protobuf>=5.0",
+  "typing-extensions>=4.8",
+  "colorlog>=6",
+]
+
+[tool.uv.workspace]
+exclude = ["script/lakesoul-e2e"]
+
+[project.optional-dependencies]
+torch = ["torch>=1.11.0,<2.5"]
+pandas = ["pandas>=1.4"]
+datasets = ["datasets>=2.20"]
+ray = ["ray>=2.55,<2.56"]
+daft = ["daft>=0.7.15"]
+pyspark = ["pyspark==3.5.8"]
+duckdb = ["duckdb>=1.4.0"]
+embodied = ["av>=12", "pillow>=10", "mcap>=1.0"]
+all = [
+  "torch>=1.11,<2.5",
+  "pandas>=1.4",
+  "datasets>=2.20",
+  "ray>=2.55,<2.56",
+  "daft>=0.7.15",
+  "pyspark==3.5.8",
+  "duckdb>=1.4.0",
+  "av>=12",
+  "pillow>=10",
+  "mcap>=1.0",
+]
+
+[tool.uv.sources]
+torch = [{ index = "pytorch-cpu" }]
+torchvision = [{ index = "pytorch-cpu" }]
+
+[[tool.uv.index]]
+name = "pytorch-cpu"
+url = "https://download.pytorch.org/whl/cpu"
+explicit = true
+
+[dependency-groups]
+all = [
+  "torch>=1.11,<2.5",
+  "pandas>=1.4",
+  "datasets>=2.14",
+  "ray>=2.55,<2.56",
+  "daft>=0.7.15",
+  "pyspark==3.5.8",
+  "grpcio-tools == 1.70",
+  "duckdb",
+  "av>=12",
+  "pillow>=10",
+  "mcap>=1.0",
+]
+dev = ["pytest>=8", "maturin>=1,<2", { include-group = "all" }]
+
+[project.urls]
+"Homepage" = "https://github.com/lakesoul-io/LakeSoul"
+"Bug Tracker" = "https://github.com/lakesoul-io/LakeSoul/issues"
+
+[build-system]
+requires = ["maturin>=1,<2", "grpcio-tools == 1.70"]
+build-backend = "maturin"
+
+[tool.maturin]
+python-source = "src"
+module-name = "lakesoul._lib"
+features = ["pyo3/extension-module"]
+
+[tool.pytest.ini_options]
+addopts = ["--import-mode=importlib"]
+markers = ["slow: marks tests as slow (deselect with '-m \"not slow\"')"]
+
+[tool.ruff]
+line-length = 88
+exclude = [
+  "src/lakesoul/metadata/generated/*.py",
+  "src/lakesoul/metadata/generated/*.pyi",
+]
+
+[tool.basedpyright]
+typeCheckingMode = "standard"
+
+[tool.ty.src]
+exclude = ["src/lakesoul/metadata/generated"]

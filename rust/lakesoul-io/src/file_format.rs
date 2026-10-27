@@ -1,0 +1,1569 @@
+// SPDX-FileCopyrightText: 2023 LakeSoul Contributors
+//
+// SPDX-License-Identifier: Apache-2.0
+
+//! Module for the [datafusion::datasource::file_format] implementation of LakeSoul.
+
+use std::collections::HashMap;
+use std::fmt::{Display, Formatter};
+use std::str::FromStr;
+use std::sync::{Arc, OnceLock};
+
+use ::vortex::layout::scan::memory::{ScanMemoryBudget, ScanMemorySessionExt};
+use ::vortex::{VortexSessionDefault, session::VortexSession};
+use arrow::datatypes::SchemaRef;
+use arrow_cast::can_cast_types;
+use arrow_schema::{ArrowError, FieldRef, Fields, Schema, SchemaBuilder};
+use async_trait::async_trait;
+use datafusion::catalog::Session;
+use datafusion::catalog::memory::DataSourceExec;
+use datafusion::datasource::file_format::file_compression_type::FileCompressionType;
+use datafusion::datasource::file_format::{FileFormat, parquet::ParquetFormat};
+use datafusion::datasource::physical_plan::parquet::metadata::DFParquetMetadata;
+use datafusion::datasource::physical_plan::{
+    FileGroup, FileScanConfig, FileScanConfigBuilder, FileSinkConfig, FileSource,
+    ParquetSource,
+};
+use datafusion::datasource::table_schema::TableSchema;
+use datafusion::physical_expr::utils::{collect_columns, reassign_expr_columns};
+use datafusion::physical_expr::{
+    LexRequirement, PhysicalExpr, conjunction_opt, expressions::Column,
+    projection::ProjectionExprs, split_conjunction,
+};
+use datafusion::physical_plan::ExecutionPlan;
+use datafusion::physical_plan::projection::ProjectionExec;
+use datafusion_common::{
+    Constraints, DataFusionError, Statistics, error::Result as DFResult, project_schema,
+};
+use futures::{StreamExt, TryStreamExt};
+use object_store::{ObjectMeta, ObjectStore};
+use parquet::arrow::parquet_to_arrow_schema;
+use rootcause::compat::boxed_error::IntoBoxedError;
+use rootcause::{Report, bail, report};
+use vortex_datafusion::{VortexFormat, VortexTableOptions};
+
+use crate::Result;
+use crate::config::LakeSoulIOConfig;
+use crate::physical_plan::merge::MergeParquetExec;
+
+pub(crate) mod vortex;
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub enum PhysicalFormat {
+    Parquet,
+    Vortex,
+    /// A variant of `Vortex` (use zstd/pcodec)
+    #[default]
+    VortexCompact,
+}
+
+impl PhysicalFormat {
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Parquet => "parquet",
+            Self::Vortex => "vortex",
+            Self::VortexCompact => "vortex-compact",
+        }
+    }
+
+    pub fn extension(self) -> &'static str {
+        match self {
+            Self::Parquet => "parquet",
+            Self::Vortex | Self::VortexCompact => "vortex",
+        }
+    }
+
+    pub fn from_extension(path: &str) -> Result<Self> {
+        let path_without_query = path.split_once('?').map_or(path, |(path, _)| path);
+        let extension = path_without_query
+            .rsplit('/')
+            .next()
+            .and_then(|file_name| file_name.rsplit_once('.').map(|(_, ext)| ext))
+            .ok_or(report!("No physical format found").attach(path.to_string()))?;
+        Self::from_str(extension)
+    }
+}
+
+impl Display for PhysicalFormat {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.name())
+    }
+}
+
+impl FromStr for PhysicalFormat {
+    type Err = Report;
+
+    fn from_str(s: &str) -> Result<Self> {
+        match s.to_ascii_lowercase().as_str() {
+            "parquet" => Ok(Self::Parquet),
+            "vortex" => Ok(Self::Vortex),
+            "vortex-compact" => Ok(Self::VortexCompact),
+            other => bail!("Unsupported physical format: {other}"),
+        }
+    }
+}
+
+/// The process-wide budget for decoded Vortex data in flight. Set at most once,
+/// at startup, from the process configuration.
+static VORTEX_DECODE_BUDGET: OnceLock<Arc<ScanMemoryBudget>> = OnceLock::new();
+
+/// Bounds the decoded Vortex data in flight across every scan of the process
+/// to `bytes`.
+///
+/// Each scan then starts decoding a split only once the split's estimated size
+/// fits, and a decoded batch counts against the budget until it and every
+/// slice of it are dropped, so a consumer that stops pulling stops decoding
+/// and the segment reads behind it. Call before building any
+/// [`LakeSoulFormatRegistry`] or distributed codec: sessions built earlier are
+/// unbudgeted. A second call must ask for the same size.
+pub fn install_vortex_decode_budget(bytes: usize) -> Result<()> {
+    let budget = VORTEX_DECODE_BUDGET.get_or_init(|| ScanMemoryBudget::new(bytes));
+    if budget.limit() != bytes {
+        bail!(
+            "vortex decode budget already installed as {} bytes, cannot change it to {bytes}",
+            budget.limit()
+        );
+    }
+    Ok(())
+}
+
+/// The [`VortexSession`] every LakeSoul vortex scan runs with.
+///
+/// [`LakeSoulFormatRegistry`] builds its vortex sources with this session, and
+/// the distributed codec rebuilds a worker-side scan with the same call
+/// (`lakesoul_datafusion::distributed::codec::user_codecs`), so the coordinator
+/// and the workers decode files with identical codecs, expressions and
+/// coercions. Carries the [`install_vortex_decode_budget`] budget, if any.
+pub fn vortex_scan_session() -> VortexSession {
+    let session = VortexSession::default();
+    match VORTEX_DECODE_BUDGET.get() {
+        Some(budget) => session.with_scan_memory_budget(Arc::clone(budget)),
+        None => session,
+    }
+}
+
+#[derive(Debug)]
+pub struct LakeSoulFormatRegistry {
+    parquet: Arc<LakeSoulParquetFormat>,
+    vortex: Arc<LakeSoulVortexFormat>,
+}
+
+impl LakeSoulFormatRegistry {
+    pub fn new(
+        io_config: LakeSoulIOConfig,
+        parquet_force_view_types: bool,
+    ) -> Result<Self> {
+        let parquet = Arc::new(LakeSoulParquetFormat::new(
+            Arc::new(
+                ParquetFormat::new().with_force_view_types(parquet_force_view_types),
+            ),
+            io_config.clone(),
+        ));
+        let opts = {
+            let mut opts = VortexTableOptions::default();
+            opts.projection_pushdown = true;
+            opts.predicate_pushdown = true;
+            opts
+        };
+
+        let vortex = Arc::new(LakeSoulVortexFormat::new(
+            Arc::new(VortexFormat::new_with_options(vortex_scan_session(), opts)),
+            io_config,
+        ));
+
+        Ok(Self { parquet, vortex })
+    }
+
+    pub fn physical_format_for_path(&self, path: &str) -> Result<PhysicalFormat> {
+        PhysicalFormat::from_extension(path)
+    }
+
+    pub fn file_format(&self, physical_format: PhysicalFormat) -> Arc<dyn FileFormat> {
+        match physical_format {
+            PhysicalFormat::Parquet => self.parquet.clone(),
+            PhysicalFormat::Vortex | PhysicalFormat::VortexCompact => self.vortex.clone(),
+        }
+    }
+
+    pub fn file_compression_type(
+        &self,
+        physical_format: PhysicalFormat,
+    ) -> FileCompressionType {
+        match physical_format {
+            PhysicalFormat::Parquet => FileCompressionType::ZSTD,
+            PhysicalFormat::Vortex => FileCompressionType::UNCOMPRESSED,
+            PhysicalFormat::VortexCompact => FileCompressionType::ZSTD,
+        }
+    }
+}
+
+/// LakeSoul `FileFormat` implementation for supporting Apache Parquet
+///
+/// Note it is recommended these are instead configured on the [`ConfigOptions`]
+/// associated with the [`SessionState`] instead of overridden on a format-basis
+///
+/// TODO: Deprecate and remove overrides
+/// <https://github.com/apache/arrow-datafusion/issues/4349>
+#[derive(Debug, Default)]
+pub struct LakeSoulParquetFormat {
+    parquet_format: Arc<ParquetFormat>,
+    io_config: LakeSoulIOConfig, // TODO try Arc
+}
+
+impl LakeSoulParquetFormat {
+    pub fn new(parquet_format: Arc<ParquetFormat>, conf: LakeSoulIOConfig) -> Self {
+        Self {
+            parquet_format,
+            io_config: conf,
+        }
+    }
+
+    pub fn primary_keys(&self) -> Arc<Vec<String>> {
+        Arc::new(self.io_config.primary_keys.clone())
+    }
+
+    pub fn default_column_value(&self) -> Arc<HashMap<String, String>> {
+        Arc::new(self.io_config.default_column_value.clone())
+    }
+
+    pub fn merge_operators(&self) -> Arc<HashMap<String, String>> {
+        Arc::new(self.io_config.merge_operators.clone())
+    }
+}
+
+#[async_trait]
+impl FileFormat for LakeSoulParquetFormat {
+    fn get_ext(&self) -> String {
+        self.parquet_format.get_ext()
+    }
+
+    fn get_ext_with_compression(
+        &self,
+        file_compression_type: &FileCompressionType,
+    ) -> DFResult<String> {
+        self.parquet_format
+            .get_ext_with_compression(file_compression_type)
+    }
+
+    fn compression_type(&self) -> Option<FileCompressionType> {
+        self.parquet_format.compression_type()
+    }
+
+    async fn infer_schema(
+        &self,
+        state: &dyn Session,
+        store: &Arc<dyn ObjectStore>,
+        objects: &[ObjectMeta],
+    ) -> DFResult<SchemaRef> {
+        let schemas: Vec<_> = futures::stream::iter(objects)
+            .map(|object| {
+                fetch_schema(
+                    store.as_ref(),
+                    object,
+                    self.parquet_format.metadata_size_hint(),
+                )
+            })
+            .boxed() // Workaround https://github.com/rust-lang/rust/issues/64552
+            .buffered(
+                state
+                    .config_options()
+                    .execution
+                    .meta_fetch_concurrency
+                    .into(),
+            )
+            .try_collect()
+            .await?;
+
+        merge_schemas_with_cast(schemas)
+    }
+
+    async fn infer_stats(
+        &self,
+        state: &dyn Session,
+        store: &Arc<dyn ObjectStore>,
+        table_schema: SchemaRef,
+        object: &ObjectMeta,
+    ) -> DFResult<Statistics> {
+        self.parquet_format
+            .infer_stats(state, store, table_schema, object)
+            .await
+    }
+
+    async fn create_physical_plan(
+        &self,
+        state: &dyn Session,
+        mut conf: FileScanConfig,
+    ) -> DFResult<Arc<dyn ExecutionPlan>> {
+        let table_schema = Arc::clone(conf.file_source.table_schema().table_schema());
+
+        // adapted file source with metadata size hint
+        let mut parquet_source = conf
+            .file_source
+            .downcast_ref::<ParquetSource>()
+            .ok_or(DataFusionError::Internal("file source".into()))?
+            .clone();
+        if let Some(metadata_size_hint) = self.parquet_format.metadata_size_hint() {
+            parquet_source = parquet_source.with_metadata_size_hint(metadata_size_hint);
+        }
+
+        conf.file_source = Arc::new(parquet_source);
+
+        // projection for Table Schema instead of File Schema
+        let projection = conf.file_column_projection_indices();
+        let target_schema = project_schema(&table_schema, projection.as_ref())?;
+
+        // merge cdc and pks
+        let merged_projection = compute_project_column_indices(
+            table_schema.clone(),
+            target_schema.clone(),
+            self.io_config.primary_keys_slice(),
+            &self.io_config.cdc_column(),
+        );
+        let merged_schema = project_schema(&table_schema, merged_projection.as_ref())?;
+
+        // files to read
+        let flatten_conf = flatten_file_scan_config(
+            state,
+            self.parquet_format.clone(),
+            conf,
+            self.io_config.primary_keys_slice(),
+            &self.io_config.cdc_column(),
+            self.io_config.partition_schema(),
+            target_schema.clone(),
+        )
+        .await?;
+
+        // merge on read files
+        let merge_exec = Arc::new(
+            MergeParquetExec::new(
+                merged_schema.clone(),
+                flatten_conf,
+                self.io_config.clone(),
+            )
+            .map_err(|e| {
+                error!("{e}");
+                e.into_boxed_error()
+            })?,
+        );
+
+        if target_schema.fields().len() < merged_schema.fields().len() {
+            let mut projection_expr = vec![];
+            for field in target_schema.fields() {
+                projection_expr.push((
+                    datafusion::physical_expr::expressions::col(
+                        field.name(),
+                        &merged_schema,
+                    )?,
+                    field.name().clone(),
+                ));
+            }
+            Ok(Arc::new(ProjectionExec::try_new(
+                projection_expr,
+                merge_exec,
+            )?))
+        } else {
+            Ok(merge_exec)
+        }
+    }
+
+    async fn create_writer_physical_plan(
+        &self,
+        input: Arc<dyn ExecutionPlan>,
+        state: &dyn Session,
+        conf: FileSinkConfig,
+        order_requirements: Option<LexRequirement>,
+    ) -> DFResult<Arc<dyn ExecutionPlan>> {
+        self.parquet_format
+            .create_writer_physical_plan(input, state, conf, order_requirements)
+            .await
+    }
+
+    fn file_source(&self, table_schema: TableSchema) -> Arc<dyn FileSource> {
+        self.parquet_format.file_source(table_schema)
+    }
+}
+
+/// LakeSoul `FileFormat` implementation for Vortex.
+///
+/// The upstream Vortex `infer_schema` uses Arrow's strict `Schema::try_merge`.
+/// LakeSoul's Parquet path has historically allowed schemas whose fields can be
+/// cast to each other (for example `Int32` and `Int64`). Keep the Vortex path
+/// aligned with that behavior by inferring every file schema independently and
+/// merging with `CanCastSchemaBuilder`.
+#[derive(Debug, Clone)]
+pub struct LakeSoulVortexFormat {
+    vortex_format: Arc<VortexFormat>,
+    io_config: LakeSoulIOConfig,
+}
+
+impl LakeSoulVortexFormat {
+    pub fn new(vortex_format: Arc<VortexFormat>, io_config: LakeSoulIOConfig) -> Self {
+        Self {
+            vortex_format,
+            io_config,
+        }
+    }
+}
+
+#[async_trait]
+impl FileFormat for LakeSoulVortexFormat {
+    fn get_ext(&self) -> String {
+        self.vortex_format.get_ext()
+    }
+
+    fn get_ext_with_compression(
+        &self,
+        file_compression_type: &FileCompressionType,
+    ) -> DFResult<String> {
+        self.vortex_format
+            .get_ext_with_compression(file_compression_type)
+    }
+
+    fn compression_type(&self) -> Option<FileCompressionType> {
+        self.vortex_format.compression_type()
+    }
+
+    async fn infer_schema(
+        &self,
+        state: &dyn Session,
+        store: &Arc<dyn ObjectStore>,
+        objects: &[ObjectMeta],
+    ) -> DFResult<SchemaRef> {
+        let schemas: Vec<_> = futures::stream::iter(objects)
+            .map(|object| {
+                let vortex_format = self.vortex_format.clone();
+                let store = store.clone();
+                let object = object.clone();
+                async move {
+                    vortex_format
+                        .infer_schema(state, &store, std::slice::from_ref(&object))
+                        .await
+                }
+            })
+            .boxed()
+            .buffered(
+                state
+                    .config_options()
+                    .execution
+                    .meta_fetch_concurrency
+                    .into(),
+            )
+            .try_collect()
+            .await?;
+
+        merge_schemas_with_cast(schemas.into_iter().map(|schema| schema.as_ref().clone()))
+    }
+
+    async fn infer_stats(
+        &self,
+        state: &dyn Session,
+        store: &Arc<dyn ObjectStore>,
+        table_schema: SchemaRef,
+        object: &ObjectMeta,
+    ) -> DFResult<Statistics> {
+        self.vortex_format
+            .infer_stats(state, store, table_schema, object)
+            .await
+    }
+
+    async fn create_physical_plan(
+        &self,
+        state: &dyn Session,
+        conf: FileScanConfig,
+    ) -> DFResult<Arc<dyn ExecutionPlan>> {
+        let table_schema = Arc::clone(conf.file_source.table_schema().table_schema());
+        let projection = conf.file_column_projection_indices();
+        let target_schema = project_schema(&table_schema, projection.as_ref())?;
+
+        let merged_projection = compute_project_column_indices(
+            table_schema.clone(),
+            target_schema.clone(),
+            self.io_config.primary_keys_slice(),
+            &self.io_config.cdc_column(),
+        );
+        let merged_schema = project_schema(&table_schema, merged_projection.as_ref())?;
+
+        let format: Arc<dyn FileFormat> = Arc::new(self.clone());
+        let flatten_conf = flatten_file_scan_config_for_format(
+            state,
+            format,
+            conf,
+            self.io_config.primary_keys_slice(),
+            &self.io_config.cdc_column(),
+            self.io_config.partition_schema(),
+            target_schema.clone(),
+        )
+        .await
+        .map_err(|e| DataFusionError::External(e.into_boxed_error()))?;
+
+        let merge_exec = Arc::new(
+            MergeParquetExec::new(
+                merged_schema.clone(),
+                flatten_conf,
+                self.io_config.clone(),
+            )
+            .map_err(|e| {
+                error!("{e}");
+                e.into_boxed_error()
+            })?,
+        );
+
+        if target_schema.fields().len() < merged_schema.fields().len() {
+            let mut projection_expr = vec![];
+            for field in target_schema.fields() {
+                projection_expr.push((
+                    datafusion::physical_expr::expressions::col(
+                        field.name(),
+                        &merged_schema,
+                    )?,
+                    field.name().clone(),
+                ));
+            }
+            Ok(Arc::new(ProjectionExec::try_new(
+                projection_expr,
+                merge_exec,
+            )?))
+        } else {
+            Ok(merge_exec)
+        }
+    }
+
+    async fn create_writer_physical_plan(
+        &self,
+        input: Arc<dyn ExecutionPlan>,
+        state: &dyn Session,
+        conf: FileSinkConfig,
+        order_requirements: Option<LexRequirement>,
+    ) -> DFResult<Arc<dyn ExecutionPlan>> {
+        self.vortex_format
+            .create_writer_physical_plan(input, state, conf, order_requirements)
+            .await
+    }
+
+    fn file_source(&self, table_schema: TableSchema) -> Arc<dyn FileSource> {
+        self.vortex_format.file_source(table_schema)
+    }
+}
+
+async fn fetch_schema(
+    store: &dyn ObjectStore,
+    obj_meta: &ObjectMeta,
+    metadata_size_hint: Option<usize>,
+) -> DFResult<Schema> {
+    // TODO add cryption
+    let metadata = DFParquetMetadata::new(store, obj_meta)
+        .with_metadata_size_hint(metadata_size_hint)
+        .fetch_metadata()
+        .await?;
+
+    let file_metadata = metadata.file_metadata();
+    let schema = parquet_to_arrow_schema(
+        file_metadata.schema_descr(),
+        file_metadata.key_value_metadata(),
+    )?;
+    Ok(schema)
+}
+
+fn clear_metadata(
+    schemas: impl IntoIterator<Item = Schema>,
+) -> impl Iterator<Item = Schema> {
+    schemas.into_iter().map(|schema| {
+        let fields = schema
+            .fields()
+            .iter()
+            .map(|field| {
+                field.as_ref().clone().with_metadata(Default::default()) // clear meta
+            })
+            .collect::<Fields>();
+        Schema::new(fields)
+    })
+}
+
+/// Merge file schemas using LakeSoul's schema evolution semantics.
+///
+/// Arrow's default `Schema::try_merge` requires the same field to have exactly
+/// the same data type in every file. LakeSoul's Parquet path has historically
+/// been more permissive and accepts fields whose types are castable by Arrow
+/// (for example `Int32` and `Int64`). Reuse the same merge rule for all native
+/// formats so Vortex and Parquet behave consistently during schema inference.
+///
+/// Field-level metadata is cleared before merging to avoid metadata-only
+/// differences between files from causing schema conflicts. Schema metadata is
+/// merged conservatively: the same key must have the same value in every file.
+fn merge_schemas_with_cast(
+    schemas: impl IntoIterator<Item = Schema>,
+) -> DFResult<SchemaRef> {
+    let mut out_meta = HashMap::new();
+    let mut out_fields = CanCastSchemaBuilder::new();
+    for schema in clear_metadata(schemas) {
+        let Schema { metadata, fields } = schema;
+
+        // merge metadata
+        for (key, value) in metadata.into_iter() {
+            if let Some(old_val) = out_meta.get(&key)
+                && old_val != &value
+            {
+                return Err(DataFusionError::ArrowError(
+                    Box::new(ArrowError::SchemaError(format!(
+                        "Fail to merge schema due to conflicting metadata. \
+                                     Key '{key}' has different values '{old_val}' and '{value}'"
+                    ))),
+                    None,
+                ));
+            }
+            out_meta.insert(key, value);
+        }
+
+        // merge fields
+        fields.iter().try_for_each(|x| out_fields.try_merge(x))?
+    }
+    Ok(Arc::new(out_fields.finish().with_metadata(out_meta)))
+}
+
+#[derive(Debug, Default)]
+pub struct CanCastSchemaBuilder {
+    fields: Vec<FieldRef>,
+}
+
+impl CanCastSchemaBuilder {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn with_capacity(capacity: usize) -> Self {
+        Self {
+            fields: Vec::with_capacity(capacity),
+        }
+    }
+
+    pub fn push(&mut self, field: impl Into<FieldRef>) {
+        self.fields.push(field.into())
+    }
+
+    fn merge(e: &mut FieldRef, field: &FieldRef) -> Result<(), ArrowError> {
+        if can_cast_types(e.data_type(), field.data_type()) {
+            *e = field.clone();
+            Ok(())
+        } else {
+            Err(ArrowError::SchemaError(format!(
+                "Fail to merge schema field '{}' because the from data_type = {} does not equal {}",
+                field.name(),
+                e.data_type(),
+                field.data_type()
+            )))
+        }
+    }
+
+    pub fn try_merge(&mut self, field: &FieldRef) -> Result<(), ArrowError> {
+        // This could potentially be sped up with a HashMap or similar
+        let existing = self.fields.iter_mut().find(|f| f.name() == field.name());
+        match existing {
+            Some(e) => {
+                Self::merge(e, field)?;
+            }
+            None => self.fields.push(field.clone()),
+        }
+        Ok(())
+    }
+
+    pub fn finish(self) -> Schema {
+        Schema::new(self.fields)
+    }
+}
+
+pub async fn flatten_file_scan_config(
+    state: &dyn Session,
+    format: Arc<ParquetFormat>,
+    conf: FileScanConfig,
+    primary_keys: &[String],
+    cdc_column: &str,
+    partition_schema: SchemaRef, // use less
+    target_schema: SchemaRef,
+) -> DFResult<Vec<FileScanConfig>> {
+    debug!("partition schema: {}", partition_schema);
+    // TODO remove clone
+    let store = state.runtime_env().object_store(&conf.object_store_url)?;
+    let file_groups = conf.file_groups.clone();
+    let flatten_configs = futures::stream::iter(file_groups)
+        .map(|files| {
+            let store = store.clone();
+            let format = format.clone();
+            let partition_schema = partition_schema.clone();
+            let target_schema = target_schema.clone();
+            let conf = conf.clone();
+            async move {
+                let configs: Vec<FileScanConfig> = futures::stream::iter(files.files())
+                    .map(|file| {
+                        let store = store.clone();
+                        let format = format.clone();
+                        let partition_schema = partition_schema.clone();
+                        let target_schema = target_schema.clone();
+                        let conf = conf.clone();
+                        async move {
+                            let objects = std::slice::from_ref(&file.object_meta);
+                            let files = vec![file.clone()];
+                            // TODO use schema adapter rewriter?
+                            let file_schema =
+                                format.infer_schema(state, &store, objects).await?;
+                            let file_schema = {
+                                let mut builder = SchemaBuilder::new();
+                                // O(nm), n = number of fields, m = number of partition columns
+                                for field in file_schema.fields() {
+                                    // in file not in partition
+                                    if partition_schema
+                                        .field_with_name(field.name())
+                                        .is_err()
+                                    {
+                                        builder.push(field.clone());
+                                    }
+                                }
+                                SchemaRef::new(builder.finish())
+                            };
+                            debug!("file schema:{}", file_schema);
+                            let cols = conf.table_partition_cols().clone();
+                            debug!("partition cols: {:?}", cols);
+                            debug!("flatten: file_schema: {}", file_schema);
+                            // only file schema
+                            let table_schema =
+                                TableSchema::new(file_schema.clone(), cols.to_vec());
+                            let file_statistics = format
+                                .infer_stats(
+                                    state,
+                                    &store,
+                                    file_schema.clone(),
+                                    &file.object_meta,
+                                )
+                                .await?;
+                            let statistics =
+                                table_statistics(file_statistics, &table_schema);
+                            let physical_target_schema = strip_partition_columns(
+                                target_schema.clone(),
+                                partition_schema.clone(),
+                            );
+                            let projection_indices = compute_project_column_indices(
+                                table_schema.file_schema().clone(),
+                                physical_target_schema,
+                                primary_keys,
+                                cdc_column,
+                            );
+                            let mut parquet_source = format
+                                .file_source(table_schema)
+                                .downcast_ref::<ParquetSource>()
+                                .ok_or(DataFusionError::Internal("file source".into()))?
+                                .clone();
+                            if let Some(predicate) = conf.file_source.filter() {
+                                let rebound = rebind_predicate(
+                                    &predicate,
+                                    conf.file_source.table_schema().table_schema(),
+                                    parquet_source.table_schema().table_schema(),
+                                )?;
+                                if let Some(predicate) = conjunction_opt(rebound) {
+                                    parquet_source =
+                                        parquet_source.with_predicate(predicate);
+                                }
+                            }
+                            if let Some(metadata_size_hint) = format.metadata_size_hint()
+                            {
+                                parquet_source = parquet_source
+                                    .with_metadata_size_hint(metadata_size_hint);
+                            }
+                            if let Some(reader_factory) = conf
+                                .file_source
+                                .downcast_ref::<ParquetSource>()
+                                .and_then(|source| {
+                                    source.parquet_file_reader_factory().cloned()
+                                })
+                            {
+                                parquet_source = parquet_source
+                                    .with_parquet_file_reader_factory(reader_factory);
+                            }
+                            let config = FileScanConfigBuilder::from(conf)
+                                .with_source(Arc::new(parquet_source))
+                                .with_file_groups(vec![
+                                    FileGroup::new(files)
+                                        .with_statistics(Arc::new(statistics.clone())),
+                                ])
+                                .with_statistics(statistics)
+                                .with_projection_indices(projection_indices)?
+                                .build();
+
+                            Ok::<FileScanConfig, DataFusionError>(config)
+                        }
+                    })
+                    .boxed()
+                    .buffered(4)
+                    .try_collect::<Vec<_>>()
+                    .await?;
+                Ok::<Vec<FileScanConfig>, DataFusionError>(configs)
+            }
+        })
+        .boxed()
+        .buffered(4)
+        .try_collect::<Vec<_>>()
+        .await?;
+    Ok(flatten_configs.into_iter().flatten().collect())
+}
+
+pub async fn flatten_file_scan_config_for_format(
+    state: &dyn Session,
+    format: Arc<dyn FileFormat>,
+    conf: FileScanConfig,
+    primary_keys: &[String],
+    cdc_column: &str,
+    partition_schema: SchemaRef,
+    target_schema: SchemaRef,
+) -> Result<Vec<FileScanConfig>> {
+    debug!("partition schema: {}", partition_schema);
+    let store = state.runtime_env().object_store(&conf.object_store_url)?;
+    let file_groups = conf.file_groups.clone();
+    let flatten_configs = futures::stream::iter(file_groups)
+        .map(|files| {
+            let store = store.clone();
+            let format = format.clone();
+            let partition_schema = partition_schema.clone();
+            let target_schema = target_schema.clone();
+            let conf = conf.clone();
+            async move {
+                let configs: Vec<FileScanConfig> = futures::stream::iter(files.files())
+                    .map(|file| {
+                        let store = store.clone();
+                        let format = format.clone();
+                        let partition_schema = partition_schema.clone();
+                        let target_schema = target_schema.clone();
+                        let conf = conf.clone();
+                        async move {
+                            let objects = std::slice::from_ref(&file.object_meta);
+                            let files = vec![file.clone()];
+                            let file_schema =
+                                format.infer_schema(state, &store, objects).await?;
+                            let file_schema = strip_partition_columns(
+                                file_schema,
+                                partition_schema.clone(),
+                            );
+                            debug!("file schema:{}", file_schema);
+                            let cols = conf.table_partition_cols().clone();
+                            debug!("partition cols: {:?}", cols);
+                            debug!("flatten: file_schema: {}", file_schema);
+                            let table_schema =
+                                TableSchema::new(file_schema, cols.to_vec());
+                            let file_statistics = format
+                                .infer_stats(
+                                    state,
+                                    &store,
+                                    table_schema.file_schema().clone(),
+                                    &file.object_meta,
+                                )
+                                .await?;
+                            let statistics =
+                                table_statistics(file_statistics, &table_schema);
+                            let physical_target_schema = strip_partition_columns(
+                                target_schema.clone(),
+                                partition_schema.clone(),
+                            );
+                            let projection_indices = compute_project_column_indices(
+                                table_schema.file_schema().clone(),
+                                physical_target_schema,
+                                primary_keys,
+                                cdc_column,
+                            );
+                            let mut source = format.file_source(table_schema);
+                            source = adapt_file_source_for_single_file(
+                                source,
+                                format.as_ref(),
+                                &conf,
+                            )?;
+                            if let Some(predicate) = conf.file_source.filter() {
+                                source = push_predicate_into(
+                                    source,
+                                    &predicate,
+                                    conf.file_source.table_schema().table_schema(),
+                                    state,
+                                )?;
+                            }
+                            let config = FileScanConfigBuilder::from(conf)
+                                .with_source(source)
+                                .with_file_groups(vec![
+                                    FileGroup::new(files)
+                                        .with_statistics(Arc::new(statistics.clone())),
+                                ])
+                                .with_statistics(statistics)
+                                .with_projection_indices(projection_indices)?
+                                .build();
+
+                            Ok::<FileScanConfig, DataFusionError>(config)
+                        }
+                    })
+                    .boxed()
+                    .buffered(4)
+                    .try_collect::<Vec<_>>()
+                    .await?;
+                Ok::<Vec<FileScanConfig>, DataFusionError>(configs)
+            }
+        })
+        .boxed()
+        .buffered(4)
+        .try_collect::<Vec<_>>()
+        .await?;
+    Ok(flatten_configs.into_iter().flatten().collect())
+}
+
+pub fn merge_schema_refs(
+    schemas: impl IntoIterator<Item = SchemaRef>,
+) -> Result<SchemaRef> {
+    let mut out_fields = CanCastSchemaBuilder::new();
+    for schema in schemas {
+        for field in schema.fields() {
+            out_fields.try_merge(field)?;
+        }
+    }
+    Ok(Arc::new(out_fields.finish()))
+}
+
+fn strip_partition_columns(
+    file_schema: SchemaRef,
+    partition_schema: SchemaRef,
+) -> SchemaRef {
+    let mut builder = SchemaBuilder::new();
+    for field in file_schema.fields() {
+        if partition_schema.field_with_name(field.name()).is_err() {
+            builder.push(field.clone());
+        }
+    }
+    SchemaRef::new(builder.finish())
+}
+
+fn table_statistics(
+    file_statistics: Statistics,
+    table_schema: &TableSchema,
+) -> Statistics {
+    let mut statistics = Statistics::new_unknown(table_schema.table_schema());
+    statistics.num_rows = file_statistics.num_rows;
+    statistics.total_byte_size = file_statistics.total_byte_size;
+    for (idx, column_statistics) in
+        file_statistics.column_statistics.into_iter().enumerate()
+    {
+        if idx < statistics.column_statistics.len() {
+            statistics.column_statistics[idx] = column_statistics;
+        }
+    }
+    statistics
+}
+
+fn adapt_file_source_for_single_file(
+    source: Arc<dyn FileSource>,
+    format: &dyn FileFormat,
+    conf: &FileScanConfig,
+) -> DFResult<Arc<dyn FileSource>> {
+    let Some(format) = format.downcast_ref::<LakeSoulParquetFormat>() else {
+        return Ok(source);
+    };
+
+    let mut parquet_source = source
+        .downcast_ref::<ParquetSource>()
+        .ok_or(DataFusionError::Internal("file source".into()))?
+        .clone();
+
+    if let Some(metadata_size_hint) = format.parquet_format.metadata_size_hint() {
+        parquet_source = parquet_source.with_metadata_size_hint(metadata_size_hint);
+    }
+
+    if let Some(reader_factory) = conf
+        .file_source
+        .downcast_ref::<ParquetSource>()
+        .and_then(|source| source.parquet_file_reader_factory().cloned())
+    {
+        parquet_source = parquet_source.with_parquet_file_reader_factory(reader_factory);
+    }
+
+    Ok(Arc::new(parquet_source))
+}
+
+/// Rebinds the conjuncts of `predicate`, bound to schema `from`, to schema
+/// `to` by column name.
+///
+/// A physical column is bound by index. The per-file sources and the
+/// append-only scan leaf declare other schemas than the scan they are built
+/// from — a file's own columns, or only the columns the scan reads — so an
+/// index into the outer schema names another column of theirs, or none. A
+/// local vortex reader converts columns by name and hides that, but a worker
+/// decodes the leaf's predicate against the leaf's own schema and fails, or
+/// binds the wrong column.
+///
+/// A conjunct is left out when `to` lacks one of its columns or declares it
+/// with another type (a file written before the column was added or
+/// widened): the source cannot evaluate it as built. Leaving it out only
+/// weakens a best-effort filter, since LakeSoul hands scan predicates to
+/// DataFusion as `Inexact` and the `FilterExec` above the scan re-evaluates
+/// every conjunct.
+fn rebind_predicate(
+    predicate: &Arc<dyn PhysicalExpr>,
+    from: &Schema,
+    to: &Schema,
+) -> DFResult<Vec<Arc<dyn PhysicalExpr>>> {
+    split_conjunction(predicate)
+        .into_iter()
+        .filter(|conjunct| {
+            collect_columns(conjunct).iter().all(|column| {
+                match (
+                    from.field_with_name(column.name()),
+                    to.field_with_name(column.name()),
+                ) {
+                    (Ok(from), Ok(to)) => from.data_type() == to.data_type(),
+                    _ => false,
+                }
+            })
+        })
+        .map(|conjunct| reassign_expr_columns(Arc::clone(conjunct), to))
+        .collect()
+}
+
+/// Offers `predicate`, bound to schema `from`, to `source` conjunct by
+/// conjunct, rebound to the source's own table schema (see
+/// [`rebind_predicate`]).
+fn push_predicate_into(
+    source: Arc<dyn FileSource>,
+    predicate: &Arc<dyn PhysicalExpr>,
+    from: &Schema,
+    state: &dyn Session,
+) -> DFResult<Arc<dyn FileSource>> {
+    let filters =
+        rebind_predicate(predicate, from, source.table_schema().table_schema())?;
+    if filters.is_empty() {
+        return Ok(source);
+    }
+    let result = source.try_pushdown_filters(filters, state.config_options())?;
+    Ok(result.updated_node.unwrap_or(source))
+}
+
+pub fn compute_project_column_indices(
+    schema: SchemaRef,
+    projected_schema: SchemaRef,
+    primary_keys: &[String],
+    cdc_column: &str,
+) -> Option<Vec<usize>> {
+    // O(nm), n = number of fields, m = number of projected columns
+    Some(
+        schema
+            .fields()
+            .iter()
+            .enumerate()
+            .filter_map(|(idx, field)| {
+                if projected_schema.field_with_name(field.name()).is_ok()
+                    || primary_keys.contains(field.name()) // linear
+                    || field.name().eq(&cdc_column)
+                {
+                    Some(idx)
+                } else {
+                    None
+                }
+            })
+            .collect::<Vec<_>>(),
+    )
+}
+
+/// Whether a work unit's per-file scan configs can share one scan leaf.
+///
+/// A leaf reads through a single file source from a single object store, so
+/// files of several physical formats or compressions would have to be read by
+/// another format's reader. The LakeSoul scans group files by physical format
+/// before building work units, so this is a guard rather than a policy.
+fn share_one_scan_leaf(configs: &[FileScanConfig]) -> bool {
+    let Some(first) = configs.first() else {
+        return false;
+    };
+    configs.iter().skip(1).all(|config| {
+        config.file_source.file_type() == first.file_source.file_type()
+            && config.file_compression_type == first.file_compression_type
+            && config.object_store_url == first.object_store_url
+    })
+}
+
+/// Builds the scan leaf of one work unit whose rows are only concatenated.
+///
+/// A work unit of a table without primary keys never merges: `merge_stream`
+/// concatenates its files. The leaf therefore only has to produce what the
+/// merge operator's concat path produces for such a work unit — `merged_schema`
+/// rows, with the work unit's partition values as constants — and it *declares*
+/// that schema instead of deriving it from the files: the reader adapts every
+/// file to the declared schema, padding columns the file does not have with
+/// NULLs, casting drifted types, and leaving out columns the table does not
+/// have. Schema evolution (older files missing newer columns) therefore needs
+/// no merge operator either.
+///
+/// What the plain leaf buys is distribution: the distributed planner's default
+/// file-scan handlers rebalance exactly this shape over the stage's tasks,
+/// while a merge work unit has to stay in one task.
+///
+/// Returns `None` when the work unit cannot be read by one leaf — its files do
+/// not share a file source, a compression or an object store — in which case
+/// the caller keeps `MergeParquetExec` over the per-file inputs.
+pub fn append_only_scan_exec(
+    state: &dyn Session,
+    format: &dyn FileFormat,
+    configs: &[FileScanConfig],
+    merged_schema: &SchemaRef,
+) -> Result<Option<Arc<dyn ExecutionPlan>>> {
+    let Some(base) = configs.first() else {
+        return Ok(None);
+    };
+    if !share_one_scan_leaf(configs) {
+        debug!("work unit files need more than one scan leaf");
+        return Ok(None);
+    }
+
+    // One file group per work unit: locally that is one partition reading the
+    // files in order, and the distributed planner splits the group — by file,
+    // or by byte range when a file is larger than a task's share — over the
+    // tasks of the stage.
+    let files = configs
+        .iter()
+        .flat_map(|config| config.file_groups.iter())
+        .flat_map(|group| group.iter().cloned())
+        .collect::<Vec<_>>();
+
+    // The leaf declares the merged schema's data columns followed by the
+    // *table's* partition columns: a file's partition values are paired with
+    // the declared partition columns by index, and they were parsed against
+    // this list, so declaring only the columns the scan reads would hand a
+    // surviving partition column the value of an earlier one. The columns the
+    // scan does not read are projected away below, so the leaf still emits
+    // exactly the columns its consumers expect.
+    let partition_columns = base
+        .file_source
+        .table_schema()
+        .table_partition_cols()
+        .to_vec();
+    let file_schema = Arc::new(Schema::new(
+        merged_schema
+            .fields()
+            .iter()
+            .filter(|field| {
+                !partition_columns
+                    .iter()
+                    .any(|column| column.name() == field.name())
+            })
+            .cloned()
+            .collect::<Vec<FieldRef>>(),
+    ));
+    let table_schema = TableSchema::builder(file_schema)
+        .with_table_partition_cols(partition_columns)
+        .build();
+
+    let mut source = format.file_source(table_schema);
+    source = adapt_file_source_for_single_file(source, format, base)?;
+    if let Some(predicate) = base.file_source.filter() {
+        source = push_predicate_into(
+            source,
+            &predicate,
+            base.file_source.table_schema().table_schema(),
+            state,
+        )?;
+    }
+
+    // `merged_schema` selects this leaf's columns the way its consumers order
+    // them: the reader takes the projection itself and materializes the
+    // partition columns it keeps from the files' partition values, so no node
+    // has to trim or reorder the rows the leaf reads, and the file-scan shape
+    // the distributed planner rebalances stays untouched. A source that cannot
+    // take a projection keeps the full table schema, which the projection below
+    // then reduces by name.
+    let leaf_schema = source.table_schema().table_schema().clone();
+    let projection = merged_schema
+        .fields()
+        .iter()
+        .map(|field| {
+            leaf_schema
+                .index_of(field.name())
+                .map_err(|_| report!("scan leaf cannot read column '{}'", field.name()))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let projection = ProjectionExprs::from_indices(&projection, &leaf_schema);
+    source = source
+        .try_pushdown_projection(&projection)?
+        .unwrap_or(source);
+
+    let config = FileScanConfigBuilder::from(base.clone())
+        .with_source(source)
+        .with_file_groups(vec![FileGroup::new(files)])
+        // Constraints index the outer table schema, not this leaf's.
+        .with_constraints(Constraints::default())
+        .with_statistics(Statistics::new_unknown(merged_schema))
+        // A declared partitioning describes the outer scan's file groups, not
+        // this leaf's single group.
+        .with_output_partitioning(None)
+        .build();
+    let leaf: Arc<dyn ExecutionPlan> = DataSourceExec::from_data_source(config);
+    if leaf.schema() == *merged_schema {
+        return Ok(Some(leaf));
+    }
+
+    // A file source that refuses the projection leaves the leaf with the whole
+    // table schema, and declared field metadata can still differ from the
+    // merged schema's; select `merged_schema` by name in that case.
+    let exprs = merged_schema
+        .fields()
+        .iter()
+        .map(|field| {
+            let index = leaf.schema().index_of(field.name()).map_err(|_| {
+                report!("scan leaf cannot read column '{}'", field.name())
+            })?;
+            Ok((
+                Arc::new(Column::new(field.name(), index)) as Arc<dyn PhysicalExpr>,
+                field.name().clone(),
+            ))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let leaf: Arc<dyn ExecutionPlan> =
+        Arc::new(ProjectionExec::try_new(exprs, leaf).map_err(|e| report!(e))?);
+    Ok((leaf.schema() == *merged_schema).then_some(leaf))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use arrow_schema::{DataType, Field, FieldRef};
+    use datafusion::datasource::listing::PartitionedFile;
+    use datafusion::execution::object_store::ObjectStoreUrl;
+    use datafusion::prelude::SessionContext;
+    use datafusion::scalar::ScalarValue;
+
+    #[test]
+    fn merge_schema_refs_allows_castable_field_types() {
+        let int32_schema =
+            Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, true)]));
+        let int64_schema =
+            Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, true)]));
+
+        let merged = merge_schema_refs([int32_schema, int64_schema]).unwrap();
+
+        assert_eq!(
+            merged.field_with_name("id").unwrap().data_type(),
+            &DataType::Int64
+        );
+    }
+
+    fn object_meta(location: &str) -> ObjectMeta {
+        ObjectMeta {
+            location: object_store::path::Path::from(location),
+            last_modified: chrono::DateTime::<chrono::Utc>::from(
+                std::time::SystemTime::UNIX_EPOCH,
+            ),
+            size: 100,
+            e_tag: None,
+            version: None,
+        }
+    }
+
+    /// One member of a work unit: a single file with `file_schema` and, for a
+    /// range-partitioned table, the partition values of the work unit.
+    fn scan_config(
+        file_schema: SchemaRef,
+        partition_cols: Vec<FieldRef>,
+        partition_values: Vec<ScalarValue>,
+    ) -> FileScanConfig {
+        let source: Arc<dyn FileSource> = Arc::new(ParquetSource::new(TableSchema::new(
+            file_schema,
+            partition_cols,
+        )));
+        let file = PartitionedFile::new_from_meta(object_meta("part-0.parquet"))
+            .with_partition_values(partition_values);
+        FileScanConfigBuilder::new(ObjectStoreUrl::local_filesystem(), source)
+            .with_file_groups(vec![FileGroup::new(vec![file])])
+            .build()
+    }
+
+    fn field(name: &str, nullable: bool) -> FieldRef {
+        Arc::new(Field::new(name, DataType::Int32, nullable))
+    }
+
+    /// The plan of one work unit, unwrapped from a reordering projection.
+    fn leaf_scan_config(leaf: &dyn ExecutionPlan) -> &FileScanConfig {
+        let leaf = leaf
+            .downcast_ref::<ProjectionExec>()
+            .map_or(leaf, |projection| projection.input().as_ref());
+        leaf.downcast_ref::<DataSourceExec>()
+            .expect("the work unit must scan as a plain file scan")
+            .data_source()
+            .downcast_ref::<FileScanConfig>()
+            .expect("the scan leaf must carry a file scan config")
+    }
+
+    /// Scans one append-only work unit as a plain leaf.
+    fn build_leaf(
+        configs: &[FileScanConfig],
+        merged: &SchemaRef,
+    ) -> Arc<dyn ExecutionPlan> {
+        let state = SessionContext::new().state();
+        let format = ParquetFormat::default();
+        append_only_scan_exec(&state, &format, configs, merged)
+            .expect("the leaf builder must not fail")
+            .expect("an append-only work unit scans as a plain leaf")
+    }
+
+    /// A work unit becomes one leaf with a single file group: locally one
+    /// partition reading the files in order, and the unit the distributed
+    /// planner splits over the stage's tasks.
+    #[test]
+    fn append_only_scan_exec_groups_one_schema_into_one_file_group() {
+        let merged: SchemaRef =
+            Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
+        let configs = vec![
+            scan_config(Arc::clone(&merged), vec![], vec![]),
+            scan_config(Arc::clone(&merged), vec![], vec![]),
+        ];
+
+        let leaf = build_leaf(&configs, &merged);
+
+        assert_eq!(leaf.schema(), merged);
+        let scan = leaf_scan_config(leaf.as_ref());
+        assert_eq!(scan.file_groups.len(), 1);
+        assert_eq!(scan.file_groups[0].files().len(), 2);
+    }
+
+    /// Schema evolution leaves older files narrower than the table. The leaf
+    /// declares the merged schema and the reader pads what a file does not
+    /// have, so such a work unit still scans as one distributable leaf.
+    #[test]
+    fn append_only_scan_exec_serves_files_that_drift_apart() {
+        let old: SchemaRef =
+            Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
+        let merged: SchemaRef = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("evolved", DataType::Utf8, true),
+        ]));
+        let configs = vec![
+            scan_config(old, vec![], vec![]),
+            scan_config(Arc::clone(&merged), vec![], vec![]),
+        ];
+
+        let leaf = build_leaf(&configs, &merged);
+
+        assert_eq!(leaf.schema(), merged);
+        let scan = leaf_scan_config(leaf.as_ref());
+        assert_eq!(scan.file_groups[0].files().len(), 2);
+        assert_eq!(
+            scan.file_source.table_schema().file_schema(),
+            &Arc::new((*merged).clone()),
+            "the leaf reads the files as the merged schema"
+        );
+    }
+
+    /// Partition columns are constants of their work unit: the leaf declares
+    /// them, and the reader fills them from each file's partition values.
+    #[test]
+    fn append_only_scan_exec_declares_the_partition_column_of_a_work_unit() {
+        let file_schema: SchemaRef =
+            Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
+        let partition_cols = vec![field("part", false)];
+        let configs = vec![
+            scan_config(
+                Arc::clone(&file_schema),
+                partition_cols.clone(),
+                vec![ScalarValue::Int32(Some(7))],
+            ),
+            scan_config(
+                file_schema,
+                partition_cols,
+                vec![ScalarValue::Int32(Some(8))],
+            ),
+        ];
+        let merged: SchemaRef = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("part", DataType::Int32, false),
+        ]));
+
+        let leaf = build_leaf(&configs, &merged);
+
+        assert_eq!(leaf.schema(), merged);
+        let scan = leaf_scan_config(leaf.as_ref());
+        assert_eq!(
+            scan.table_partition_cols()
+                .iter()
+                .map(|field| field.name().as_str())
+                .collect::<Vec<_>>(),
+            vec!["part"]
+        );
+        assert_eq!(
+            scan.file_groups[0]
+                .files()
+                .iter()
+                .map(|file| file.partition_values.clone())
+                .collect::<Vec<_>>(),
+            vec![
+                vec![ScalarValue::Int32(Some(7))],
+                vec![ScalarValue::Int32(Some(8))]
+            ],
+            "every file keeps the partition values of its own work unit"
+        );
+    }
+
+    /// The merged schema is a projection of the table schema, so a partition
+    /// column can precede a data column: the leaf reorders it.
+    #[test]
+    fn append_only_scan_exec_reorders_a_merged_schema_that_differs_from_the_table() {
+        let file_schema: SchemaRef =
+            Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
+        let configs = vec![scan_config(
+            file_schema,
+            vec![field("part", false)],
+            vec![ScalarValue::Int32(Some(7))],
+        )];
+        let merged: SchemaRef = Arc::new(Schema::new(vec![
+            Field::new("part", DataType::Int32, false),
+            Field::new("id", DataType::Int32, false),
+        ]));
+
+        let leaf = build_leaf(&configs, &merged);
+
+        assert_eq!(leaf.schema(), merged);
+        assert_eq!(
+            leaf_scan_config(leaf.as_ref()).file_groups[0].files().len(),
+            1
+        );
+    }
+
+    /// A leaf reads through one file source: files of several compressions
+    /// keep the merge operator over their per-file inputs.
+    #[test]
+    fn append_only_scan_exec_needs_one_file_source() {
+        let merged: SchemaRef =
+            Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
+        let same = scan_config(Arc::clone(&merged), vec![], vec![]);
+        let mut other = scan_config(Arc::clone(&merged), vec![], vec![]);
+        other.file_compression_type = FileCompressionType::ZSTD;
+        let state = SessionContext::new().state();
+        let format = ParquetFormat::default();
+
+        let leaf = append_only_scan_exec(&state, &format, &[same, other], &merged)
+            .expect("the leaf builder must not fail");
+
+        assert!(
+            leaf.is_none(),
+            "files read differently cannot share one scan leaf"
+        );
+    }
+
+    /// The TPC-H `part` columns up to `p_size`: `p_brand` and `p_size` sit at
+    /// indices 3 and 5 of the table, and at 0 and 1 of a leaf reading only
+    /// them.
+    fn part_schema() -> SchemaRef {
+        Arc::new(Schema::new(vec![
+            Field::new("p_partkey", DataType::Int64, false),
+            Field::new("p_name", DataType::Utf8, false),
+            Field::new("p_mfgr", DataType::Utf8, false),
+            Field::new("p_brand", DataType::Utf8, false),
+            Field::new("p_type", DataType::Utf8, false),
+            Field::new("p_size", DataType::Int32, false),
+        ]))
+    }
+
+    /// `p_size IN (1, 2, 3, 4, 5)` and `p_brand <> 'Brand#45'`, bound to
+    /// `schema`. An `IN` list of more than three items stays an `InListExpr`,
+    /// which checks its column against the schema it is decoded with.
+    fn part_predicates(schema: &Schema) -> Vec<Arc<dyn PhysicalExpr>> {
+        use datafusion::logical_expr::Operator;
+        use datafusion::physical_expr::expressions::{binary, col, in_list, lit};
+
+        let sizes = (1..=5).map(lit).collect();
+        vec![
+            in_list(col("p_size", schema).unwrap(), sizes, &false, schema).unwrap(),
+            binary(
+                col("p_brand", schema).unwrap(),
+                Operator::NotEq,
+                lit("Brand#45"),
+                schema,
+            )
+            .unwrap(),
+        ]
+    }
+
+    /// A leaf reading fewer columns than its table rebinds the predicate it
+    /// takes over to its own schema, for both file formats.
+    ///
+    /// Left bound to the table, the predicate names `p_size` at index 5 of a
+    /// two-column leaf: a worker decoding the leaf fails on the `IN` list, and
+    /// a comparison binds whatever column sits at the stale index.
+    #[test]
+    fn append_only_scan_exec_binds_its_predicate_to_the_leaf_schema() {
+        let registry =
+            LakeSoulFormatRegistry::new(LakeSoulIOConfig::default(), false).unwrap();
+        let table = part_schema();
+        let merged: SchemaRef = Arc::new(Schema::new(vec![
+            Field::new("p_brand", DataType::Utf8, false),
+            Field::new("p_size", DataType::Int32, false),
+        ]));
+        let state = SessionContext::new().state();
+
+        for physical_format in [PhysicalFormat::Parquet, PhysicalFormat::Vortex] {
+            let format = registry.file_format(physical_format);
+            let source = format
+                .file_source(TableSchema::new(Arc::clone(&table), vec![]))
+                .try_pushdown_filters(part_predicates(&table), state.config_options())
+                .unwrap()
+                .updated_node
+                .unwrap_or_else(|| {
+                    panic!("{physical_format}: source refused the filters")
+                });
+            let file = PartitionedFile::new_from_meta(object_meta("part-0"));
+            let config =
+                FileScanConfigBuilder::new(ObjectStoreUrl::local_filesystem(), source)
+                    .with_file_groups(vec![FileGroup::new(vec![file])])
+                    .build();
+
+            let leaf = append_only_scan_exec(&state, format.as_ref(), &[config], &merged)
+                .expect("the leaf builder must not fail")
+                .expect("an append-only work unit scans as a plain leaf");
+
+            let scan = leaf_scan_config(leaf.as_ref());
+            let leaf_schema = scan.file_source.table_schema().table_schema();
+            let filter = scan.file_source.filter().unwrap_or_else(|| {
+                panic!("{physical_format}: the leaf lost its predicate")
+            });
+            let mut names = vec![];
+            for column in collect_columns(&filter) {
+                assert_eq!(
+                    leaf_schema
+                        .fields()
+                        .get(column.index())
+                        .map(|field| field.name().as_str()),
+                    Some(column.name()),
+                    "{physical_format}: {filter} is not bound to the leaf schema \
+                     {leaf_schema}"
+                );
+                names.push(column.name().to_string());
+            }
+            names.sort();
+            assert_eq!(names, ["p_brand", "p_size"], "{physical_format}: {filter}");
+        }
+    }
+
+    /// A conjunct moves to a narrower schema only when that schema declares
+    /// its columns with the same types; otherwise it stays with the
+    /// `FilterExec` above the scan. Here a file was written before `p_brand`
+    /// existed, and another while `p_size` was still narrower.
+    #[test]
+    fn rebind_predicate_keeps_the_conjuncts_the_target_can_evaluate() {
+        let table = part_schema();
+        let predicate = conjunction_opt(part_predicates(&table)).unwrap();
+
+        let without_brand = Schema::new(vec![
+            Field::new("p_size", DataType::Int32, false),
+            Field::new("p_partkey", DataType::Int64, false),
+        ]);
+        let rebound = rebind_predicate(&predicate, &table, &without_brand).unwrap();
+        assert_eq!(
+            rebound.iter().flat_map(collect_columns).collect::<Vec<_>>(),
+            [Column::new("p_size", 0)]
+        );
+
+        let narrower_size = Schema::new(vec![
+            Field::new("p_brand", DataType::Utf8, false),
+            Field::new("p_size", DataType::Int16, false),
+        ]);
+        let rebound = rebind_predicate(&predicate, &table, &narrower_size).unwrap();
+        assert_eq!(
+            rebound.iter().flat_map(collect_columns).collect::<Vec<_>>(),
+            [Column::new("p_brand", 0)]
+        );
+    }
+}

@@ -1,0 +1,78 @@
+# SPDX-FileCopyrightText: LakeSoul Contributors
+#
+# SPDX-License-Identifier: Apache-2.0
+
+[package]
+name = "lakesoul-flight"
+description = "Experimental Arrow Flight service; not part of LakeSoul Core GA"
+version.workspace = true
+publish = false
+edition.workspace = true
+
+
+[dependencies]
+# lakesoul
+lakesoul-datafusion = { path = "../lakesoul-datafusion" }
+lakesoul-metadata = { path = "../lakesoul-metadata" }
+lakesoul-io = { path = "../lakesoul-io" }
+lakesoul-observability = { path = "../lakesoul-observability" }
+# datafusion
+datafusion = { workspace = true }
+# arrow
+arrow = { workspace = true }
+arrow-flight = { workspace = true }
+object_store = { workspace = true }
+# async
+futures = { workspace = true }
+async-trait = { workspace = true }
+# runtime
+tokio = { workspace = true }
+# time
+chrono = { workspace = true }
+# web
+tonic = { workspace = true }
+http = { workspace = true }
+tower = { workspace = true }
+tower-http = { version = "0.4", features = ["trace"] }
+jsonwebtoken = { workspace = true }
+metrics = { workspace = true }
+# serialization
+serde = { workspace = true }
+serde_json = { workspace = true }
+# protobuf
+prost = { workspace = true }
+# cli
+clap = { workspace = true }
+# utils
+url = { workspace = true }
+uuid = { workspace = true }
+bytes = { workspace = true }
+dashmap = { workspace = true }
+# rand
+rand = { workspace = true }
+# logging
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+# err
+rootcause = { workspace = true }
+
+[features]
+hdfs = ["lakesoul-io/hdfs"]
+default = []
+
+[build-dependencies]
+tonic-build = { workspace = true }
+
+[dev-dependencies]
+assert_cmd = "2.0"
+arrow-array = { workspace = true }
+arrow-schema = { workspace = true }
+arrow-cast = { workspace = true }
+arrow = { workspace = true, features = ["test_utils"] }
+futures = { workspace = true }
+test-log = { workspace = true }
+lakesoul-datafusion = { path = "../lakesoul-datafusion" }
+rootcause.workspace = true
+
+[lints]
+workspace = true

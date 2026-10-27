@@ -1,0 +1,50 @@
+// SPDX-FileCopyrightText: 2023 LakeSoul Contributors
+//
+// SPDX-License-Identifier: Apache-2.0
+
+package com.facebook.presto.lakesoul;
+
+import static com.facebook.airlift.testing.Closeables.closeAllSuppress;
+import static com.facebook.presto.testing.TestingSession.testSessionBuilder;
+
+import com.facebook.presto.Session;
+import com.facebook.presto.tests.DistributedQueryRunner;
+
+import java.util.HashMap;
+import java.util.Map;
+
+public class LakeSoulQueryRunner {
+
+    private LakeSoulQueryRunner() {}
+    ;
+
+    public static DistributedQueryRunner createLakeSoulQueryRunner() throws Exception {
+        DistributedQueryRunner queryRunner = null;
+        try {
+            int nodeCount = 1;
+            queryRunner =
+                    DistributedQueryRunner.builder(createSession()).setNodeCount(nodeCount).build();
+            Map<String, String> properties = new HashMap<>();
+            properties.put("fs.s3a.access.key", "rustfsadmin");
+            properties.put("fs.s3a.secret.key", "rustfsadmin");
+            properties.put("fs.s3a.bucket", "lakesoul-test-bucket");
+            properties.put("fs.s3a.endpoint", "http://localhost:9000");
+            queryRunner.installPlugin(new LakeSoulPlugin());
+            queryRunner.createCatalog(
+                    LakeSoulConnectorFactory.CONNECTOR_NAME,
+                    LakeSoulConnectorFactory.CONNECTOR_NAME,
+                    properties);
+            return queryRunner;
+        } catch (Throwable e) {
+            closeAllSuppress(e, queryRunner);
+            throw e;
+        }
+    }
+
+    private static Session createSession() {
+        return testSessionBuilder()
+                .setCatalog(LakeSoulConnectorFactory.CONNECTOR_NAME)
+                .setSchema("default")
+                .build();
+    }
+}

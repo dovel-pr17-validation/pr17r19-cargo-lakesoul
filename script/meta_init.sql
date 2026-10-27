@@ -1,0 +1,258 @@
+-- SPDX-FileCopyrightText: 2023 LakeSoul Contributors
+--
+-- SPDX-License-Identifier: Apache-2.0
+
+create table if not exists namespace
+(
+    namespace  text,
+    properties json,
+    comment    text,
+    domain     text default 'public',
+    primary key (namespace)
+);
+
+insert into namespace(namespace, properties, comment) values ('default', '{}', '')
+ON CONFLICT DO NOTHING;
+
+create table if not exists table_info
+(
+    table_id        text,
+    table_namespace text default 'default',
+    table_name      text,
+    table_path      text,
+    table_schema    text,
+    table_schema_arrow_ipc bytea,
+    table_schema_arrow_ipc_json_hash text,
+    properties      json,
+    partitions      text,
+    domain          text default 'public',
+    primary key (table_id)
+);
+ALTER TABLE table_info ADD COLUMN IF NOT EXISTS table_schema_arrow_ipc bytea;
+ALTER TABLE table_info ADD COLUMN IF NOT EXISTS table_schema_arrow_ipc_json_hash text;
+CREATE INDEX CONCURRENTLY IF NOT EXISTS table_info_name_index ON table_info (table_namespace, table_name);
+CREATE INDEX CONCURRENTLY IF NOT EXISTS table_info_path_index ON table_info (table_path);
+
+create table if not exists table_name_id
+(
+    table_name      text,
+    table_id        text,
+    table_namespace text default 'default',
+    domain          text default 'public',
+    primary key (table_name, table_namespace)
+);
+CREATE INDEX CONCURRENTLY IF NOT EXISTS table_name_id_id_index ON table_name_id (table_id);
+
+create table if not exists table_path_id
+(
+    table_path      text,
+    table_id        text,
+    table_namespace text default 'default',
+    domain          text default 'public',
+    primary key (table_path)
+);
+CREATE INDEX CONCURRENTLY IF NOT EXISTS table_path_id_id_index ON table_path_id (table_id);
+
+DO
+$$
+    BEGIN
+        IF NOT EXISTS (SELECT 1 FROM pg_type WHERE typname = 'data_file_op') THEN
+            create type data_file_op as
+            (
+                path            text,
+                file_op         text,
+                size            bigint,
+                file_exist_cols text
+            );
+        END IF;
+    END
+$$;
+
+create table if not exists data_commit_info
+(
+    table_id       text,
+    partition_desc text,
+    commit_id      UUID,
+    file_ops       data_file_op[],
+    commit_op      text,
+    committed      boolean default 'false',
+    timestamp      bigint,
+    domain         text default 'public',
+    primary key (table_id, partition_desc, commit_id)
+);
+CREATE INDEX CONCURRENTLY IF NOT EXISTS data_commit_info_commit_id ON data_commit_info (commit_id);
+ALTER TABLE data_commit_info REPLICA IDENTITY FULL;
+
+create table if not exists partition_info
+(
+    table_id       text,
+    partition_desc text,
+    version        int,
+    commit_op      text,
+    timestamp      bigint DEFAULT (date_part('epoch'::text, now()) * (1000)::double precision),
+    snapshot       UUID[],
+    expression     text,
+    domain         text default 'public',
+    primary key (table_id, partition_desc, version)
+);
+CREATE INDEX CONCURRENTLY IF NOT EXISTS partition_info_timestamp ON partition_info (timestamp);
+CREATE INDEX CONCURRENTLY IF NOT EXISTS partition_info_desc_gin_tsvector_index ON partition_info USING GIN (to_tsvector('english', partition_desc));
+
+CREATE OR REPLACE FUNCTION partition_insert() RETURNS TRIGGER AS
+$$
+DECLARE
+    rs_version         integer;
+    rs_table_path      text;
+    rs_table_namespace text;
+BEGIN
+    if NEW.commit_op <> 'CompactionCommit' then
+        select version
+        INTO rs_version
+        from partition_info
+        where table_id = NEW.table_id
+          and partition_desc = NEW.partition_desc
+          and version != NEW.version
+          and commit_op = 'CompactionCommit'
+        order by version desc
+        limit 1;
+        if rs_version >= 0 then
+            if NEW.version - rs_version >= 10 then
+                select table_path, table_namespace
+                into rs_table_path, rs_table_namespace
+                from table_info
+                where table_id = NEW.table_id;
+                perform pg_notify('lakesoul_compaction_notify',
+                                  concat('{"table_path":"', rs_table_path, '","table_partition_desc":"',
+                                         NEW.partition_desc, '","table_namespace":"', rs_table_namespace, '"}'));
+            end if;
+        else
+            if NEW.version >= 10 then
+                select table_path, table_namespace
+                into rs_table_path, rs_table_namespace
+                from table_info
+                where table_id = NEW.table_id;
+                perform pg_notify('lakesoul_compaction_notify',
+                                  concat('{"table_path":"', rs_table_path, '","table_partition_desc":"',
+                                         NEW.partition_desc, '","table_namespace":"', rs_table_namespace, '"}'));
+            end if;
+        end if;
+        RETURN NULL;
+    end if;
+    RETURN NULL;
+END;
+$$ LANGUAGE plpgsql;
+
+DROP TRIGGER IF EXISTS partition_table_change ON partition_info;
+CREATE TRIGGER partition_table_change
+    AFTER INSERT
+    ON partition_info
+    FOR EACH ROW
+EXECUTE PROCEDURE partition_insert();
+
+create table if not exists global_config
+(
+    key  text,
+    value text,
+    primary key (key)
+);
+
+create table if not exists discard_compressed_file_info
+(
+    file_path text,
+    table_path text,
+    partition_desc text,
+    timestamp bigint DEFAULT (date_part('epoch'::text, now()) * (1000)::double precision),
+    t_date date,
+    PRIMARY KEY (file_path)
+);
+
+-- Index control plane: the index data (segments/splits) lives in object
+-- storage; these tables track the current commit per shard (scoped by the
+-- index kind), the files it references, and the leases held by readers
+-- while they load.
+create table if not exists index_shard
+(
+    shard_id     bigserial primary key,
+    kind         text not null,
+    index_prefix text not null,
+    unique (kind, index_prefix)
+);
+
+create table if not exists index_commit
+(
+    commit_id     bigserial primary key,
+    shard_id      bigint      not null references index_shard (shard_id) on delete cascade,
+    generation    bigint      not null,
+    version       bigint      not null,
+    header        bytea       not null,
+    segments      jsonb       not null default '[]'::jsonb,
+    created_at    timestamptz not null default now(),
+    superseded_at timestamptz,
+    unique (shard_id, generation, version)
+);
+
+create index if not exists index_commit_shard_key_index
+    on index_commit (shard_id, generation desc, version desc);
+
+create table if not exists index_lease
+(
+    lease_id    uuid primary key,
+    shard_id    bigint      not null references index_shard (shard_id) on delete cascade,
+    generation  bigint      not null,
+    version     bigint      not null,
+    owner       text        not null,
+    acquired_at timestamptz not null default now(),
+    expires_at  timestamptz not null
+);
+
+create index if not exists index_lease_expiry_index
+    on index_lease (shard_id, expires_at);
+
+-- Table-level snapshots and tags. A snapshot freezes the version and commit
+-- ids of every partition; a tag keeps a snapshot alive so the Flink clean job
+-- must not delete its files or metadata. `pinned` on data_commit_info and
+-- partition_info is the materialized filter the clean job reads.
+create table if not exists table_snapshot
+(
+    table_id    text   not null,
+    snapshot_id bigserial,
+    created_at  bigint not null,
+    description text,
+    primary key (table_id, snapshot_id)
+);
+
+create table if not exists snapshot_commit
+(
+    table_id       text   not null,
+    snapshot_id    bigint not null,
+    partition_desc text   not null,
+    version        int    not null,
+    commit_id      uuid   not null,
+    primary key (table_id, snapshot_id, partition_desc, commit_id)
+);
+
+create index if not exists snapshot_commit_commit_id_index
+    on snapshot_commit (table_id, commit_id);
+
+create index if not exists snapshot_commit_version_index
+    on snapshot_commit (table_id, partition_desc, version);
+
+create table if not exists table_snapshot_tag
+(
+    table_id    text   not null,
+    tag         text   not null,
+    snapshot_id bigint not null,
+    created_at  bigint not null,
+    expire_at   bigint,
+    primary key (table_id, tag)
+);
+
+alter table data_commit_info
+    add column if not exists pinned boolean not null default false;
+alter table partition_info
+    add column if not exists pinned boolean not null default false;
+
+create index if not exists data_commit_info_pinned_index
+    on data_commit_info (table_id, pinned);
+create index if not exists partition_info_pinned_index
+    on partition_info (table_id, pinned);

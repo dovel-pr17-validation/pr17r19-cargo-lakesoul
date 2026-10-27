@@ -1,0 +1,363 @@
+// SPDX-FileCopyrightText: 2026 LakeSoul Contributors
+//
+// SPDX-License-Identifier: Apache-2.0
+
+use std::collections::BTreeSet;
+use std::sync::Arc;
+use std::time::Duration;
+
+use datafusion::execution::SessionStateBuilder;
+use datafusion::prelude::SessionContext;
+use lakesoul_datafusion::distributed::DistributedOptions;
+use parking_lot::RwLock;
+use rootcause::{bail, report};
+
+use datafusion_postgres::auth::AuthManager;
+use datafusion_postgres::datafusion_pg_catalog::{
+    PgCatalogOptions, setup_pg_catalog_with_options,
+};
+use lakesoul_common::misc::TimeZone;
+use lakesoul_datafusion::catalog::{
+    CatalogSnapshot, LakeSoulProviderOptions, LakeSoulVectorFieldMetadata,
+};
+use lakesoul_datafusion::cli::CoreArgs;
+use lakesoul_datafusion::distributed::headers::{
+    SessionActor, StatementIdGuard, set_identity_headers,
+};
+use lakesoul_datafusion::session::{
+    ExecutionMemoryArgs, LakeSoulSessionFactory, LakeSoulSessionOptions,
+};
+use lakesoul_datafusion::udf::vector_search_marker::LakeSoulVectorSearchConfig;
+use lakesoul_metadata::MetaDataClientRef;
+use rootcause::Report;
+use tracing::{info, instrument};
+
+use crate::catalog::{PUBLIC_SCHEMA, PgDatabaseCatalogList, pg_lakesoul_catalog};
+
+/// Identity resolved for one PostgreSQL connection during startup.
+#[derive(Debug, Clone, Default)]
+pub struct SessionIdentity {
+    pub user: String,
+    pub database: String,
+}
+
+/// PostgreSQL connection-local settings.
+#[derive(Debug, Clone)]
+pub struct SessionSettings {
+    /// PostgreSQL search path, most significant schema first.
+    pub search_path: Vec<String>,
+    /// Session time zone applied to DataFusion execution.
+    pub time_zone: TimeZone,
+    pub statement_timeout: Option<Duration>,
+}
+
+impl Default for SessionSettings {
+    fn default() -> Self {
+        // default is utc
+        let tz = TimeZone::try_system().unwrap_or(TimeZone::UTC);
+        Self {
+            search_path: vec![PUBLIC_SCHEMA.to_string(), "pg_catalog".to_string()],
+            time_zone: tz,
+            statement_timeout: None,
+        }
+    }
+}
+
+impl SessionSettings {
+    /// Initial DataFusion schema derived from the PostgreSQL search path.
+    /// Full multi-schema resolution is handled by the PG query layer.
+    pub fn initial_schema(&self) -> &str {
+        self.search_path
+            .iter()
+            .map(String::as_str)
+            .find(|schema| *schema != "pg_catalog")
+            .unwrap_or(PUBLIC_SCHEMA)
+    }
+}
+
+/// State owned by one PostgreSQL connection.
+pub struct PgSession {
+    pub identity: SessionIdentity,
+    pub context: Arc<SessionContext>,
+    pub settings: RwLock<SessionSettings>,
+    pub actor: SessionActor,
+    distributed: bool,
+    /// Metadata view this connection lists from: the factory's shared
+    /// snapshot, i.e. one refresher per process rather than one per
+    /// connection.
+    catalog_snapshot: Arc<CatalogSnapshot>,
+}
+
+impl PgSession {
+    pub fn new(
+        identity: SessionIdentity,
+        context: Arc<SessionContext>,
+        settings: SessionSettings,
+        catalog_snapshot: Arc<CatalogSnapshot>,
+        distributed: bool,
+    ) -> Result<Self> {
+        let actor =
+            SessionActor::new(identity.user.clone(), "", identity.database.clone());
+        if distributed {
+            set_identity_headers(&context, &actor).map_err(|error| {
+                report!("invalid connection identity for distributed headers: {error}")
+            })?;
+        }
+        Ok(Self {
+            identity,
+            context,
+            settings: RwLock::new(settings),
+            actor,
+            distributed,
+            catalog_snapshot,
+        })
+    }
+
+    /// The metadata view backing this connection's catalog listings.
+    pub fn catalog_snapshot(&self) -> &Arc<CatalogSnapshot> {
+        &self.catalog_snapshot
+    }
+    pub fn label_statement(
+        &self,
+        query_id: u64,
+        span: &tracing::Span,
+    ) -> Option<StatementIdGuard> {
+        self.distributed.then(|| {
+            // Entering the statement span makes its OTel context current while
+            // the distributed headers are built, so `StatementIdGuard` can
+            // forward `traceparent` to the workers.
+            let _entered = span.enter();
+            StatementIdGuard::set(&self.context, &self.actor, query_id)
+        })
+    }
+}
+
+type Result<T, E = Report> = std::result::Result<T, E>;
+
+/// PostgreSQL-specific adapter around the generic LakeSoul session factory.
+///
+/// It maps connection-local PG settings to DataFusion session options and
+/// installs the PostgreSQL database semantics:
+///
+/// - the PG database parameter names the LakeSoul namespace the connection
+///   attaches to; the session's default catalog and schema are that
+///   database and its `public` schema;
+/// - a connection-level [`PgDatabaseCatalogList`] lists every visible
+///   namespace as a database (empty marker catalogs outside the current
+///   one), so `pg_catalog.pg_database` reports them without exposing
+///   cross-database objects;
+/// - `pg_catalog` plus the PostgreSQL compatibility functions are installed
+///   only into the current database's catalog.
+pub struct PgSessionFactory {
+    meta_client: MetaDataClientRef,
+    base: LakeSoulSessionFactory,
+    auth_manager: Arc<AuthManager>,
+    catalog_options: PgCatalogOptions,
+    distributed: bool,
+}
+
+impl PgSessionFactory {
+    #[cfg(test)]
+    pub fn new(
+        meta_client: MetaDataClientRef,
+        args: &CoreArgs,
+        auth_manager: Arc<AuthManager>,
+    ) -> Result<Self> {
+        Self::new_with_memory(
+            meta_client,
+            args,
+            auth_manager,
+            &ExecutionMemoryArgs::default(),
+        )
+    }
+
+    pub fn new_with_memory(
+        meta_client: MetaDataClientRef,
+        args: &CoreArgs,
+        auth_manager: Arc<AuthManager>,
+        memory: &ExecutionMemoryArgs,
+    ) -> Result<Self> {
+        let base = LakeSoulSessionFactory::new_with_memory_pool(
+            Arc::clone(&meta_client),
+            args,
+            memory.create_pool(),
+        )?;
+        Ok(Self {
+            meta_client,
+            base,
+            auth_manager,
+            distributed: false,
+            catalog_options: PgCatalogOptions {
+                include_synthetic_postgres_database: false,
+            },
+        })
+    }
+
+    /// Plans every session against distributed workers.
+    ///
+    /// Installed by the server entry point when workers are configured: the
+    /// coordinator then serves the queries the distributed planner cannot
+    /// plan by itself — or, in production mode, fails them instead of falling
+    /// back to single-node execution.
+    pub fn with_distributed(mut self, options: DistributedOptions) -> Self {
+        self.base = self.base.with_distributed(options);
+        self.distributed = true;
+        self
+    }
+
+    /// The metadata view shared by every connection of this factory.
+    ///
+    /// Call [`CatalogSnapshot::load`] on it once at start-up to warm it, so the
+    /// first connection does not pay for the initial load.
+    pub fn catalog_snapshot(&self) -> &Arc<CatalogSnapshot> {
+        self.base.catalog_snapshot()
+    }
+
+    /// One span per connection: the namespace-visibility query below is
+    /// instrumented on its own, and without this parent it opens a root trace
+    /// per connection.
+    #[instrument(
+        name = "create_session",
+        level = "info",
+        skip_all,
+        fields(user = %identity.user, database = %identity.database)
+    )]
+    pub async fn create_session(
+        &self,
+        identity: SessionIdentity,
+        settings: &SessionSettings,
+    ) -> Result<Arc<PgSession>> {
+        // Namespace visibility is snapshotted once per connection; the sync
+        // catalog interfaces later read this snapshot without blocking.
+        let namespaces = self.meta_client.get_all_namespace().await?;
+        let visible_databases: BTreeSet<String> = namespaces
+            .into_iter()
+            .map(|namespace| namespace.namespace)
+            .collect();
+        if !visible_databases.contains(&identity.database) {
+            bail!("database \"{}\" does not exist", identity.database);
+        }
+
+        let context = self.base.create_session(&LakeSoulSessionOptions {
+            default_schema: settings.initial_schema().to_string(),
+            time_zone: settings.time_zone.iana_name().map(str::to_owned),
+        })?;
+
+        let state = context.state();
+
+        // Report the table's vector columns as the pgvector `vector` type on
+        // the wire.  The provider tags the declared vector columns with this
+        // marker, the result schemas inherit it, and the encoder picks the
+        // vector format from the reported type — so drivers (psycopg with
+        // `register_vector`) decode results as vectors.  It goes on the config
+        // before any provider options are derived from it, so the catalog and
+        // every later provider agree.
+        let mut config = state
+            .config()
+            .clone()
+            .with_default_catalog_and_schema(
+                identity.database.clone(),
+                PUBLIC_SCHEMA.to_string(),
+            )
+            .with_create_default_catalog_and_schema(false)
+            .with_extension(Arc::new(LakeSoulVectorFieldMetadata {
+                fields: vec![(
+                    datafusion_postgres::arrow_pg::datatypes::PG_VECTOR_KEY.to_string(),
+                    "vector".to_string(),
+                )],
+            }));
+        // The vector-search options exist on every connection config: the
+        // scan reads them, `SET lakesoul_vector_search.*` writes them and
+        // `SET ivfflat.probes` maps onto `nprobe`.
+        config
+            .options_mut()
+            .extensions
+            .insert(LakeSoulVectorSearchConfig::default());
+        let state = SessionStateBuilder::new_from_existing(state)
+            .with_config(config)
+            .build();
+        let catalog = pg_lakesoul_catalog(
+            Arc::clone(&self.meta_client),
+            LakeSoulProviderOptions::from_session(&state),
+            &identity.database,
+            Arc::clone(self.base.catalog_snapshot()),
+        );
+        let catalog_list = Arc::new(PgDatabaseCatalogList::new(
+            identity.database.clone(),
+            visible_databases,
+            catalog,
+        ));
+        let context = Arc::new(SessionContext::new_with_state(
+            SessionStateBuilder::new_from_existing(state)
+                .with_catalog_list(catalog_list)
+                .build(),
+        ));
+
+        setup_pg_catalog_with_options(
+            &context,
+            &identity.database,
+            Arc::clone(&self.auth_manager),
+            self.catalog_options,
+        )?;
+        // After the upstream setup: the registry is keyed by name, so the shims
+        // replace the narrower upstream signatures.
+        crate::pg_compat::register_pg_catalog_shims(&context);
+        // pgvector syntax (`<->`, `<#>`, `<=>` and `'[...]'` literals).  The
+        // install rebuilds the state from the existing one, so the LakeSoul
+        // catalog, optimizer rules and config extensions stay in place; it
+        // must run after `setup_pg_catalog_with_options`, whose own planners
+        // it appends to.  The parameter planner goes first: planners are
+        // consulted in order and it only claims the operators whose
+        // parameters it annotates.
+        crate::pg_vector::install(&context)
+            .map_err(|error| report!("pgvector parameter planner: {error}"))?;
+        datafusion_postgres::pgvector::install(&context)
+            .map_err(|error| report!("pgvector install: {error}"))?;
+        let session = Arc::new(PgSession::new(
+            identity,
+            context,
+            settings.clone(),
+            Arc::clone(self.base.catalog_snapshot()),
+            self.distributed,
+        )?);
+        {
+            let settings = session.settings.read();
+            info!(
+                user = %session.identity.user,
+                database = %session.identity.database,
+                time_zone = ?settings.time_zone.iana_name().unwrap_or("None"),
+                statement_timeout = ?settings.statement_timeout,
+                catalog_view_age_ms = ?session
+                    .catalog_snapshot()
+                    .view()
+                    .refreshed_at()
+                    .map(|at| at.elapsed().as_millis()),
+                "created PostgreSQL session"
+            );
+        }
+        Ok(session)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn initial_schema_skips_pg_catalog() {
+        let settings = SessionSettings {
+            search_path: vec!["pg_catalog".to_string(), "tenant_a".to_string()],
+            ..Default::default()
+        };
+        assert_eq!(settings.initial_schema(), "tenant_a");
+    }
+
+    #[test]
+    fn initial_schema_falls_back_to_public() {
+        let settings = SessionSettings {
+            search_path: vec!["pg_catalog".to_string()],
+            ..Default::default()
+        };
+        assert_eq!(settings.initial_schema(), PUBLIC_SCHEMA);
+    }
+}

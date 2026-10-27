@@ -1,0 +1,2028 @@
+// SPDX-FileCopyrightText: 2026 LakeSoul Contributors
+//
+// SPDX-License-Identifier: Apache-2.0
+
+//! The left-deep lookup chain view: a base table joined to keyed 1:1 lookups.
+
+use std::collections::BTreeMap;
+
+use super::join_state::{IVM_JOIN_KEY_COLUMN, JoinKeyEncoder};
+use super::*;
+use datafusion::common::NullEquality;
+use datafusion::logical_expr::LogicalPlanBuilder;
+use futures::StreamExt;
+use futures::future::join_all;
+
+use datafusion::functions::string::expr_fn::{concat, octet_length};
+use datafusion::logical_expr::Cast;
+
+// The change ratio (percent of the estimated live view rows) above which a
+// full bucket-parallel rebuild is cheaper than the incremental replay.  It is
+// per storage format because the state read dominates the replay and its
+// random-read granularity differs (Vortex blocks vs Parquet pages).
+// `LAKESOUL_IVM_REBUILD_RATIO` overrides it at runtime (a percentage).
+
+/// The calibrated crossover for a Parquet MV (pages cannot skip a random key
+/// set, so the state read is a full pass even at small ratios).
+const PARQUET_REBUILD_RATIO_PERCENT: u64 = 4;
+
+/// The calibrated crossover for a Vortex MV: 1024-row blocks let the pk index
+/// skip non-matching blocks, so the replay stays cheaper up to a higher ratio.
+const VORTEX_REBUILD_RATIO_PERCENT: u64 = 8;
+
+/// The rebuild crossover for `mv`, overridable with
+/// `LAKESOUL_IVM_REBUILD_RATIO` (percent of the estimated live rows).
+fn rebuild_ratio_percent(mv: &IvmTable) -> u64 {
+    if let Ok(value) = std::env::var("LAKESOUL_IVM_REBUILD_RATIO")
+        && let Ok(percent) = value.parse::<u64>()
+    {
+        return percent;
+    }
+    if matches!(mv.file_format, crate::PhysicalFormat::Parquet) {
+        PARQUET_REBUILD_RATIO_PERCENT
+    } else {
+        VORTEX_REBUILD_RATIO_PERCENT
+    }
+}
+
+/// The typed view of a left-deep chain of keyed lookups over a base table.
+/// A step whose keys are the source key is a 1:1 lookup; any other key is a
+/// 1:N lookup, whose matched row identity becomes part of the MV merge key.
+#[derive(Debug, Clone)]
+pub struct LookupChainView {
+    /// The view id.
+    pub view_id: String,
+    /// The chain sources; index 0 is the base, the rest follow the steps.
+    pub sources: Vec<(IvmTable, Option<String>)>,
+    /// The join steps in chain order; step `k` joins source `k + 1`.
+    pub steps: Vec<LookupChainStep>,
+    /// The materialized columns.
+    pub output_columns: Vec<LookupChainColumn>,
+    /// The materialized view table, created from
+    /// [`lookup_chain_mv_schema_for`].
+    pub mv: IvmTable,
+    /// Every step compares its keys null-safely.
+    pub null_safe: bool,
+    /// The refresh interval hint persisted with the view.
+    pub refresh_interval_ms: i64,
+}
+
+impl LookupChainView {
+    /// A chain view with no filters.
+    pub fn new(
+        view_id: impl Into<String>,
+        sources: Vec<(IvmTable, Option<String>)>,
+        steps: Vec<LookupChainStep>,
+        output_columns: Vec<LookupChainColumn>,
+        mv: IvmTable,
+    ) -> Self {
+        Self {
+            view_id: view_id.into(),
+            sources,
+            steps,
+            output_columns,
+            mv,
+            null_safe: false,
+            refresh_interval_ms: 0,
+        }
+    }
+
+    fn to_spec(&self) -> ViewSpec {
+        ViewSpec::LookupChain {
+            view_id: self.view_id.clone(),
+            sources: self
+                .sources
+                .iter()
+                .map(|(table, filter)| LookupChainSource {
+                    table_id: table.table_id.clone(),
+                    filter: filter.clone(),
+                })
+                .collect(),
+            steps: self.steps.clone(),
+            output_columns: self.output_columns.clone(),
+            mv_table_id: self.mv.table_id.clone(),
+            null_safe: self.null_safe,
+        }
+    }
+}
+
+/// The schema of a [`LookupChainView`] materialized view: the output columns,
+/// the row kind and the epoch.  A column of a step is nullable when any step
+/// up to it is a left join.
+pub fn lookup_chain_mv_schema_for(
+    source_schemas: &[SchemaRef],
+    steps: &[LookupChainStep],
+    output_columns: &[LookupChainColumn],
+) -> Result<SchemaRef> {
+    if source_schemas.len() != steps.len() + 1 || steps.is_empty() {
+        return Err(report!(
+            "a lookup chain needs one base and at least one step"
+        ));
+    }
+    let mut fields: Vec<arrow_schema::FieldRef> = Vec::new();
+    let mut names = std::collections::HashSet::new();
+    for column in output_columns {
+        let schema = source_schemas.get(column.source).ok_or_else(|| {
+            report!(
+                "lookup chain column {} refers to a missing source",
+                column.name
+            )
+        })?;
+        let field = schema.field_with_name(&column.column).map_err(|_| {
+            report!("lookup chain column {} is not in its source", column.column)
+        })?;
+        if !names.insert(column.name.clone()) {
+            return Err(report!(
+                "lookup chain column {} is materialized twice",
+                column.name
+            ));
+        }
+        let nullable = field.is_nullable()
+            || (column.source > 0 && steps[..column.source].iter().any(|step| step.left));
+        fields.push(Arc::new(Field::new(
+            column.name.clone(),
+            field.data_type().clone(),
+            nullable,
+        )));
+    }
+    for step in steps {
+        if step.unique {
+            continue;
+        }
+        let id_column = lookup_chain_step_id_column(step.source);
+        if !names.insert(id_column.clone()) {
+            return Err(report!(
+                "lookup chain identity column {id_column} collides with an output column"
+            ));
+        }
+        fields.push(Arc::new(Field::new(id_column, DataType::Utf8, false)));
+    }
+    fields.push(Arc::new(Field::new(
+        IVM_ROW_KINDS_COLUMN,
+        DataType::Utf8,
+        false,
+    )));
+    fields.push(Arc::new(Field::new(
+        IVM_EPOCH_COLUMN,
+        DataType::Int64,
+        false,
+    )));
+    Ok(Arc::new(Schema::new(fields)))
+}
+
+/// The alias of a step column in the replay frame, so the joined sources
+/// cannot collide with each other.
+fn lookup_chain_alias(source: usize, column: &str) -> String {
+    format!("__ivm_chain_{source}_{column}")
+}
+
+/// The source a step key comes from (0 is the base).
+fn step_key_source(step: &LookupChainStep, index: usize) -> usize {
+    step.key_sources.get(index).copied().unwrap_or(0)
+}
+
+/// The name of a chain column in the replay frame.
+fn chain_column_name(source: usize, column: &str) -> String {
+    if source == 0 {
+        column.to_string()
+    } else {
+        lookup_chain_alias(source, column)
+    }
+}
+
+/// The identity column of a 1:N step: `__step<source>_id`.  It is non-null
+/// for every chain row (the unmatched row uses the `n...n` encoding), so it
+/// can take part in the MV merge key.
+pub fn lookup_chain_step_id_column(source: usize) -> String {
+    format!("__step{source}_id")
+}
+
+/// The identity expression of a 1:N step: the primary key of the matched row
+/// encoded as a deterministic, collision-free string.
+///
+/// Every component is length prefixed (`v<octets>:<text>`), so concatenating
+/// the components cannot collide; the all-NULL unmatched row encodes as
+/// `n...n`.
+fn lookup_chain_step_id_expr(
+    step: &LookupChainStep,
+    primary_keys: &[String],
+) -> Result<Expr> {
+    let mut parts = Vec::new();
+    for key in primary_keys {
+        let value = col(lookup_chain_alias(step.source, key).as_str());
+        let text = Expr::Cast(Cast::new(Box::new(value.clone()), DataType::Utf8));
+        let length = octet_length(text.clone());
+        let length = Expr::Cast(Cast::new(Box::new(length), DataType::Utf8));
+        let encoded = concat(vec![lit("v"), length, lit(":"), text]);
+        parts.push(when(value.is_null(), lit("n")).otherwise(encoded)?);
+    }
+    Ok(concat(parts).alias(lookup_chain_step_id_column(step.source)))
+}
+
+/// The expressions of one MV row: the output columns and the identity column
+/// of every 1:N step.
+fn lookup_chain_row_exprs(view: &LookupChainView) -> Result<Vec<Expr>> {
+    let mut exprs = view
+        .output_columns
+        .iter()
+        .map(|column| {
+            let expr = if column.source == 0 {
+                col(column.column.as_str())
+            } else {
+                col(lookup_chain_alias(column.source, &column.column).as_str())
+            };
+            expr.alias(column.name.as_str())
+        })
+        .collect::<Vec<_>>();
+    for step in &view.steps {
+        if step.unique {
+            continue;
+        }
+        let (table, _) = &view.sources[step.source];
+        exprs.push(lookup_chain_step_id_expr(step, &table.primary_keys)?);
+    }
+    Ok(exprs)
+}
+
+/// The MV columns one rewritten row carries, in MV schema order.
+fn lookup_chain_row_columns(view: &LookupChainView) -> Vec<String> {
+    let mut columns = view
+        .output_columns
+        .iter()
+        .map(|column| column.name.clone())
+        .collect::<Vec<_>>();
+    for step in &view.steps {
+        if !step.unique {
+            columns.push(lookup_chain_step_id_column(step.source));
+        }
+    }
+    columns
+}
+
+/// The columns that identify one MV row: the base key plus the identity
+/// column of every 1:N step.
+fn lookup_chain_identity_columns(view: &LookupChainView) -> Vec<String> {
+    let mut columns = view.sources[0].0.primary_keys.clone();
+    for step in &view.steps {
+        if !step.unique {
+            columns.push(lookup_chain_step_id_column(step.source));
+        }
+    }
+    columns
+}
+
+/// The columns of earlier sources that later steps join on.  A computed key
+/// is materialized on the frame of its source, so the columns its expression
+/// reads are carried too.
+fn lookup_chain_referenced(
+    view: &LookupChainView,
+    source: usize,
+    context: &SessionContext,
+) -> Result<Vec<String>> {
+    let mut columns = Vec::new();
+    for step in &view.steps {
+        if step.source <= source {
+            continue;
+        }
+        for (index, key) in step.keys.iter().enumerate() {
+            if step_key_source(step, index) != source {
+                continue;
+            }
+            if let Some(expr) = step
+                .key_exprs
+                .left
+                .get(index)
+                .filter(|expr| !expr.is_empty())
+            {
+                let (table, _) = &view.sources[source];
+                for column in filter_columns(context, &table.schema, expr)? {
+                    if !columns.contains(&column) {
+                        columns.push(column);
+                    }
+                }
+            }
+            if !columns.contains(key) {
+                columns.push(key.clone());
+            }
+        }
+    }
+    Ok(columns)
+}
+
+/// Replay the first `steps` chain steps over `frame` (the base rows).
+fn lookup_chain_replay(
+    view: &LookupChainView,
+    frames: &[DataFrame],
+    steps: usize,
+    mut frame: DataFrame,
+) -> Result<DataFrame> {
+    // The base frame's rows keep their own column names, so a computed key
+    // over the base is materialized here.
+    let context = refresh_session();
+    for step in &view.steps {
+        for (key_index, expr) in step.key_exprs.left.iter().enumerate() {
+            if expr.is_empty() || step_key_source(step, key_index) != 0 {
+                continue;
+            }
+            let name = &step.keys[key_index];
+            let expression = context.state().create_logical_expr(expr, frame.schema())?;
+            frame = frame.with_column(name, expression)?;
+        }
+    }
+    for (index, step) in view.steps.iter().enumerate().take(steps) {
+        let (_, step_frame) = lookup_chain_step_frame(view, index, &frames[index + 1])?;
+        let right_keys = step
+            .right_keys
+            .iter()
+            .map(|key| lookup_chain_alias(index + 1, key))
+            .collect::<Vec<_>>();
+        let left_keys = step
+            .keys
+            .iter()
+            .enumerate()
+            .map(|(key, column)| chain_column_name(step_key_source(step, key), column))
+            .collect::<Vec<_>>();
+        let left_refs = left_keys.iter().map(String::as_str).collect::<Vec<_>>();
+        let right_refs = right_keys.iter().map(String::as_str).collect::<Vec<_>>();
+        let join_type = if step.left {
+            JoinType::Left
+        } else {
+            JoinType::Inner
+        };
+        frame = if view.null_safe {
+            // A NULL join key matches another NULL join key.
+            let plan = LogicalPlanBuilder::new(frame.logical_plan().clone())
+                .join_detailed(
+                    step_frame.logical_plan().clone(),
+                    join_type,
+                    (left_keys.clone(), right_keys.clone()),
+                    None,
+                    NullEquality::NullEqualsNull,
+                )?
+                .build()?;
+            DataFrame::new(context.state(), plan)
+        } else {
+            frame.join(step_frame, join_type, &left_refs, &right_refs, None)?
+        };
+    }
+    Ok(frame)
+}
+
+/// The payload columns a source contributes to the view.
+fn lookup_chain_payload(view: &LookupChainView, source: usize) -> Vec<String> {
+    let mut columns = Vec::new();
+    for column in &view.output_columns {
+        if column.source == source && !columns.contains(&column.column) {
+            columns.push(column.column.clone());
+        }
+    }
+    columns
+}
+
+/// Whether every unique step is keyed by the base primary key and reads its
+/// key from the base.  Such a chain maps each changed dimension row to exactly
+/// one base key, so dimension windows can use the keyed lookup path.
+fn dimension_keys_are_base_keys(view: &LookupChainView) -> bool {
+    let base_keys = &view.sources[0].0.primary_keys;
+    view.steps.iter().all(|step| {
+        step.unique
+            && step.keys == *base_keys
+            && step.key_sources.iter().all(|source| *source == 0)
+    })
+}
+
+/// Validate that a lookup chain can be maintained.
+fn validate_lookup_chain_view(view: &LookupChainView) -> Result<()> {
+    if view.steps.is_empty() || view.sources.len() != view.steps.len() + 1 {
+        return Err(report!(
+            "lookup chain view {} needs a base and one step per source",
+            view.view_id
+        ));
+    }
+    let (base, _) = &view.sources[0];
+    if base.primary_keys.is_empty() {
+        return Err(report!(
+            "lookup chain view {} needs a keyed base",
+            view.view_id
+        ));
+    }
+    for key in &base.primary_keys {
+        let field = base.schema.field_with_name(key).map_err(|_| {
+            report!(
+                "lookup chain view {}: base key {key} is not in the base",
+                view.view_id
+            )
+        })?;
+        if field.is_nullable() {
+            return Err(report!(
+                "lookup chain view {}: base key {key} must be non-nullable",
+                view.view_id
+            ));
+        }
+        if !view.output_columns.iter().any(|column| {
+            column.source == 0 && &column.column == key && &column.name == key
+        }) {
+            return Err(report!(
+                "lookup chain view {}: output must keep the base key {key}",
+                view.view_id
+            ));
+        }
+    }
+    for (index, step) in view.steps.iter().enumerate() {
+        if step.source != index + 1 {
+            return Err(report!(
+                "lookup chain view {}: step {} joins source {}",
+                view.view_id,
+                index,
+                step.source
+            ));
+        }
+        let (table, _) = &view.sources[index + 1];
+        if table.primary_keys.is_empty() {
+            return Err(report!(
+                "lookup chain view {}: step source {} needs a primary key",
+                view.view_id,
+                table.table_name
+            ));
+        }
+        if step.keys.is_empty() || step.keys.len() != step.right_keys.len() {
+            return Err(report!(
+                "lookup chain view {}: step {} needs one key per column",
+                view.view_id,
+                index
+            ));
+        }
+        let mut pks = table.primary_keys.clone();
+        pks.sort();
+        pks.dedup();
+        let mut keys = step.right_keys.clone();
+        keys.sort();
+        keys.dedup();
+        // `unique` drives the MV schema and the merge key, so it must agree
+        // with the declared keys instead of silently producing duplicate
+        // logical rows.
+        if step.unique != (pks == keys) {
+            return Err(report!(
+                "lookup chain view {}: step source {} unique flag does not match its keys",
+                view.view_id,
+                table.table_name
+            ));
+        }
+        for (key_index, key) in step.keys.iter().enumerate() {
+            let source = step_key_source(step, key_index);
+            if source > index {
+                return Err(report!(
+                    "lookup chain view {}: join key {key} must come from an earlier source",
+                    view.view_id
+                ));
+            }
+            // A computed key is materialized by the replay, so it only has
+            // to resolve against its source; a plain key must be a source
+            // column.
+            let (left_table, _) = &view.sources[source];
+            let left_type = match step
+                .key_exprs
+                .left
+                .get(key_index)
+                .filter(|expr| !expr.is_empty())
+            {
+                Some(expr) => expression_type(&left_table.schema, expr)?.0,
+                None => left_table
+                    .schema
+                    .field_with_name(key)
+                    .map_err(|_| {
+                        report!(
+                            "lookup chain view {}: join key {key} is not in {}",
+                            view.view_id,
+                            left_table.table_name
+                        )
+                    })?
+                    .data_type()
+                    .clone(),
+            };
+            let right_key = &step.right_keys[key_index];
+            let right_type = match step
+                .key_exprs
+                .right
+                .get(key_index)
+                .filter(|expr| !expr.is_empty())
+            {
+                Some(expr) => expression_type(&table.schema, expr)?.0,
+                None => table
+                    .schema
+                    .field_with_name(right_key)
+                    .map_err(|_| {
+                        report!(
+                            "lookup chain view {}: join key {right_key} is not in {}",
+                            view.view_id,
+                            table.table_name
+                        )
+                    })?
+                    .data_type()
+                    .clone(),
+            };
+            if left_type != right_type {
+                return Err(report!(
+                    "lookup chain view {}: join key {right_key} has different types",
+                    view.view_id
+                ));
+            }
+        }
+    }
+    let context = refresh_session();
+    for (table, filter) in &view.sources {
+        if let Some(filter) = filter {
+            parse_filter(&context, &table.schema, filter)?;
+        }
+    }
+    // The MV merge key must identify a logical row: it has to contain the
+    // base key and the identity column of every 1:N step (extra columns are
+    // the user's responsibility, like the MV primary key check of A1).
+    let declared = view
+        .mv
+        .primary_keys
+        .iter()
+        .collect::<std::collections::HashSet<_>>();
+    for column in lookup_chain_identity_columns(view) {
+        if !declared.contains(&column) {
+            return Err(report!(
+                "lookup chain view {}: MV primary key must contain {column}",
+                view.view_id
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// The MV range partitions an affected base key can live in.
+///
+/// Sound when the MV's partition columns are base partition columns and the
+/// base primary keys carry all of them (a key cannot move between partitions):
+/// every affected MV row then lies in one of the delta's partitions, so the
+/// unchanged MV partitions can be skipped.
+fn lookup_chain_mv_partitions(
+    view: &LookupChainView,
+    window: &SourceWindow,
+) -> Option<Vec<(String, Vec<String>)>> {
+    let mv_partitions = &view.mv.range_partition_columns;
+    if mv_partitions.is_empty() {
+        return None;
+    }
+    let (base, _) = view.sources.first()?;
+    if !mv_partitions
+        .iter()
+        .all(|column| base.range_partition_columns.contains(column))
+        || !base
+            .range_partition_columns
+            .iter()
+            .all(|column| base.primary_keys.contains(column))
+        || !mv_partitions
+            .iter()
+            .all(|column| view.mv.primary_keys.contains(column))
+    {
+        return None;
+    }
+    let mut restriction = mv_partitions
+        .iter()
+        .map(|column| (column.clone(), Vec::new()))
+        .collect::<Vec<_>>();
+    for files in &window.added_files {
+        let values = crate::table::parse_partition_values(
+            &files.partition_desc,
+            &base.range_partition_columns,
+        )?;
+        for (column, allowed) in restriction.iter_mut() {
+            let index = base
+                .range_partition_columns
+                .iter()
+                .position(|candidate| candidate == column)?;
+            let value = values.get(index)?.clone();
+            if !allowed.contains(&value) {
+                allowed.push(value);
+            }
+        }
+    }
+    restriction
+        .iter()
+        .all(|(_, allowed)| !allowed.is_empty())
+        .then_some(restriction)
+}
+
+/// The columns of one source a refresh must read.
+fn lookup_chain_source_columns(
+    view: &LookupChainView,
+    index: usize,
+    context: &SessionContext,
+) -> Result<Vec<String>> {
+    let (table, filter) = &view.sources[index];
+    let mut columns = lookup_chain_payload(view, index);
+    for column in lookup_chain_referenced(view, index, context)? {
+        if !columns.contains(&column) {
+            columns.push(column);
+        }
+    }
+    // A computed key is materialized on its own source's frame, so the
+    // columns its expression reads are carried instead of the hidden name.
+    for (step_index, step) in view.steps.iter().enumerate() {
+        for (key_index, expr) in step.key_exprs.left.iter().enumerate() {
+            if expr.is_empty() || step_key_source(step, key_index) != index {
+                continue;
+            }
+            for column in filter_columns(context, &table.schema, expr)? {
+                if !columns.contains(&column) {
+                    columns.push(column);
+                }
+            }
+        }
+        if step_index + 1 == index {
+            for expr in step.key_exprs.right.iter().filter(|expr| !expr.is_empty()) {
+                for column in filter_columns(context, &table.schema, expr)? {
+                    if !columns.contains(&column) {
+                        columns.push(column);
+                    }
+                }
+            }
+        }
+    }
+    let computed = |exprs: &[String], key_index: usize| {
+        exprs.get(key_index).is_some_and(|expr| !expr.is_empty())
+    };
+    if index == 0 {
+        for key in &table.primary_keys {
+            if !columns.contains(key) {
+                columns.push(key.clone());
+            }
+        }
+        for step in &view.steps {
+            for (key_index, key) in step.keys.iter().enumerate() {
+                if computed(&step.key_exprs.left, key_index)
+                    || step_key_source(step, key_index) != 0
+                {
+                    continue;
+                }
+                if !columns.contains(key) {
+                    columns.push(key.clone());
+                }
+            }
+        }
+    } else {
+        let step = &view.steps[index - 1];
+        for (key_index, key) in step.right_keys.iter().enumerate() {
+            if computed(&step.key_exprs.right, key_index) {
+                continue;
+            }
+            if !columns.contains(key) {
+                columns.push(key.clone());
+            }
+        }
+        if !step.unique {
+            for key in &table.primary_keys {
+                if !columns.contains(key) {
+                    columns.push(key.clone());
+                }
+            }
+        }
+    }
+    if let Some(filter) = filter {
+        for column in filter_columns(context, &table.schema, filter)? {
+            if !columns.contains(&column) {
+                columns.push(column);
+            }
+        }
+    }
+    if let Some(change) = change_column(table)
+        && !columns.iter().any(|column| column == change)
+    {
+        columns.push(change.to_string());
+    }
+    Ok(columns)
+}
+
+/// The replay frame of one step: the key and payload columns aliased so the
+/// chain joins cannot collide.
+fn lookup_chain_step_frame(
+    view: &LookupChainView,
+    index: usize,
+    now: &DataFrame,
+) -> Result<(String, DataFrame)> {
+    let step = &view.steps[index];
+    // The step's own computed keys and the computed keys later steps read
+    // from it are materialized before the aliasing projection: their
+    // expressions use the source's own columns.
+    let context = refresh_session();
+    let mut now = now.clone();
+    for (key_index, expr) in step.key_exprs.right.iter().enumerate() {
+        if expr.is_empty() {
+            continue;
+        }
+        let name = &step.right_keys[key_index];
+        let expression = context.state().create_logical_expr(expr, now.schema())?;
+        now = now.with_column(name, expression)?;
+    }
+    for later in view.steps.iter().skip(index + 1) {
+        for (key_index, expr) in later.key_exprs.left.iter().enumerate() {
+            if expr.is_empty() || step_key_source(later, key_index) != index + 1 {
+                continue;
+            }
+            let name = &later.keys[key_index];
+            let expression = context.state().create_logical_expr(expr, now.schema())?;
+            now = now.with_column(name, expression)?;
+        }
+    }
+    let mut select = Vec::new();
+    for key in &step.right_keys {
+        select.push(col(key.as_str()).alias(lookup_chain_alias(index + 1, key)));
+    }
+    let mut columns = lookup_chain_payload(view, index + 1);
+    for column in lookup_chain_referenced(view, index + 1, &refresh_session())? {
+        if !columns.contains(&column) {
+            columns.push(column);
+        }
+    }
+    if !step.unique {
+        for key in &view.sources[index + 1].0.primary_keys {
+            if !columns.contains(key) {
+                columns.push(key.clone());
+            }
+        }
+    }
+    for column in columns {
+        if !step.right_keys.contains(&column) {
+            select
+                .push(col(column.as_str()).alias(lookup_chain_alias(index + 1, &column)));
+        }
+    }
+    let mut keys = step
+        .right_keys
+        .iter()
+        .map(|key| lookup_chain_alias(index + 1, key))
+        .collect::<Vec<_>>();
+    keys.sort();
+    Ok((keys.join(","), now.clone().select(select)?))
+}
+
+/// The dimension frames of a chain, built from streaming providers.
+fn lookup_chain_dim_frames(
+    context: &SessionContext,
+    view: &LookupChainView,
+    client: &MetaDataClient,
+) -> Result<Vec<DataFrame>> {
+    let mut frames = Vec::new();
+    for (index, (table, filter)) in view.sources.iter().enumerate().skip(1) {
+        let columns = lookup_chain_source_columns(view, index, context)?;
+        let projection = project_schema(&table.schema, &columns)?;
+        let provider = crate::IvmTableProvider::current(table.clone(), client.clone());
+        let frame = project_frame(context.read_table(Arc::new(provider))?, &columns)?;
+        let frame = filter_deletes(frame, change_column(table))?;
+        frames.push(apply_side_filter(
+            context,
+            frame,
+            &projection,
+            filter.as_deref(),
+        )?);
+    }
+    Ok(frames)
+}
+
+/// Whether every step is a unique lookup whose left keys all come from the
+/// base.  That is the shape where a per-step base join-key index can map a
+/// changed dimension row back to affected base rows without scanning the base.
+fn lookup_chain_indexable(view: &LookupChainView) -> bool {
+    !view.steps.is_empty()
+        && view.steps.iter().all(|step| {
+            step.unique
+                && !step.keys.is_empty()
+                && step.key_sources.iter().all(|source| *source == 0)
+        })
+}
+
+impl IvmRuntime {
+    /// Persist a lookup chain view spec (idempotent).
+    pub async fn register_lookup_chain_view(&self, view: &LookupChainView) -> Result<()> {
+        self.register_state_tables(&view.view_id, &[(StateRole::Mv, &view.mv)])
+            .await?;
+        let spec = serde_json::to_value(view.to_spec())?;
+        self.metadata
+            .upsert_view(&view.view_id, &spec, view.refresh_interval_ms)
+            .await
+    }
+
+    /// Project a base source down to the columns the index needs.  The index
+    /// stores the base primary keys, the step's plain keys (or columns used by
+    /// computed keys), and partition/bucket columns needed by the reader.  It
+    /// deliberately does not carry the full fact payload.
+    fn lookup_chain_index_source(
+        &self,
+        base: &IvmTable,
+        step: &LookupChainStep,
+    ) -> Result<IvmTable> {
+        let context = refresh_session();
+        let mut columns = base.primary_keys.clone();
+        let push = |column: String, columns: &mut Vec<String>| {
+            if !columns.contains(&column) {
+                columns.push(column);
+            }
+        };
+        for key in &step.keys {
+            if base.schema.field_with_name(key).is_ok() {
+                push(key.clone(), &mut columns);
+            }
+        }
+        for expression in step
+            .key_exprs
+            .left
+            .iter()
+            .filter(|expression| !expression.is_empty())
+        {
+            for column in filter_columns(&context, &base.schema, expression)? {
+                push(column, &mut columns);
+            }
+        }
+        for column in base
+            .range_partition_columns
+            .iter()
+            .chain(&base.bucket_columns)
+        {
+            if base.schema.field_with_name(column).is_ok() {
+                push(column.clone(), &mut columns);
+            }
+        }
+        let mut source = base.clone();
+        source.schema = project_schema(&base.schema, &columns)?;
+        Ok(source)
+    }
+
+    /// Drop the per-step indexes before a full rebuild.  A rebuild reads the
+    /// current source state; a stale index would otherwise fan a later
+    /// dimension change out to the wrong base keys.
+    async fn drop_lookup_chain_indexes(&self, view: &LookupChainView) -> Result<()> {
+        if !lookup_chain_indexable(view) {
+            return Ok(());
+        }
+        for step in &view.steps {
+            let role = StateRole::LookupChainIndex(step.source as u32);
+            let Some(info) = self.metadata().get_state(&view.view_id, role).await? else {
+                continue;
+            };
+            self.metadata()
+                .unregister_state(&view.view_id, role)
+                .await?;
+            let _ = self
+                .client()
+                .drop_table(&info.table_name, &info.namespace)
+                .await;
+        }
+        Ok(())
+    }
+
+    /// Keep the per-step base join-key indexes current.
+    ///
+    /// Only an index that has already been created is maintained on base-only
+    /// windows.  A dimension window creates the index lazily from the current
+    /// base, so the first dimension change pays the one full base index build;
+    /// later changes use the keyed lookup.
+    async fn refresh_lookup_chain_indexes(
+        &self,
+        view: &LookupChainView,
+        windows: &[SourceWindow],
+        changed: &[bool],
+        create: bool,
+    ) -> Result<(Vec<Option<IvmTable>>, Vec<String>)> {
+        let mut indexes = vec![None; view.steps.len()];
+        let mut commit_ids = Vec::new();
+        if !lookup_chain_indexable(view) {
+            return Ok((indexes, commit_ids));
+        }
+        let base = &view.sources[0].0;
+        for (index, step) in view.steps.iter().enumerate() {
+            let role = StateRole::LookupChainIndex(step.source as u32);
+            let index_source = self.lookup_chain_index_source(base, step)?;
+            let existing = self.metadata().get_state(&view.view_id, role).await?;
+            let state = match existing {
+                Some(info) => {
+                    let state = self.open_table_by_id(&info.table_id).await?;
+                    if state.current_files(&self.client).await?.is_empty() {
+                        commit_ids.extend(
+                            self.sync_join_side_state(
+                                &index_source,
+                                &state,
+                                &step.keys,
+                                &step.key_exprs.left,
+                            )
+                            .await?,
+                        );
+                    } else if changed[0] {
+                        commit_ids.extend(
+                            self.apply_join_side_delta(
+                                &index_source,
+                                &state,
+                                &windows[0],
+                                &step.keys,
+                                &step.key_exprs.left,
+                            )
+                            .await?,
+                        );
+                    }
+                    Some(state)
+                }
+                None if create && changed[step.source] => {
+                    let state = self
+                        .ensure_join_side_state_forced(
+                            &view.view_id,
+                            &index_source,
+                            &step.keys,
+                            role,
+                        )
+                        .await?
+                        .ok_or_else(|| {
+                            report!(
+                                "lookup chain index for step {} was not created",
+                                step.source
+                            )
+                        })?;
+                    commit_ids.extend(
+                        self.sync_join_side_state(
+                            &index_source,
+                            &state,
+                            &step.keys,
+                            &step.key_exprs.left,
+                        )
+                        .await?,
+                    );
+                    Some(state)
+                }
+                None => None,
+            };
+            indexes[index] = state;
+        }
+        Ok((indexes, commit_ids))
+    }
+
+    /// Look up the base primary keys whose step key matches the changed
+    /// dimension keys.  The index is the existing join-side state layout,
+    /// keyed by the encoded join key plus the base primary keys.
+    async fn lookup_chain_index_base_keys(
+        &self,
+        context: &SessionContext,
+        index: &IvmTable,
+        base: &IvmTable,
+        changed_keys: DataFrame,
+        step: &LookupChainStep,
+    ) -> Result<DataFrame> {
+        let key_frame = changed_keys.select(
+            step.right_keys
+                .iter()
+                .zip(&step.keys)
+                .map(|(right, left)| col(right.as_str()).alias(left.as_str()))
+                .collect::<Vec<_>>(),
+        )?;
+        let encoder = std::sync::Arc::new(JoinKeyEncoder::new_with_schema(
+            base,
+            key_frame.schema().as_arrow(),
+            &step.keys,
+        )?);
+        let mut stream = key_frame.execute_stream().await?;
+        let mut batches = Vec::new();
+        while let Some(batch) = stream.next().await {
+            let batch = batch?;
+            if batch.num_rows() > 0 {
+                batches.push(encoder.encode_key_only(&batch)?);
+            }
+        }
+        if batches.is_empty() {
+            let schema = project_schema(&base.schema, &base.primary_keys)?;
+            return dataframe(context, Vec::new(), &schema);
+        }
+        let contribution = context.read_batches(batches)?;
+        let rows = self
+            .lookup_source_by_join_keys(
+                context,
+                index,
+                contribution,
+                &[IVM_JOIN_KEY_COLUMN.to_string()],
+                &[IVM_JOIN_KEY_COLUMN.to_string()],
+                true,
+            )
+            .await?;
+        let rows = rows
+            .select(
+                base.primary_keys
+                    .iter()
+                    .map(|key| col(key.as_str()))
+                    .collect::<Vec<_>>(),
+            )?
+            .distinct()?;
+        Ok(rows)
+    }
+
+    /// Refresh a lookup chain: the affected base rows are replayed through
+    /// the chain.
+    pub async fn refresh_lookup_chain(
+        &self,
+        view: &LookupChainView,
+    ) -> Result<Option<i64>> {
+        self.register_lookup_chain_view(view).await?;
+        validate_lookup_chain_view(view)?;
+
+        let mut windows = Vec::with_capacity(view.sources.len());
+        for (table, _) in &view.sources {
+            windows.push(self.collect_source_window(&view.view_id, table).await?);
+        }
+        let changed = windows
+            .iter()
+            .map(|window| !window.added_files.is_empty())
+            .collect::<Vec<_>>();
+        if !changed.iter().any(|changed| *changed) {
+            return Ok(None);
+        }
+        // A changed dimension can fan out to an unbounded number of base
+        // rows.  A unique chain whose dimension keys are the base keys maps
+        // each changed dimension row to exactly one base row.  A unique chain
+        // whose left keys all come from the base uses a per-step join-key
+        // index to find the affected base keys.  Other shapes still rebuild.
+        let base_keyed_chain = dimension_keys_are_base_keys(view);
+        let indexable = lookup_chain_indexable(view);
+        if changed[1..].iter().any(|changed| *changed) && !base_keyed_chain && !indexable
+        {
+            return self.rebuild_lookup_chain(view).await.map(Some);
+        }
+        let base_only = changed[0] && !changed[1..].iter().any(|changed| *changed);
+        let unique_steps = view.steps.iter().all(|step| step.unique);
+        let mv_empty = view.mv.current_files(&self.client).await?.is_empty();
+        // The first load of an empty MV reads the whole sources; keep the
+        // full-frame path there.  Later windows may legitimately change all
+        // three sources and still benefit from the keyed path.
+        let full_snapshot = mv_empty && changed[0];
+        // Cost-based fallback: at a high enough change ratio the bucket-parallel
+        // rebuild is cheaper than replaying the incremental delta.  The live
+        // row estimate is maintained on bootstrap/rebuild/refreshes below.
+        if base_only
+            && unique_steps
+            && !mv_empty
+            && let Some(base_rows) = self.known_view_rows(&view.view_id)
+            && base_rows > 0
+        {
+            let base = &view.sources[0].0;
+            let context = refresh_session();
+            let delta =
+                self.groups_table_frame(&context, base, windows[0].added_files.clone())?;
+            let delta = project_frame(delta, &base.primary_keys)?;
+            let delta_rows = count_frame_rows(delta).await?;
+            if delta_rows * 100 >= base_rows * rebuild_ratio_percent(&view.mv) {
+                return self.rebuild_lookup_chain(view).await.map(Some);
+            }
+        }
+        let mut identity = Vec::new();
+        for window in &windows {
+            identity.extend(window.identity.iter().cloned());
+        }
+        let record = match self
+            .begin_window(&view.view_id, &identity, &view.mv)
+            .await?
+        {
+            WindowStart::AlreadyApplied(epoch) => {
+                for window in windows {
+                    self.advance_cursors(&view.view_id, window.cursors).await?;
+                }
+                return Ok(Some(epoch));
+            }
+            WindowStart::Apply(record) => record,
+        };
+        let epoch = record.epoch;
+        let mut commit_ids = Vec::new();
+        let (indexes, index_commit_ids) = self
+            .refresh_lookup_chain_indexes(view, &windows, &changed, !mv_empty)
+            .await?;
+        // Bucket-parallel fast path: with a unique-step chain the MV is keyed
+        // by the base key, so a key and all of its rows live in one hash
+        // bucket.  Split the fact delta by the file's bucket suffix and
+        // refresh each bucket independently; dimensions are broadcast.
+        let bucket_parallel = base_only
+            && view.steps.iter().all(|step| step.unique)
+            && view
+                .sources
+                .iter()
+                .all(|(table, _)| table.range_partition_columns.is_empty())
+            && view.sources[0].0.hash_bucket_num == view.mv.hash_bucket_num
+            && view.sources[0].0.primary_keys == view.mv.primary_keys
+            && view.sources[0].0.bucket_columns.is_empty()
+            && view.mv.bucket_columns.is_empty()
+            && view.sources[0]
+                .0
+                .hash_bucket_num
+                .parse::<u32>()
+                .unwrap_or(1)
+                > 1;
+        if bucket_parallel
+            && let Some(mut outcome) = self
+                .refresh_lookup_chain_buckets(view, &windows, epoch)
+                .await?
+        {
+            outcome.commit_ids.extend(index_commit_ids.clone());
+            if unique_steps {
+                if mv_empty {
+                    self.set_view_rows(&view.view_id, outcome.inserts);
+                } else {
+                    self.adjust_view_rows(
+                        &view.view_id,
+                        outcome.inserts,
+                        outcome.deletes,
+                    );
+                }
+            }
+            let mv_versions = output_partition_versions(&self.client, &view.mv).await?;
+            self.mark_epoch_committed(&record, &mv_versions, &outcome.commit_ids)
+                .await?;
+            for window in windows {
+                self.advance_cursors(&view.view_id, window.cursors).await?;
+            }
+            return Ok(Some(epoch));
+        }
+
+        let context = refresh_session();
+        let mut frames = Vec::with_capacity(view.sources.len());
+        for (index, (table, filter)) in view.sources.iter().enumerate() {
+            let columns = lookup_chain_source_columns(view, index, &context)?;
+            let projection = project_schema(&table.schema, &columns)?;
+            let delta = project_frame(
+                self.groups_table_frame(
+                    &context,
+                    table,
+                    windows[index].added_files.clone(),
+                )?,
+                &columns,
+            )?;
+            let before = if changed[index] && !(base_only && index == 0) {
+                project_frame(
+                    self.before_window_table_frame(
+                        &context,
+                        table,
+                        &windows[index].before_versions,
+                    )
+                    .await?,
+                    &columns,
+                )?
+            } else {
+                dataframe(&context, Vec::new(), &projection)?
+            };
+            // The base table is the large side (the fact table): stream it
+            // through the DataFusion provider instead of materializing it in
+            // the driver.  The dimensions are small (~10k rows) and stay
+            // materialized.
+            let now = if base_only && index == 0 {
+                apply_side_filter(
+                    &context,
+                    filter_deletes(delta.clone(), change_column(table))?,
+                    &projection,
+                    filter.as_deref(),
+                )?
+            } else {
+                apply_side_filter(
+                    &context,
+                    project_frame(self.current_table_frame(&context, table)?, &columns)?,
+                    &projection,
+                    filter.as_deref(),
+                )?
+            };
+            frames.push((delta, before, now));
+        }
+        let (base, _) = &view.sources[0];
+        let base_key_names = base
+            .primary_keys
+            .iter()
+            .map(String::as_str)
+            .collect::<Vec<_>>();
+        let base_key_exprs = base
+            .primary_keys
+            .iter()
+            .map(|column| col(column.as_str()))
+            .collect::<Vec<_>>();
+
+        let mv = if base_only {
+            match lookup_chain_mv_partitions(view, &windows[0]) {
+                Some(restriction) => {
+                    self.current_table_frame_filtered_partitions(
+                        &context,
+                        &view.mv,
+                        Vec::new(),
+                        &restriction,
+                    )
+                    .await?
+                }
+                None => self.current_table_frame(&context, &view.mv)?,
+            }
+        } else {
+            self.current_table_frame(&context, &view.mv)?
+        };
+
+        let mut now_frames = frames
+            .iter()
+            .map(|(_, _, now)| now.clone())
+            .collect::<Vec<_>>();
+
+        let mut indexed_fanout = false;
+        let affected = if base_only {
+            // Every delta row is an affected base key; no base scan needed.
+            frames[0]
+                .0
+                .clone()
+                .select(base_key_exprs.clone())?
+                .distinct()?
+        } else {
+            // The base rows the window can change: the base delta keys plus, for
+            // every changed step source, the base rows matching the changed keys.
+            let mut affected = frames[0]
+                .0
+                .clone()
+                .select(base_key_exprs.clone())?
+                .distinct()?;
+            let mut every_base_row = false;
+            for (index, step) in view.steps.iter().enumerate() {
+                if !changed[index + 1] {
+                    continue;
+                }
+                // A change in the base or in an earlier step can move any key, so
+                // every base row is re-evaluated.  The indexed star path below
+                // handles base changes without that fallback.
+                if !base_keyed_chain
+                    && !indexable
+                    && (0..=index).any(|source| changed[source])
+                {
+                    every_base_row = true;
+                    break;
+                }
+                let (table, _) = &view.sources[index + 1];
+                let (delta, before, _) = &frames[index + 1];
+                let delta_schema = delta.schema().clone();
+                let right_key_exprs = step
+                    .right_keys
+                    .iter()
+                    .enumerate()
+                    .map(|(key_index, key)| {
+                        Ok(
+                            match step
+                                .key_exprs
+                                .right
+                                .get(key_index)
+                                .filter(|expr| !expr.is_empty())
+                            {
+                                Some(expr) => context
+                                    .state()
+                                    .create_logical_expr(expr, &delta_schema)?
+                                    .alias(key.as_str()),
+                                None => col(key.as_str()),
+                            },
+                        )
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                let changed_keys = if table.primary_keys.is_empty() {
+                    delta.clone().select(right_key_exprs)?
+                } else {
+                    let pk_names = table
+                        .primary_keys
+                        .iter()
+                        .map(String::as_str)
+                        .collect::<Vec<_>>();
+                    let changed_pks = delta
+                        .clone()
+                        .select(
+                            table
+                                .primary_keys
+                                .iter()
+                                .map(|key| col(key.as_str()))
+                                .collect::<Vec<_>>(),
+                        )?
+                        .distinct()?;
+                    before
+                        .clone()
+                        .join(
+                            changed_pks,
+                            JoinType::LeftSemi,
+                            &pk_names,
+                            &pk_names,
+                            None,
+                        )?
+                        .union(delta.clone())?
+                        .distinct()?
+                        .select(right_key_exprs)?
+                }
+                .distinct()?;
+                if let Some(index_table) =
+                    indexes.get(index).and_then(|index| index.as_ref())
+                {
+                    affected = affected
+                        .union(
+                            self.lookup_chain_index_base_keys(
+                                &context,
+                                index_table,
+                                base,
+                                changed_keys.clone(),
+                                step,
+                            )
+                            .await?,
+                        )?
+                        .distinct()?;
+                    indexed_fanout = true;
+                    continue;
+                }
+                indexed_fanout = false;
+                if base_keyed_chain {
+                    // The dimension is keyed by the base key.  A changed
+                    // dimension row therefore contributes exactly that base
+                    // key; no base-prefix replay is needed.
+                    let aliases = step
+                        .right_keys
+                        .iter()
+                        .zip(&step.keys)
+                        .map(|(right, base)| col(right.as_str()).alias(base.as_str()))
+                        .collect::<Vec<_>>();
+                    affected =
+                        affected.union(changed_keys.select(aliases)?)?.distinct()?;
+                    continue;
+                }
+                // Match the changed keys against the prefix columns they refer
+                // to; the prefix is replayed over the current (unchanged) states.
+                let matching = (0..step.keys.len())
+                    .map(|key| format!("__ivm_changed_{key}"))
+                    .collect::<Vec<_>>();
+                let mut prefix_select = base_key_exprs.clone();
+                for (key, name) in step.keys.iter().zip(&matching) {
+                    let position = step
+                        .keys
+                        .iter()
+                        .position(|column| column == key)
+                        .unwrap_or(0);
+                    let source = step_key_source(step, position);
+                    prefix_select.push(
+                        col(chain_column_name(source, key).as_str()).alias(name.as_str()),
+                    );
+                }
+                let prefix =
+                    lookup_chain_replay(view, &now_frames, index, frames[0].2.clone())?
+                        .select(prefix_select)?;
+                let changed_renamed = changed_keys.select(
+                    step.right_keys
+                        .iter()
+                        .zip(&matching)
+                        .map(|(key, name)| col(key.as_str()).alias(name.as_str()))
+                        .collect::<Vec<_>>(),
+                )?;
+                let matched = prefix
+                    .join(
+                        changed_renamed,
+                        JoinType::LeftSemi,
+                        &matching.iter().map(String::as_str).collect::<Vec<_>>(),
+                        &matching.iter().map(String::as_str).collect::<Vec<_>>(),
+                        None,
+                    )?
+                    .select(base_key_exprs.clone())?
+                    .distinct()?;
+                affected = affected.union(matched)?.distinct()?;
+            }
+            if every_base_row {
+                // Every key the base or the view knows is re-evaluated; the view
+                // side keeps the keys the base no longer has.
+                let base_now_keys = frames[0]
+                    .2
+                    .clone()
+                    .select(base_key_exprs.clone())?
+                    .distinct()?;
+                let mv_keys = mv.clone().select(base_key_exprs.clone())?.distinct()?;
+                affected = affected.union(base_now_keys)?.union(mv_keys)?.distinct()?;
+            }
+            affected
+        };
+
+        // The indexed star path only needs the affected base rows.  The
+        // dimension frames stay as current-state frames; a production fact
+        // table is the large side.
+        if indexed_fanout && !base_keyed_chain && !full_snapshot {
+            let base = &view.sources[0].0;
+            let base_columns = lookup_chain_source_columns(view, 0, &context)?;
+            let base_now = self
+                .lookup_source_by_join_keys(
+                    &context,
+                    base,
+                    affected.clone(),
+                    &base.primary_keys,
+                    &base.primary_keys,
+                    true,
+                )
+                .await?;
+            frames[0].2 = project_frame(base_now, &base_columns)?;
+            now_frames = frames
+                .iter()
+                .map(|(_, _, now)| now.clone())
+                .collect::<Vec<_>>();
+        }
+
+        // A chain whose step keys are the base primary keys can fetch only
+        // the affected base and dimension rows.  This avoids scanning the
+        // fact table and the dimensions for a dimension-only window.
+        if base_keyed_chain && !full_snapshot {
+            let base = &view.sources[0].0;
+            let base_columns = lookup_chain_source_columns(view, 0, &context)?;
+            let base_now = self
+                .lookup_source_by_join_keys(
+                    &context,
+                    base,
+                    affected.clone(),
+                    &base.primary_keys,
+                    &base.primary_keys,
+                    true,
+                )
+                .await?;
+            frames[0].2 = project_frame(base_now, &base_columns)?;
+            for (index, step) in view.steps.iter().enumerate() {
+                let table = &view.sources[index + 1].0;
+                let columns = lookup_chain_source_columns(view, index + 1, &context)?;
+                let now = self
+                    .lookup_source_by_join_keys(
+                        &context,
+                        table,
+                        affected.clone(),
+                        &step.keys,
+                        &step.right_keys,
+                        true,
+                    )
+                    .await?;
+                frames[index + 1].2 = project_frame(now, &columns)?;
+            }
+            now_frames = frames
+                .iter()
+                .map(|(_, _, now)| now.clone())
+                .collect::<Vec<_>>();
+        }
+
+        // Replay the chain over the current states for the affected rows.
+        let frame = lookup_chain_replay(
+            view,
+            &now_frames,
+            view.steps.len(),
+            frames[0].2.clone().join(
+                affected.clone(),
+                JoinType::LeftSemi,
+                &base_key_names,
+                &base_key_names,
+                None,
+            )?,
+        )?;
+        let identity_columns = lookup_chain_identity_columns(view);
+        let identity_names = identity_columns
+            .iter()
+            .map(String::as_str)
+            .collect::<Vec<_>>();
+        let identity_exprs = identity_columns
+            .iter()
+            .map(|column| col(column.as_str()))
+            .collect::<Vec<_>>();
+        let mv_epoch_keys = mv
+            .clone()
+            .filter(col(IVM_EPOCH_COLUMN).eq(lit(epoch)))?
+            .select(identity_exprs)?
+            .distinct()?;
+        let inserts = frame
+            .select(lookup_chain_row_exprs(view)?)?
+            .join(
+                mv_epoch_keys,
+                JoinType::LeftAnti,
+                &identity_names,
+                &identity_names,
+                None,
+            )?
+            .with_column(IVM_ROW_KINDS_COLUMN, lit("insert"))?
+            .with_column(IVM_EPOCH_COLUMN, lit(epoch))?;
+        let deletes = mv
+            .join(
+                affected,
+                JoinType::LeftSemi,
+                &base_key_names,
+                &base_key_names,
+                None,
+            )?
+            .filter(col(IVM_EPOCH_COLUMN).not_eq(lit(epoch)))?
+            .select(
+                lookup_chain_row_columns(view)
+                    .iter()
+                    .map(|column| col(column.as_str()))
+                    .collect::<Vec<_>>(),
+            )?
+            .with_column(IVM_ROW_KINDS_COLUMN, lit("delete"))?
+            .with_column(IVM_EPOCH_COLUMN, lit(epoch))?;
+        let mut sort_exprs = identity_columns
+            .iter()
+            .map(|column| column_expr(column))
+            .collect::<Vec<_>>();
+        sort_exprs.push(column_expr(IVM_ROW_KINDS_COLUMN));
+        let outcome = append_dataframe(
+            &view.mv,
+            &self.client,
+            inserts.union(deletes)?.sort_by(sort_exprs)?,
+        )
+        .await?;
+        if unique_steps {
+            if mv_empty {
+                self.set_view_rows(&view.view_id, outcome.inserts);
+            } else {
+                self.adjust_view_rows(&view.view_id, outcome.inserts, outcome.deletes);
+            }
+        }
+        commit_ids.extend(outcome.commit_ids);
+        commit_ids.extend(index_commit_ids);
+
+        let mv_versions = output_partition_versions(&self.client, &view.mv).await?;
+        self.mark_epoch_committed(&record, &mv_versions, &commit_ids)
+            .await?;
+        for window in windows {
+            self.advance_cursors(&view.view_id, window.cursors).await?;
+        }
+        Ok(Some(epoch))
+    }
+
+    /// Refresh a unique-step chain bucket by bucket.
+    ///
+    /// Each hash bucket is self-contained: the fact delta files carry the
+    /// bucket in their name, the MV is keyed by the same base key, and the
+    /// dimensions are broadcast.  Returns `None` when the delta cannot be
+    /// split (unknown file names, or everything in one bucket), so the caller
+    /// can use the single-plan path.
+    async fn refresh_lookup_chain_buckets(
+        &self,
+        view: &LookupChainView,
+        windows: &[SourceWindow],
+        epoch: i64,
+    ) -> Result<Option<AppendOutcome>> {
+        let mut groups: BTreeMap<u32, Vec<String>> = BTreeMap::new();
+        for group in &windows[0].added_files {
+            for file in &group.files {
+                let Some(bucket) = crate::table::file_bucket(file) else {
+                    return Ok(None);
+                };
+                groups.entry(bucket).or_default().push(file.clone());
+            }
+        }
+        if groups.len() <= 1 {
+            return Ok(None);
+        }
+        let mut mv_by_bucket: BTreeMap<u32, Vec<String>> = BTreeMap::new();
+        for file in view.mv.current_files(&self.client).await? {
+            let Some(bucket) = crate::table::file_bucket(&file) else {
+                return Ok(None);
+            };
+            mv_by_bucket.entry(bucket).or_default().push(file);
+        }
+
+        let context = refresh_session();
+        let (base, base_filter) = &view.sources[0];
+        let base_columns = lookup_chain_source_columns(view, 0, &context)?;
+        let base_projection = project_schema(&base.schema, &base_columns)?;
+        let identity_columns = lookup_chain_identity_columns(view);
+        let identity_names = identity_columns;
+        let identity_exprs = identity_names
+            .iter()
+            .map(|column| col(column.as_str()))
+            .collect::<Vec<_>>();
+        let key_names = base.primary_keys.clone();
+        let key_exprs = key_names
+            .iter()
+            .map(|column| col(column.as_str()))
+            .collect::<Vec<_>>();
+        let row_exprs = lookup_chain_row_exprs(view)?;
+        let row_columns = lookup_chain_row_columns(view);
+        let mut sort_exprs = identity_names
+            .iter()
+            .map(|column| column_expr(column))
+            .collect::<Vec<_>>();
+        sort_exprs.push(column_expr(IVM_ROW_KINDS_COLUMN));
+
+        let tasks = groups.into_iter().map(|(bucket, files)| {
+            let view = view.clone();
+            let base = base.clone();
+            let mv_table = view.mv.clone();
+            let base_filter = base_filter.clone();
+            let base_projection = base_projection.clone();
+            let base_columns = base_columns.clone();
+            let client = self.client.clone();
+            let key_names = key_names.clone();
+            let key_exprs = key_exprs.clone();
+            let identity_names = identity_names.clone();
+            let identity_exprs = identity_exprs.clone();
+            let row_exprs = row_exprs.clone();
+            let row_columns = row_columns.clone();
+            let sort_exprs = sort_exprs.clone();
+            let mv_files = mv_by_bucket.get(&bucket).cloned().unwrap_or_default();
+            async move {
+                let context = refresh_session();
+                let provider = crate::IvmTableProvider::groups(
+                    base.clone(),
+                    client.clone(),
+                    vec![crate::table::PartitionFiles {
+                        partition_desc: lakesoul_io::constant::DEFAULT_PARTITION_DESC
+                            .to_string(),
+                        files,
+                    }],
+                );
+                let raw = project_frame(
+                    context.read_table(Arc::new(provider))?,
+                    &base_columns,
+                )?;
+                let raw = project_frame(raw, &base_columns)?;
+                let now = apply_side_filter(
+                    &context,
+                    filter_deletes(raw.clone(), change_column(&base))?,
+                    &base_projection,
+                    base_filter.as_deref(),
+                )?;
+                let affected = raw.select(key_exprs.clone())?.distinct()?;
+                let mv =
+                    context.read_table(Arc::new(crate::IvmTableProvider::groups(
+                        mv_table.clone(),
+                        client.clone(),
+                        vec![crate::table::PartitionFiles {
+                            partition_desc: lakesoul_io::constant::DEFAULT_PARTITION_DESC
+                                .to_string(),
+                            files: mv_files,
+                        }],
+                    )))?;
+                let mut now_frames = vec![now.clone()];
+                now_frames.extend(lookup_chain_dim_frames(&context, &view, &client)?);
+                let frame =
+                    lookup_chain_replay(&view, &now_frames, view.steps.len(), now)?;
+                let key_refs = key_names.iter().map(String::as_str).collect::<Vec<_>>();
+                let identity_refs = identity_names
+                    .iter()
+                    .map(String::as_str)
+                    .collect::<Vec<_>>();
+                let mv_epoch_keys = mv
+                    .clone()
+                    .filter(col(IVM_EPOCH_COLUMN).eq(lit(epoch)))?
+                    .select(identity_exprs.clone())?
+                    .distinct()?;
+                let inserts = frame
+                    .select(row_exprs.clone())?
+                    .join(
+                        mv_epoch_keys,
+                        JoinType::LeftAnti,
+                        &identity_refs,
+                        &identity_refs,
+                        None,
+                    )?
+                    .with_column(IVM_ROW_KINDS_COLUMN, lit("insert"))?
+                    .with_column(IVM_EPOCH_COLUMN, lit(epoch))?;
+                let deletes = mv
+                    .join(affected, JoinType::LeftSemi, &key_refs, &key_refs, None)?
+                    .filter(col(IVM_EPOCH_COLUMN).not_eq(lit(epoch)))?
+                    .select(
+                        row_columns
+                            .iter()
+                            .map(|column| col(column.as_str()))
+                            .collect::<Vec<_>>(),
+                    )?
+                    .with_column(IVM_ROW_KINDS_COLUMN, lit("delete"))?
+                    .with_column(IVM_EPOCH_COLUMN, lit(epoch))?;
+                let written = write_dataframe(
+                    &mv_table,
+                    inserts.union(deletes)?.sort_by(sort_exprs)?,
+                )
+                .await?;
+                Ok::<WrittenFiles, rootcause::Report>(written)
+            }
+        });
+        let mut outcome = AppendOutcome {
+            commit_ids: Vec::new(),
+            rows: 0,
+            inserts: 0,
+            deletes: 0,
+        };
+        let mut files = Vec::new();
+        for result in join_all(tasks).await {
+            let part = result?;
+            files.extend(part.files);
+            outcome.rows += part.rows;
+            outcome.inserts += part.inserts;
+            outcome.deletes += part.deletes;
+        }
+        // The buckets wrote in parallel; publish every file in one commit so
+        // no two writers race on the partition version (and a distributed
+        // refresh can have the driver do the same after collecting the files).
+        outcome.commit_ids = view.mv.commit_files(&self.client, files).await?;
+        Ok(Some(outcome))
+    }
+
+    /// Rebuild a lookup chain from the current states of its sources.
+    pub async fn rebuild_lookup_chain(&self, view: &LookupChainView) -> Result<i64> {
+        self.register_lookup_chain_view(view).await?;
+        validate_lookup_chain_view(view)?;
+        self.drop_lookup_chain_indexes(view).await?;
+
+        self.metadata
+            .set_view_status(&view.view_id, "rebuilding")
+            .await?;
+        let generation = self.metadata.bump_generation(&view.view_id).await?;
+        self.metadata.delete_cursors(&view.view_id).await?;
+        view.mv.truncate(&self.client).await?;
+
+        let mut baselines = Vec::with_capacity(view.sources.len());
+        for (table, _) in &view.sources {
+            // The rebuild reads the data below (per bucket when possible);
+            // only the versions and cursors are needed here.
+            baselines.push(self.source_baseline_meta(table).await?);
+        }
+        let mv_versions_before =
+            output_partition_versions(&self.client, &view.mv).await?;
+        let mut to_versions = Vec::new();
+        for baseline in &baselines {
+            to_versions.extend(baseline.to_versions.iter().cloned());
+        }
+        let record = match self
+            .metadata
+            .begin_epoch(
+                &view.view_id,
+                &format!("rebuild:{generation}"),
+                &to_versions,
+                &mv_versions_before,
+            )
+            .await?
+        {
+            BeginEpoch::Committed(record) => {
+                for baseline in baselines {
+                    self.advance_cursors(&view.view_id, baseline.cursors)
+                        .await?;
+                }
+                self.metadata
+                    .set_view_status(&view.view_id, "active")
+                    .await?;
+                return Ok(record.epoch);
+            }
+            BeginEpoch::Created(record) | BeginEpoch::Pending(record) => record,
+        };
+        let epoch = record.epoch;
+        let mut commit_ids = Vec::new();
+        let unique_steps = view.steps.iter().all(|step| step.unique);
+
+        // A unique chain keyed by the base primary key can also build one
+        // base bucket at a time.  The dimensions are fetched by the bucket's
+        // base keys through the shared PK lookup plan, so the rebuild never
+        // materializes the full dimensions.  The MV is empty here, so buckets
+        // can be written sequentially without a delete pass.
+        let base = &view.sources[0].0;
+        let keyed_bucket_parallel = dimension_keys_are_base_keys(view)
+            && unique_steps
+            && view
+                .sources
+                .iter()
+                .all(|(table, _)| table.range_partition_columns.is_empty())
+            && base.hash_bucket_num == view.mv.hash_bucket_num
+            && base.primary_keys == view.mv.primary_keys
+            && base.hash_bucket_num.parse::<u32>().unwrap_or(1) > 1;
+        if keyed_bucket_parallel {
+            let mut groups: BTreeMap<u32, Vec<String>> = BTreeMap::new();
+            let mut splittable = true;
+            for group in &baselines[0].groups {
+                for file in &group.files {
+                    let Some(bucket) = crate::table::file_bucket(file) else {
+                        splittable = false;
+                        break;
+                    };
+                    groups.entry(bucket).or_default().push(file.clone());
+                }
+                if !splittable {
+                    break;
+                }
+            }
+            if splittable && groups.len() > 1 {
+                let context = refresh_session();
+                let base_columns = lookup_chain_source_columns(view, 0, &context)?;
+                let base_projection = project_schema(&base.schema, &base_columns)?;
+                let base_key_exprs = base
+                    .primary_keys
+                    .iter()
+                    .map(|column| col(column.as_str()))
+                    .collect::<Vec<_>>();
+                let row_exprs = lookup_chain_row_exprs(view)?;
+                let mut files = Vec::new();
+                let mut rebuilt_rows = 0u64;
+                for base_files in groups.into_values() {
+                    let context = refresh_session();
+                    let provider = crate::IvmTableProvider::groups(
+                        base.clone(),
+                        self.client.clone(),
+                        vec![crate::table::PartitionFiles {
+                            partition_desc: lakesoul_io::constant::DEFAULT_PARTITION_DESC
+                                .to_string(),
+                            files: base_files,
+                        }],
+                    );
+                    let base_frame = apply_side_filter(
+                        &context,
+                        filter_deletes(
+                            project_frame(
+                                context.read_table(Arc::new(provider))?,
+                                &base_columns,
+                            )?,
+                            change_column(base),
+                        )?,
+                        &base_projection,
+                        view.sources[0].1.as_deref(),
+                    )?;
+                    let affected = base_frame
+                        .clone()
+                        .select(base_key_exprs.clone())?
+                        .distinct()?;
+                    let mut frames = vec![base_frame];
+                    for (index, step) in view.steps.iter().enumerate() {
+                        let (table, _) = &view.sources[index + 1];
+                        let columns =
+                            lookup_chain_source_columns(view, index + 1, &context)?;
+                        let now = self
+                            .lookup_source_by_join_keys(
+                                &context,
+                                table,
+                                affected.clone(),
+                                &step.keys,
+                                &step.right_keys,
+                                true,
+                            )
+                            .await?;
+                        frames.push(project_frame(now, &columns)?);
+                    }
+                    let frame = lookup_chain_replay(
+                        view,
+                        &frames,
+                        view.steps.len(),
+                        frames[0].clone(),
+                    )?;
+                    let rows = frame
+                        .select(row_exprs.clone())?
+                        .with_column(IVM_ROW_KINDS_COLUMN, lit("insert"))?
+                        .with_column(IVM_EPOCH_COLUMN, lit(epoch))?;
+                    let written = write_dataframe(&view.mv, rows).await?;
+                    rebuilt_rows += written.inserts;
+                    files.extend(written.files);
+                }
+                let commit_ids = view.mv.commit_files(&self.client, files).await?;
+                self.set_view_rows(&view.view_id, rebuilt_rows);
+                let mv_versions =
+                    output_partition_versions(&self.client, &view.mv).await?;
+                self.mark_epoch_committed(&record, &mv_versions, &commit_ids)
+                    .await?;
+                for baseline in baselines {
+                    self.advance_cursors(&view.view_id, baseline.cursors)
+                        .await?;
+                }
+                self.metadata
+                    .set_view_status(&view.view_id, "active")
+                    .await?;
+                return Ok(epoch);
+            }
+        }
+
+        // Rebuild a unique-step, single-bucket-column chain bucket by bucket:
+        // the MV was just truncated, so each task only writes its own inserts.
+        let bucket_parallel = view.steps.iter().all(|step| step.unique)
+            && view
+                .sources
+                .iter()
+                .all(|(table, _)| table.range_partition_columns.is_empty())
+            && view.sources[0].0.hash_bucket_num == view.mv.hash_bucket_num
+            && view.sources[0].0.primary_keys == view.mv.primary_keys
+            && view.sources[0].0.bucket_columns.is_empty()
+            && view.mv.bucket_columns.is_empty()
+            && view.sources[0]
+                .0
+                .hash_bucket_num
+                .parse::<u32>()
+                .unwrap_or(1)
+                > 1;
+        if bucket_parallel {
+            let mut groups: BTreeMap<u32, Vec<String>> = BTreeMap::new();
+            let mut splittable = true;
+            for group in &baselines[0].groups {
+                for file in &group.files {
+                    let Some(bucket) = crate::table::file_bucket(file) else {
+                        splittable = false;
+                        break;
+                    };
+                    groups.entry(bucket).or_default().push(file.clone());
+                }
+                if !splittable {
+                    break;
+                }
+            }
+            if splittable && groups.len() > 1 {
+                let context = refresh_session();
+                let (base, base_filter) = &view.sources[0];
+                let base_columns = lookup_chain_source_columns(view, 0, &context)?;
+                let base_projection = project_schema(&base.schema, &base_columns)?;
+                let row_exprs = lookup_chain_row_exprs(view)?;
+                let tasks = groups.into_values().map(|files| {
+                    let view = view.clone();
+                    let base = base.clone();
+                    let mv = view.mv.clone();
+                    let base_filter = base_filter.clone();
+                    let base_projection = base_projection.clone();
+                    let base_columns = base_columns.clone();
+                    let client = self.client.clone();
+                    let row_exprs = row_exprs.clone();
+                    async move {
+                        let context = refresh_session();
+                        let provider = crate::IvmTableProvider::groups(
+                            base.clone(),
+                            client.clone(),
+                            vec![crate::table::PartitionFiles {
+                                partition_desc:
+                                    lakesoul_io::constant::DEFAULT_PARTITION_DESC
+                                        .to_string(),
+                                files,
+                            }],
+                        );
+                        let base_frame = apply_side_filter(
+                            &context,
+                            filter_deletes(
+                                project_frame(
+                                    context.read_table(Arc::new(provider))?,
+                                    &base_columns,
+                                )?,
+                                change_column(&base),
+                            )?,
+                            &base_projection,
+                            base_filter.as_deref(),
+                        )?;
+                        let mut frames = vec![base_frame];
+                        frames.extend(lookup_chain_dim_frames(&context, &view, &client)?);
+                        let frame = lookup_chain_replay(
+                            &view,
+                            &frames,
+                            view.steps.len(),
+                            frames[0].clone(),
+                        )?;
+                        let rows = frame
+                            .select(row_exprs.clone())?
+                            .with_column(IVM_ROW_KINDS_COLUMN, lit("insert"))?
+                            .with_column(IVM_EPOCH_COLUMN, lit(epoch))?;
+                        let written = write_dataframe(&mv, rows).await?;
+                        Ok::<WrittenFiles, rootcause::Report>(written)
+                    }
+                });
+                let mut rebuilt_rows = 0u64;
+                let mut files = Vec::new();
+                for result in join_all(tasks).await {
+                    let part = result?;
+                    files.extend(part.files);
+                    rebuilt_rows += part.inserts;
+                }
+                commit_ids.extend(view.mv.commit_files(&self.client, files).await?);
+                if unique_steps {
+                    self.set_view_rows(&view.view_id, rebuilt_rows);
+                }
+                let mv_versions =
+                    output_partition_versions(&self.client, &view.mv).await?;
+                self.mark_epoch_committed(&record, &mv_versions, &commit_ids)
+                    .await?;
+                for baseline in baselines {
+                    self.advance_cursors(&view.view_id, baseline.cursors)
+                        .await?;
+                }
+                self.metadata
+                    .set_view_status(&view.view_id, "active")
+                    .await?;
+                return Ok(epoch);
+            }
+        }
+
+        let context = refresh_session();
+        let mut frames = Vec::with_capacity(view.sources.len());
+        for (table, filter) in &view.sources {
+            let frame = apply_side_filter(
+                &context,
+                self.current_table_frame(&context, table)?,
+                &table.schema,
+                filter.as_deref(),
+            )?;
+            frames.push(frame);
+        }
+        let frame =
+            lookup_chain_replay(view, &frames, view.steps.len(), frames[0].clone())?;
+        let rows = frame
+            .select(lookup_chain_row_exprs(view)?)?
+            .with_column(IVM_ROW_KINDS_COLUMN, lit("insert"))?
+            .with_column(IVM_EPOCH_COLUMN, lit(epoch))?;
+        let outcome = append_dataframe(&view.mv, &self.client, rows).await?;
+        if unique_steps {
+            self.set_view_rows(&view.view_id, outcome.inserts);
+        }
+        commit_ids.extend(outcome.commit_ids);
+
+        let mv_versions = output_partition_versions(&self.client, &view.mv).await?;
+        self.mark_epoch_committed(&record, &mv_versions, &commit_ids)
+            .await?;
+        for baseline in baselines {
+            self.advance_cursors(&view.view_id, baseline.cursors)
+                .await?;
+        }
+        self.metadata
+            .set_view_status(&view.view_id, "active")
+            .await?;
+        Ok(epoch)
+    }
+}

@@ -1,0 +1,256 @@
+// SPDX-FileCopyrightText: 2023 LakeSoul Contributors
+//
+// SPDX-License-Identifier: Apache-2.0
+
+//! Module for the async writer implementation of LakeSoul.
+use bytes::BytesMut;
+use datafusion_common::DataFusionError;
+use datafusion_common::tree_node::TreeNodeRecursion;
+
+mod file_sink_writer;
+pub use file_sink_writer::FileSinkWriter;
+
+mod multipart_writer;
+pub use multipart_writer::MultiPartAsyncWriter;
+
+mod sort_writer;
+use object_store::ObjectMeta;
+pub use sort_writer::SortAsyncWriter;
+
+mod partitioning_writer;
+pub use partitioning_writer::PartitioningAsyncWriter;
+
+mod rolling_writer;
+pub use rolling_writer::{
+    ENV_FILE_ROLLING_BYTES, ENV_FILE_ROLLING_ROWS, RollingAsyncWriter, rolling_enabled,
+    rolling_settings,
+};
+
+mod sendable_writer;
+pub use sendable_writer::AsyncSendableMutableLakeSoulWriter;
+
+mod write_invariants;
+pub use write_invariants::WriteInvariants;
+
+use std::{
+    collections::HashMap,
+    fmt::{Debug, Formatter},
+    io::Write,
+    sync::Arc,
+};
+
+use arrow_array::RecordBatch;
+use arrow_schema::SchemaRef;
+use atomic_refcell::AtomicRefCell;
+use datafusion_execution::{SendableRecordBatchStream, TaskContext};
+use datafusion_physical_expr::{EquivalenceProperties, LexOrdering, PhysicalExpr};
+use datafusion_physical_plan::{
+    DisplayAs, DisplayFormatType, ExecutionPlan, ExecutionPlanProperties, Partitioning,
+    PlanProperties, stream::RecordBatchReceiverStreamBuilder,
+};
+use datafusion_physical_plan::{
+    execution_plan::{Boundedness, EmissionType},
+    metrics::MetricsSet,
+};
+
+use crate::{Result, session::LakeSoulIOSession};
+
+#[derive(Debug, Clone)]
+pub struct FlushOutput {
+    pub partition_desc: String,
+    pub file_path: String,
+    pub object_meta: ObjectMeta,
+    pub file_exist_cols: Vec<String>,
+    /// The total number of rows in the written file.
+    pub row_count: usize,
+    pub other_info: HashMap<String, String>,
+}
+
+/// The trait for the async batch writer.
+#[async_trait::async_trait]
+pub trait AsyncBatchWriter {
+    /// Write a record batch to the writer.
+    /// When error occured, writer will clean the resource.
+    async fn write_record_batch(&mut self, batch: RecordBatch) -> Result<()>;
+
+    /// Flush the writer and close it.
+    async fn flush_and_close(self: Box<Self>) -> Result<Vec<FlushOutput>>;
+
+    /// Flush the writer, close it, and return the final metrics snapshot.
+    async fn flush_and_close_with_metrics(
+        self: Box<Self>,
+    ) -> Result<(Vec<FlushOutput>, Option<MetricsSet>)> {
+        let metrics = self.metrics();
+        let output = self.flush_and_close().await?;
+        Ok((output, metrics))
+    }
+
+    /// Flush the writer, this can only be called once.
+    async fn flush(&mut self) -> Result<Vec<FlushOutput>> {
+        unimplemented!()
+    }
+
+    /// Close the writer
+    async fn close(self: Box<Self>) -> Result<()> {
+        unimplemented!()
+    }
+
+    /// Abort the writer
+    async fn abort(&mut self) -> Result<()> {
+        unimplemented!()
+    }
+
+    /// Abort the writer and close it when an error occurs.
+    async fn abort_and_close(self: Box<Self>) -> Result<()>;
+
+    /// Get the schema of the writer.
+    fn schema(&self) -> SchemaRef;
+
+    /// Get the buffered size of rows in the writer.
+    fn buffered_size(&self) -> u64 {
+        0
+    }
+
+    /// Get the LakeSoul io session of this writer.
+    fn io_session(&self) -> &Arc<LakeSoulIOSession> {
+        unimplemented!()
+    }
+
+    /// Get the metrics of this writer.
+    fn metrics(&self) -> Option<MetricsSet> {
+        None
+    }
+}
+
+/// A VecDeque which is both std::io::Write and bytes::Buf
+#[derive(Clone)]
+struct InMemBuf(Arc<AtomicRefCell<BytesMut>>);
+
+impl InMemBuf {
+    pub fn with_capacity(capacity: usize) -> Self {
+        Self(Arc::new(AtomicRefCell::new(BytesMut::with_capacity(
+            capacity,
+        ))))
+    }
+}
+
+impl Write for InMemBuf {
+    #[inline]
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0.borrow_mut().extend_from_slice(buf);
+        Ok(buf.len())
+    }
+
+    #[inline]
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// A [`datafusion::physical_plan::execution_plan::ExecutionPlan`] implementation for the receiver stream.
+pub struct ReceiverStreamExec {
+    receiver_stream_builder: AtomicRefCell<Option<RecordBatchReceiverStreamBuilder>>,
+    schema: SchemaRef,
+    properties: Arc<PlanProperties>,
+}
+
+impl ReceiverStreamExec {
+    pub fn new(
+        receiver_stream_builder: RecordBatchReceiverStreamBuilder,
+        schema: SchemaRef,
+    ) -> Self {
+        Self {
+            receiver_stream_builder: AtomicRefCell::new(Some(receiver_stream_builder)),
+            schema: schema.clone(),
+            properties: Arc::new(PlanProperties::new(
+                EquivalenceProperties::new(schema),
+                Partitioning::UnknownPartitioning(1),
+                EmissionType::Incremental,
+                Boundedness::Bounded,
+            )),
+        }
+    }
+}
+
+impl Debug for ReceiverStreamExec {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        write!(f, "ReceiverStreamExec")
+    }
+}
+
+impl DisplayAs for ReceiverStreamExec {
+    fn fmt_as(
+        &self,
+        _t: DisplayFormatType,
+        f: &mut std::fmt::Formatter,
+    ) -> std::fmt::Result {
+        write!(f, "ReceiverStreamExec")
+    }
+}
+
+impl ExecutionPlanProperties for ReceiverStreamExec {
+    fn output_partitioning(&self) -> &Partitioning {
+        &self.properties.partitioning
+    }
+
+    fn output_ordering(&self) -> Option<&LexOrdering> {
+        None
+    }
+
+    fn boundedness(&self) -> Boundedness {
+        Boundedness::Bounded
+    }
+
+    fn pipeline_behavior(&self) -> EmissionType {
+        EmissionType::Incremental
+    }
+
+    fn equivalence_properties(&self) -> &EquivalenceProperties {
+        &self.properties.eq_properties
+    }
+}
+
+impl ExecutionPlan for ReceiverStreamExec {
+    fn name(&self) -> &str {
+        "ReceiverStreamExec"
+    }
+
+    fn schema(&self) -> SchemaRef {
+        Arc::clone(&self.schema)
+    }
+
+    fn properties(&self) -> &Arc<PlanProperties> {
+        &self.properties
+    }
+
+    fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
+        unimplemented!()
+    }
+
+    fn apply_expressions(
+        &self,
+        _f: &mut dyn FnMut(
+            &Arc<dyn PhysicalExpr>,
+        ) -> Result<TreeNodeRecursion, DataFusionError>,
+    ) -> Result<TreeNodeRecursion, DataFusionError> {
+        Ok(TreeNodeRecursion::Continue)
+    }
+
+    fn with_new_children(
+        self: Arc<Self>,
+        _children: Vec<Arc<dyn ExecutionPlan>>,
+    ) -> Result<Arc<dyn ExecutionPlan>, DataFusionError> {
+        unimplemented!()
+    }
+
+    fn execute(
+        &self,
+        _partition: usize,
+        _context: Arc<TaskContext>,
+    ) -> Result<SendableRecordBatchStream, DataFusionError> {
+        let builder = self.receiver_stream_builder.borrow_mut().take().ok_or(
+            DataFusionError::Internal("empty receiver stream".to_string()),
+        )?;
+        Ok(builder.build())
+    }
+}

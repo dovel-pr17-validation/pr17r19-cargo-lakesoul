@@ -1,0 +1,370 @@
+// SPDX-FileCopyrightText: 2023 LakeSoul Contributors
+//
+// SPDX-License-Identifier: Apache-2.0
+
+package com.dmetasoul.lakesoul.lakesoul.io;
+
+import static com.dmetasoul.lakesoul.meta.DBConfig.TableInfoProperty.HASH_BUCKET_NUM;
+
+import com.dmetasoul.lakesoul.lakesoul.LakeSoulArrowUtils;
+import com.dmetasoul.lakesoul.lakesoul.io.jnr.LibLakeSoulIO;
+import com.dmetasoul.lakesoul.meta.DBConfig;
+import com.dmetasoul.lakesoul.meta.DBUtil;
+import com.dmetasoul.lakesoul.meta.entity.TableInfo;
+import com.fasterxml.jackson.core.JsonProcessingException;
+import com.fasterxml.jackson.databind.ObjectMapper;
+
+import jnr.ffi.Pointer;
+import jnr.ffi.Runtime;
+
+import org.apache.arrow.c.ArrowArray;
+import org.apache.arrow.c.ArrowSchema;
+import org.apache.arrow.c.Data;
+import org.apache.arrow.util.Preconditions;
+import org.apache.arrow.vector.VectorSchemaRoot;
+import org.apache.arrow.vector.ipc.ArrowStreamReader;
+import org.apache.arrow.vector.types.pojo.Schema;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import java.io.ByteArrayInputStream;
+import java.io.IOException;
+import java.util.*;
+import java.util.concurrent.atomic.AtomicReference;
+import java.util.stream.Collectors;
+
+public class NativeIOWriter extends NativeIOBase implements AutoCloseable {
+
+    private static final Logger LOG = LoggerFactory.getLogger(NativeIOWriter.class);
+
+    private Pointer writer = null;
+
+    public NativeIOWriter(Schema schema) throws IOException {
+        super("NativeWriter");
+        setSchema(schema);
+    }
+
+    public NativeIOWriter(TableInfo tableInfo) throws IOException {
+        super("NativeWriter");
+
+        String cdcColumn;
+        try {
+            ObjectMapper mapper = new ObjectMapper();
+            Map<String, String> properties = mapper.readValue(tableInfo.getProperties(), Map.class);
+            setHashBucketNum(Integer.parseInt(properties.get(HASH_BUCKET_NUM)));
+            cdcColumn = properties.get(DBConfig.TableInfoProperty.CDC_CHANGE_COLUMN);
+        } catch (JsonProcessingException e) {
+            throw new RuntimeException(e);
+        }
+        try {
+            Schema schema = Schema.fromJSON(tableInfo.getTableSchema());
+            setSchema(LakeSoulArrowUtils.cdcColumnAlignment(schema, cdcColumn));
+        } catch (IOException e) {
+            throw new RuntimeException(e);
+        }
+        DBUtil.TablePartitionKeys partitionKeys =
+                DBUtil.parseTableInfoPartitions(tableInfo.getPartitions());
+        setPrimaryKeys(partitionKeys.primaryKeys);
+        setRangePartitions(partitionKeys.rangeKeys);
+        useDynamicPartition(true);
+
+        withPrefix(tableInfo.getTablePath());
+    }
+
+    public void setAuxSortColumns(Iterable<String> auxSortColumns) throws IOException {
+        for (String col : auxSortColumns) {
+            ioConfigBuilder =
+                    requireBuilderNonNull(
+                            libLakeSoulIO.lakesoul_config_builder_add_single_aux_sort_column(
+                                    ioConfigBuilder, col),
+                            "addAuxSortColumn");
+        }
+    }
+
+    public void setHashBucketNum(Integer hashBucketNum) throws IOException {
+        hashBucketNum = hashBucketNum < 1 ? 1 : hashBucketNum;
+        ioConfigBuilder =
+                requireBuilderNonNull(
+                        libLakeSoulIO.lakesoul_config_builder_set_hash_bucket_num(
+                                ioConfigBuilder, hashBucketNum),
+                        "setHashBucketNum");
+    }
+
+    public void setRowGroupRowNumber(int rowNum) throws IOException {
+        ioConfigBuilder =
+                requireBuilderNonNull(
+                        libLakeSoulIO.lakesoul_config_builder_set_max_row_group_size(
+                                ioConfigBuilder, rowNum),
+                        "setMaxRowGroupSize");
+    }
+
+    public void setRowGroupValueNumber(int valueNum) throws IOException {
+        ioConfigBuilder =
+                requireBuilderNonNull(
+                        libLakeSoulIO.lakesoul_config_builder_set_max_row_group_num_values(
+                                ioConfigBuilder, valueNum),
+                        "setMaxRowGroupNumValues");
+    }
+
+    public void initializeWriter() throws IOException {
+        assert tokioRuntimeBuilder != null;
+        assert ioConfigBuilder != null;
+
+        tokioRuntime =
+                requireNonNull(
+                        libLakeSoulIO.create_tokio_runtime_from_builder(tokioRuntimeBuilder),
+                        "create_tokio_runtime_from_builder");
+        tokioRuntimeBuilder = null;
+        config =
+                requireNonNull(
+                        libLakeSoulIO.create_lakesoul_io_config_from_builder(ioConfigBuilder),
+                        "create_lakesoul_io_config_from_builder");
+        ioConfigBuilder = null;
+        Pointer newWriter = libLakeSoulIO.create_lakesoul_writer_from_config(config, tokioRuntime);
+        config = null;
+        tokioRuntime = null;
+        LibLakeSoulIO.CStatus status = libLakeSoulIO.check_writer_created(newWriter);
+        IOException pending = null;
+        try {
+            if (status.status.get() < 0) {
+                pending =
+                        new IOException(
+                                "Init native writer failed with error: "
+                                        + (status.err.get() != null
+                                                ? status.err.get()
+                                                : "unknown"));
+            }
+            writer = newWriter;
+            newWriter = null;
+        } finally {
+            if (status != null) {
+                libLakeSoulIO.free_c_status(status);
+            }
+            if (newWriter != null) {
+                libLakeSoulIO.free_lakesoul_writer(newWriter);
+            }
+            if (pending != null) {
+                try {
+                    super.close();
+                } catch (Exception e) {
+                    IOException closeError = new IOException("Failed to close native writer", e);
+                    pending.addSuppressed(closeError);
+                }
+            }
+        }
+
+        if (pending != null) {
+            throw pending;
+        }
+    }
+
+    public int writeIpc(byte[] encodedBatch) throws IOException {
+        int batchSize = 0;
+        try (ArrowStreamReader reader =
+                new ArrowStreamReader(new ByteArrayInputStream(encodedBatch), allocator)) {
+            if (reader.loadNextBatch()) {
+                VectorSchemaRoot batch = reader.getVectorSchemaRoot();
+                batchSize = batch.getRowCount();
+                this.write(batch);
+            }
+        }
+        return batchSize;
+    }
+
+    public void write(VectorSchemaRoot batch) throws IOException {
+        ArrowArray array = ArrowArray.allocateNew(allocator);
+        ArrowSchema schema = ArrowSchema.allocateNew(allocator);
+        Data.exportVectorSchemaRoot(allocator, batch, provider, array, schema);
+        LibLakeSoulIO.CStatus status =
+                libLakeSoulIO.write_record_batch_blocked(
+                        writer, schema.memoryAddress(), array.memoryAddress());
+        try {
+            if (status.status.get() < 0) {
+                throw new IOException(
+                        "Native writer write batch failed with error: "
+                                + (status.err.get() != null ? status.err.get() : "unknown"));
+            }
+        } finally {
+            array.close();
+            schema.close();
+            libLakeSoulIO.free_c_status(status);
+        }
+    }
+
+    public static class FlushResult {
+        final String filePath;
+        final Long fileSize;
+
+        final String fileExistCols;
+
+        FlushResult(String filePath, Long fileSize, String fileExistCols) {
+            this.filePath = filePath;
+            this.fileSize = fileSize;
+            this.fileExistCols = fileExistCols;
+        }
+
+        public Long getFileSize() {
+            return fileSize;
+        }
+
+        public String getFilePath() {
+            return filePath;
+        }
+
+        public String getFileExistCols() {
+            return fileExistCols;
+        }
+
+        @Override
+        public String toString() {
+            return "FlushResult{"
+                    + "filePath='"
+                    + filePath
+                    + '\''
+                    + ", fileSize="
+                    + fileSize
+                    + ", fileExistCols='"
+                    + fileExistCols
+                    + '\''
+                    + '}';
+        }
+    }
+
+    public static FlushResult decodeFlushResult(String encoded) {
+        String[] fields = encoded.split("\u0003");
+
+        Preconditions.checkArgument(fields.length == 3);
+        return new FlushResult(fields[0], Long.parseLong(fields[1]), fields[2]);
+    }
+
+    public HashMap<String, List<FlushResult>> flush() throws IOException {
+        AtomicReference<String> errMsg = new AtomicReference<>();
+        AtomicReference<Integer> lenResult = new AtomicReference<>();
+        IntegerCallback nativeIntegerCallback =
+                new IntegerCallback(
+                        (len, err) -> {
+                            if (len < 0 && err != null) {
+                                errMsg.set(err);
+                            }
+                            lenResult.set(len);
+                        },
+                        intReferenceManager);
+        nativeIntegerCallback.registerReferenceKey();
+        Pointer ptrResult = libLakeSoulIO.flush_and_close_writer(writer, nativeIntegerCallback);
+        writer = null;
+        if (errMsg.get() != null && !errMsg.get().isEmpty()) {
+            libLakeSoulIO.free_bytes_result(ptrResult);
+            throw new IOException("Native writer flush failed with error: " + errMsg.get());
+        }
+
+        Integer len = lenResult.get();
+        if (len != null && len > 0) {
+            int lenWithTail = len + 1;
+            Pointer buffer = fixedBuffer;
+            if (lenWithTail > fixedBuffer.size()) {
+                if (lenWithTail > mutableBuffer.size()) {
+                    mutableBuffer =
+                            Runtime.getRuntime(libLakeSoulIO)
+                                    .getMemoryManager()
+                                    .allocateDirect(lenWithTail);
+                }
+                buffer = mutableBuffer;
+            }
+            AtomicReference<Boolean> exported = new AtomicReference<>();
+            BooleanCallback nativeBooleanCallback =
+                    new BooleanCallback(
+                            (status, err) -> {
+                                if (!status && err != null) {
+                                    errMsg.set(err);
+                                }
+                                exported.set(status);
+                            },
+                            boolReferenceManager);
+            nativeBooleanCallback.registerReferenceKey();
+            libLakeSoulIO.export_bytes_result(
+                    nativeBooleanCallback, ptrResult, len, buffer.address());
+            ptrResult = null;
+            if (exported.get() != null && exported.get()) {
+                byte[] bytes = new byte[len];
+                buffer.get(0, bytes, 0, len);
+                String decodedResult = new String(bytes);
+                String[] splits = decodedResult.split("\u0001");
+                int partitionNum = Integer.parseInt(splits[0]);
+                if (partitionNum != splits.length - 1) {
+                    throw new IOException(
+                            "Dynamic Partitions Result ["
+                                    + decodedResult
+                                    + "] encode error: partition number mismatch "
+                                    + partitionNum
+                                    + "!="
+                                    + (splits.length - 1));
+                }
+                HashMap<String, List<FlushResult>> partitionDescAndFilesMap = new HashMap<>();
+                for (int i = 1; i < splits.length; i++) {
+                    String[] partitionDescAndFiles = splits[i].split("\u0002");
+                    List<String> list =
+                            new ArrayList<>(
+                                    Arrays.asList(partitionDescAndFiles)
+                                            .subList(1, partitionDescAndFiles.length));
+                    List<FlushResult> result =
+                            list.stream()
+                                    .map(NativeIOWriter::decodeFlushResult)
+                                    .collect(Collectors.toList());
+                    partitionDescAndFilesMap.put(partitionDescAndFiles[0], result);
+                }
+                return partitionDescAndFilesMap;
+            }
+        }
+        return null;
+    }
+
+    public void abort() throws IOException {
+        if (writer == null) {
+            return;
+        }
+        LOG.info("NativeIOWriter start abort");
+        AtomicReference<String> errMsg = new AtomicReference<>();
+        BooleanCallback nativeBooleanCallback =
+                new BooleanCallback(
+                        (status, err) -> {
+                            if (!status && err != null) {
+                                errMsg.set(err);
+                            }
+                        },
+                        boolReferenceManager);
+        nativeBooleanCallback.registerReferenceKey();
+        libLakeSoulIO.abort_and_close_writer(writer, nativeBooleanCallback);
+        writer = null;
+        if (errMsg.get() != null && !errMsg.get().isEmpty()) {
+            throw new IOException("Native writer abort failed with error: " + errMsg.get());
+        }
+    }
+
+    @Override
+    public void close() throws Exception {
+        LOG.info("NativeIOWriter start close");
+        Throwable firstException = null;
+        try {
+            abort();
+        } catch (Throwable t) {
+            firstException = t;
+        } finally {
+            try {
+                super.close();
+            } catch (Throwable t) {
+                if (firstException == null) {
+                    firstException = t;
+                } else {
+                    firstException.addSuppressed(t);
+                }
+            }
+        }
+        if (firstException != null) {
+            if (firstException instanceof Error) {
+                throw (Error) firstException;
+            } else {
+                throw (Exception) firstException;
+            }
+        }
+    }
+}

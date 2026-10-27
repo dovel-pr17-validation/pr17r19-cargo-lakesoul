@@ -1,0 +1,24 @@
+# SPDX-FileCopyrightText: 2023 LakeSoul Contributors
+#
+# SPDX-License-Identifier: Apache-2.0
+
+[package]
+name = "lakesoul-metadata-proto"
+version = { workspace = true }
+publish = false
+edition = { workspace = true }
+build = "build.rs"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+# protobuf
+prost = { workspace = true }
+# utils
+bytes = { workspace = true }
+
+[build-dependencies]
+prost-build = { workspace = true }
+
+[lints]
+workspace = true

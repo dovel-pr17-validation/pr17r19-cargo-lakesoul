@@ -1,0 +1,282 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright 2026 LakeSoul contributors
+
+import pickle
+from pathlib import Path
+from types import MappingProxyType
+from urllib.parse import unquote, urlparse
+
+import pyarrow as pa
+import pyarrow.parquet as pq
+import pytest
+
+from lakesoul.io import IOConfig, Writer
+
+
+def _local_path(uri: str) -> Path:
+    parsed = urlparse(uri)
+    assert parsed.scheme == "file"
+    return Path(unquote(parsed.path))
+
+
+def _batch() -> pa.RecordBatch:
+    return pa.record_batch(
+        {
+            "id": pa.array([1, 2], type=pa.int64()),
+            "value": pa.array(["a", "b"]),
+        }
+    )
+
+
+def test_writer_accepts_arrow_inputs_and_finishes_once(tmp_path: Path) -> None:
+    batch = _batch()
+    table = pa.Table.from_batches([batch])
+    reader = pa.RecordBatchReader.from_batches(batch.schema, [batch])
+    config = IOConfig(
+        path=tmp_path / "data",
+        schema=batch.schema,
+        format="parquet",
+        batch_size=1,
+    )
+
+    with Writer(config) as writer:
+        assert writer.write(batch) == 2
+        assert writer.write(table) == 2
+        assert writer.write(reader) == 2
+
+    result = writer.result
+    assert result is not None
+    assert result is writer.finish()
+    assert result.row_count == 6
+    assert len(result.files) == 1
+    assert result.files[0].row_count == 6
+    assert result.files[0].size > 0
+
+    output_path = _local_path(result.files[0].path)
+    assert output_path.suffix == ".parquet"
+    assert pq.read_table(output_path).num_rows == 6
+
+    with pytest.raises(RuntimeError, match="closed"):
+        writer.write(batch)
+
+
+def test_writer_dynamic_partitions(tmp_path: Path) -> None:
+    table = pa.table(
+        {
+            "id": pa.array([1, 2, 3], type=pa.int64()),
+            "part": pa.array(["a", "b", "a"]),
+        }
+    )
+    config = IOConfig(
+        path=tmp_path / "partitioned",
+        schema=table.schema,
+        format="parquet",
+        partition_by=["part"],
+    )
+
+    writer = Writer(config)
+    assert writer.write(table) == 3
+    result = writer.finish()
+
+    assert result.row_count == 3
+    assert set(result.partitions) == {"part=a", "part=b"}
+    assert sum(len(files) for files in result.partitions.values()) == 2
+    for file_info in result.files:
+        output_path = _local_path(file_info.path)
+        assert output_path.exists()
+        assert output_path.parent.name in {"part=a", "part=b"}
+        assert pq.read_schema(output_path).names == ["id"]
+
+
+def test_write_result_pickle_roundtrip_preserves_read_only_mappings(
+    tmp_path: Path,
+) -> None:
+    table = pa.table(
+        {
+            "id": pa.array([1, 2, 3], type=pa.int64()),
+            "part": pa.array(["a", "b", "a"]),
+        }
+    )
+    writer = Writer(
+        IOConfig(
+            path=tmp_path / "partitioned",
+            schema=table.schema,
+            partition_by=["part"],
+        )
+    )
+
+    writer.write(table)
+    result = writer.finish()
+    restored = pickle.loads(pickle.dumps(result))
+
+    assert restored == result
+    assert restored.row_count == 3
+    assert isinstance(restored.partitions, type(MappingProxyType({})))
+    assert isinstance(restored.files[0].other_info, type(MappingProxyType({})))
+    with pytest.raises(TypeError):
+        restored.partitions["part=c"] = ()
+    with pytest.raises(TypeError):
+        restored.files[0].other_info["format"] = "parquet"
+
+
+def test_empty_write_result_pickle_roundtrip() -> None:
+    from lakesoul.io import WriteResult
+
+    result = WriteResult(files=(), partitions={}, row_count=0)
+    restored = pickle.loads(pickle.dumps(result))
+
+    assert restored == result
+    assert restored.files == ()
+    assert restored.partitions == {}
+    with pytest.raises(TypeError):
+        restored.partitions["part=a"] = ()
+
+
+def test_writer_aborts_on_context_error(tmp_path: Path) -> None:
+    batch = _batch()
+    writer = Writer(IOConfig(path=tmp_path / "aborted", schema=batch.schema))
+
+    with pytest.raises(ValueError, match="stop"), writer:
+        writer.write(batch)
+        raise ValueError("stop")
+
+    assert writer.closed
+    assert writer.result is None
+    with pytest.raises(RuntimeError, match="aborted"):
+        writer.finish()
+
+
+def test_writer_rejects_schema_mismatch(tmp_path: Path) -> None:
+    batch = _batch()
+    writer = Writer(IOConfig(path=tmp_path / "data", schema=batch.schema))
+    other = pa.record_batch({"id": pa.array([1], type=pa.int64())})
+
+    with pytest.raises(ValueError, match="input schema"):
+        writer.write(other)
+    writer.abort()
+
+
+@pytest.mark.parametrize("format", ["parquet", "vortex", "vortex-compact"])
+def test_writer_rejects_actual_nulls_in_required_schema(
+    tmp_path: Path, format: str
+) -> None:
+    schema = pa.schema([pa.field("id", pa.int64(), nullable=False)])
+    data = pa.record_batch([pa.array([None], type=pa.int64())], schema=schema)
+    writer = Writer(IOConfig(path=tmp_path / "invalid", schema=schema, format=format))
+
+    with pytest.raises(ValueError, match="non-nullable.*id"), writer:
+        writer.write(data)
+
+    assert writer.closed
+    assert writer.result is None
+
+
+def test_writer_parquet_output_reports_physical_format(tmp_path: Path) -> None:
+    batch = _batch()
+    writer = Writer(
+        IOConfig(path=tmp_path / "parquet", schema=batch.schema, format="parquet")
+    )
+
+    writer.write(batch)
+    result = writer.finish()
+
+    assert result.row_count == 2
+    assert len(result.files) == 1
+    output_path = _local_path(result.files[0].path)
+    assert output_path.suffix == ".parquet"
+    assert output_path.exists()
+    assert result.files[0].other_info["physical_format"] == "parquet"
+
+
+def test_writer_vortex_output(tmp_path: Path) -> None:
+    batch = _batch()
+    writer = Writer(
+        IOConfig(path=tmp_path / "vortex", schema=batch.schema, format="vortex")
+    )
+
+    writer.write(batch)
+    result = writer.finish()
+
+    assert result.row_count == 2
+    assert len(result.files) == 1
+    output_path = _local_path(result.files[0].path)
+    assert output_path.suffix == ".vortex"
+    assert output_path.exists()
+
+
+def test_writer_accepts_vector_columns(tmp_path: Path) -> None:
+    batch = pa.record_batch(
+        {
+            "id": pa.array([1, 2], type=pa.int64()),
+            "embedding": pa.array(
+                [[1.0, 2.0], [3.0, 4.0]], type=pa.list_(pa.float32(), 2)
+            ),
+        }
+    )
+    writer = Writer(
+        IOConfig(
+            path=tmp_path / "vector",
+            schema=batch.schema,
+            format="vortex",
+            vector_columns=["embedding"],
+        )
+    )
+
+    writer.write(batch)
+    result = writer.finish()
+
+    assert result.row_count == 2
+    assert len(result.files) == 1
+
+
+def test_writer_defaults_to_vortex_compact_output(tmp_path: Path) -> None:
+    batch = _batch()
+    writer = Writer(IOConfig(path=tmp_path / "default", schema=batch.schema))
+
+    writer.write(batch)
+    result = writer.finish()
+
+    assert result.row_count == 2
+    assert len(result.files) == 1
+    output_path = _local_path(result.files[0].path)
+    assert output_path.suffix == ".vortex"
+    assert output_path.exists()
+    assert result.files[0].other_info["physical_format"] == "vortex-compact"
+
+
+def test_writer_binary_columns_skip_compression(tmp_path: Path) -> None:
+    batch = pa.record_batch(
+        {
+            "id": pa.array([1, 2], type=pa.int64()),
+            "frame": pa.array([b"\x00\x01", b"\x02\x03"], type=pa.binary()),
+        }
+    )
+    writer = Writer(
+        IOConfig(path=tmp_path / "blob", schema=batch.schema, format="vortex-compact")
+    )
+
+    writer.write(batch)
+    result = writer.finish()
+
+    assert result.row_count == 2
+    assert len(result.files) == 1
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "message"),
+    [
+        ({"batch_size": 0}, "batch_size"),
+        ({"thread_num": -1}, "thread_num"),
+        ({"thread_num": False}, "thread_num"),
+        ({"hash_bucket_num": 0}, "hash_bucket_num"),
+        ({"format": "csv"}, "format"),
+        ({"partition_by": ["missing"]}, "column not in schema"),
+        ({"vector_columns": ["missing"]}, "column not in schema"),
+        ({"vector_columns": ["id", "id"]}, "duplicate"),
+    ],
+)
+def test_writer_config_validation(
+    tmp_path: Path, kwargs: dict[str, object], message: str
+) -> None:
+    with pytest.raises((TypeError, ValueError), match=message):
+        IOConfig(path=tmp_path / "data", schema=_batch().schema, **kwargs)

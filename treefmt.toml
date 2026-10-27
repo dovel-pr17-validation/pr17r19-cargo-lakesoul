@@ -1,0 +1,73 @@
+# treefmt — unified formatting entry point
+# https://treefmt.com
+#
+# Usage:
+#   treefmt <paths...>  # format selected files
+#   treefmt --ci <paths...>  # check selected files (CI / pre-push)
+
+[global]
+excludes = [
+  # Build artifacts
+  "target/**",
+  "**/target/**",
+  "build/**",
+  "**/build/**",
+  "node_modules/**",
+  "**/node_modules/**",
+  ".direnv/**",
+  ".devenv*/**",
+  # Lock files
+  "Cargo.lock",
+  "**/uv.lock",
+  "website/package-lock.json",
+  # Generated code
+  "lakesoul-flink/src/main/java/org/apache/flink/fnexecution/v1/FlinkFnApi.java",
+  "python/src/lakesoul/metadata/generated/**",
+]
+
+# Rust ─────────────────────────────────────────────────
+# Config: rust/rustfmt.toml (picked up automatically)
+[formatter.rust]
+command = "rustfmt"
+options = ["--edition", "2024", "--config", "skip_children=true"]
+includes = ["*.rs"]
+
+# Java ─────────────────────────────────────────────────
+# google-java-format with AOSP style (4-space indent)
+[formatter.java]
+command = "google-java-format"
+options = ["--replace", "--aosp"]
+includes = ["*.java"]
+
+# Scala ────────────────────────────────────────────────
+# Config: .scalafmt.conf (picked up automatically)
+[formatter.scala]
+command = "scalafmt"
+includes = ["*.scala", "*.sbt"]
+
+# Python ───────────────────────────────────────────────
+# Config: [tool.ruff] in python/pyproject.toml (picked up automatically)
+[formatter.python]
+command = "ruff"
+options = ["format"]
+includes = ["*.py"]
+
+# TOML ─────────────────────────────────────────────────
+# Config: .taplo.toml (picked up automatically)
+[formatter.toml]
+command = "taplo"
+options = ["fmt"]
+includes = ["*.toml"]
+
+# YAML ─────────────────────────────────────────────────
+[formatter.yaml]
+command = "prettier"
+options = ["--write"]
+includes = ["*.yml", "*.yaml"]
+
+# JSON ─────────────────────────────────────────────────
+[formatter.json]
+command = "prettier"
+options = ["--write"]
+includes = ["*.json"]
+excludes = ["**/package-lock.json"]

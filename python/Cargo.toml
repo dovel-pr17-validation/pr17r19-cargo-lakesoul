@@ -1,0 +1,55 @@
+# SPDX-FileCopyrightText: 2026 LakeSoul Contributors
+#
+# SPDX-License-Identifier: Apache-2.0
+
+[package]
+name = "lakesoul-python"
+authors = ["LakeSoul Contributors"]
+edition = "2024"
+publish = false
+version = "2.1.0-dev.0"
+build = "build.rs"
+
+[lib]
+crate-type = ["cdylib"]
+
+[features]
+dist-ffi = ["dep:lakesoul-io-c", "dep:lakesoul-metadata-c"]
+hdfs = ["lakesoul-io-c/hdfs"]
+ci-unify = ["dep:lakesoul-datafusion"]
+
+[dependencies]
+pyo3 = { version = "0.28", features = [
+  "extension-module",
+  "experimental-async",
+  "abi3-py310",
+] }
+pyo3-log = "0.13"
+log = { workspace = true }
+lakesoul-build-info = { path = "../rust/lakesoul-build-info" }
+lakesoul-io = { path = "../rust/lakesoul-io" }
+lakesoul-io-c = { path = "../rust/lakesoul-io-c", optional = true }
+lakesoul-datafusion = { path = "../rust/lakesoul-datafusion", optional = true }
+lakesoul-common = { path = "../rust/lakesoul-common" }
+lakesoul-metadata = { path = "../rust/lakesoul-metadata" }
+lakesoul-metadata-c = { path = "../rust/lakesoul-metadata-c", optional = true }
+lakesoul-metadata-proto = { path = "../rust/lakesoul-metadata-proto" }
+uuid = { workspace = true }
+lakesoul-vector = { path = "../rust/lakesoul-vector" }
+lakesoul-text = { path = "../rust/lakesoul-text" }
+object_store = { workspace = true }
+tokio.workspace = true
+arrow-pyarrow.workspace = true
+arrow-schema.workspace = true
+arrow-array.workspace = true
+datafusion-common.workspace = true
+datafusion-execution.workspace = true
+futures.workspace = true
+prost.workspace = true
+rootcause.workspace = true
+serde_json.workspace = true
+serde.workspace = true
+datafusion.workspace = true
+
+[lints]
+workspace = true

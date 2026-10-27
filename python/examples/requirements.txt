@@ -1,0 +1,11 @@
+lakesoul
+pandas
+torch
+tqdm
+transformers
+sentence-transformers
+datasets
+evaluate
+accelerate
+scikit-learn
+pillow

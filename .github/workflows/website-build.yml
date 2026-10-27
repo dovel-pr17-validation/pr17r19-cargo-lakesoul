@@ -1,0 +1,38 @@
+# SPDX-FileCopyrightText: 2023 LakeSoul Contributors
+#
+# SPDX-License-Identifier: Apache-2.0
+
+name: Website Build
+on:
+  push:
+    paths:
+      - "website/**"
+    branches:
+      - "main"
+  pull_request:
+    paths:
+      - "website/**"
+    branches:
+      - "main"
+      - "release/**"
+  workflow_dispatch:
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 18
+          cache-dependency-path: "website/package-lock.json"
+          cache: npm
+      - name: Build website
+        working-directory: ./website
+        run: |
+          npm ci --omit-lockfile-registry-resolved true
+          npm run build

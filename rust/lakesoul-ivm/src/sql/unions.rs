@@ -1,0 +1,731 @@
+// SPDX-FileCopyrightText: 2026 LakeSoul Contributors
+//
+// SPDX-License-Identifier: Apache-2.0
+
+//! The `UNION ALL` / `UNION` (distinct) analyzer.
+
+use super::*;
+
+/// A `UNION ALL` of sources with identical schemas.
+pub(super) fn analyze_union(
+    union: &Union,
+    projection: Option<&Projection>,
+    tables: &HashMap<String, IvmTable>,
+    request: &AnalyzeRequest,
+) -> Result<ViewSpec> {
+    if let Some(projection) = projection {
+        if !is_plain_projection(projection) {
+            return Err(unsupported("computed columns above UNION ALL"));
+        }
+        let columns = projection
+            .expr
+            .iter()
+            .map(column_name)
+            .collect::<Option<Vec<_>>>()
+            .ok_or_else(|| unsupported("UNION ALL output must be plain columns"))?;
+        let union_columns = union
+            .schema
+            .fields()
+            .iter()
+            .map(|field| field.name().clone())
+            .filter(|name| {
+                name != crate::runtime::IVM_ROW_KINDS_COLUMN
+                    && name != crate::runtime::IVM_EPOCH_COLUMN
+            })
+            .collect::<Vec<_>>();
+        if columns != union_columns {
+            return Err(unsupported(
+                "UNION ALL output must keep the column order and names",
+            ));
+        }
+    }
+    let mut sources = Vec::with_capacity(union.inputs.len());
+    for input in &union.inputs {
+        sources.push(union_branch(peel(input), tables)?);
+    }
+    if sources.len() < 2 {
+        return Err(unsupported("UNION ALL needs at least two branches"));
+    }
+    // A `SELECT *` over a derived step also sees the step's internal
+    // bookkeeping columns; they must not become union output columns (the
+    // union adds its own source index and epoch).
+    for branch in &mut sources {
+        let columns = if branch.columns.is_empty() {
+            branch
+                .source
+                .schema
+                .fields()
+                .iter()
+                .map(|field| field.name().clone())
+                .collect::<Vec<_>>()
+        } else {
+            branch.columns.clone()
+        };
+        if !columns.iter().any(|column| is_internal_column(column)) {
+            continue;
+        }
+        let mut kept = Vec::with_capacity(columns.len());
+        let mut kept_exprs = Vec::with_capacity(branch.exprs.len());
+        for (index, column) in columns.iter().enumerate() {
+            if is_internal_column(column) {
+                continue;
+            }
+            kept.push(column.clone());
+            if !branch.exprs.is_empty() {
+                kept_exprs.push(branch.exprs[index].clone());
+            }
+        }
+        branch.columns = kept;
+        branch.exprs = kept_exprs;
+    }
+    // The keyed maintenance matches the MV rows by the source primary keys,
+    // so a keyed branch must project them unchanged.  A derived step widens
+    // the branch with the keys its consumer does not select; a user statement
+    // keeps them part of the output.  The widening runs before the schema
+    // check so a widened branch that no longer matches its siblings is
+    // rejected explicitly.
+    let keyed = !sources[0].source.primary_keys.is_empty();
+    for branch in &mut sources {
+        let keys = branch.source.primary_keys.clone();
+        if keyed != !keys.is_empty() {
+            return Err(unsupported(
+                "UNION ALL branches must be all keyed or all append-only",
+            ));
+        }
+        if !keyed {
+            continue;
+        }
+        let projected = if branch.columns.is_empty() {
+            branch
+                .source
+                .schema
+                .fields()
+                .iter()
+                .map(|field| field.name().clone())
+                .collect::<Vec<_>>()
+        } else {
+            branch.columns.clone()
+        };
+        for key in &keys {
+            let position = projected.iter().position(|column| column == key);
+            let unchanged = match position {
+                Some(_) if branch.exprs.is_empty() => true,
+                Some(position) => branch.exprs[position] == *key,
+                None => false,
+            };
+            if unchanged {
+                continue;
+            }
+            if !request.derived {
+                return Err(unsupported(format!(
+                    "a keyed UNION ALL branch must keep the primary key \
+                     {key} as a plain column"
+                )));
+            }
+            if !branch.columns.is_empty() {
+                branch.columns.push(key.clone());
+            }
+            if !branch.exprs.is_empty() {
+                branch.exprs.push(key.clone());
+            }
+        }
+    }
+    // Nested unions keep their inner marker as a data column, but branches
+    // may list it in a different position.  Align every branch to the first
+    // branch's output order so the runtime concatenation and schema check
+    // agree.
+    align_union_branches(&mut sources);
+    let first = &sources[0];
+    let first_schema =
+        union_output_schema_for(&first.source.schema, &first.columns, &first.exprs)?;
+    for branch in &sources[1..] {
+        let schema = union_output_schema_for(
+            &branch.source.schema,
+            &branch.columns,
+            &branch.exprs,
+        )?;
+        if !same_union_schema(&first_schema, &schema) {
+            return Err(unsupported(
+                "UNION ALL branches must have identical output schemas",
+            ));
+        }
+    }
+    let source_column = if sources.iter().any(|branch| {
+        branch
+            .source
+            .schema
+            .fields()
+            .iter()
+            .any(|field| field.name().starts_with("__ivm_source"))
+    }) {
+        union_source_column(union)
+    } else {
+        crate::runtime::IVM_SOURCE_COLUMN.to_string()
+    };
+    Ok(ViewSpec::UnionAll {
+        view_id: request.view_id.clone(),
+        sources: sources
+            .into_iter()
+            .map(|branch| UnionSourceSpec {
+                table_id: branch.source.table_id,
+                filter: branch.filter,
+                columns: branch.columns,
+                exprs: branch.exprs,
+            })
+            .collect(),
+        mv_table_id: request.mv_table_id.clone(),
+        source_column,
+    })
+}
+
+/// A `UNION` (distinct) view: `SELECT ... UNION SELECT ...` deduplicates the
+/// union output.  The optimizer plans it as a group-by over every column (the
+/// raw plan keeps a `Distinct` node), so the analyzer accepts both shapes.
+pub(super) fn analyze_union_distinct(
+    union: &Union,
+    tables: &HashMap<String, IvmTable>,
+    request: &AnalyzeRequest,
+) -> Result<ViewSpec> {
+    let mut sources = Vec::with_capacity(union.inputs.len());
+    for input in &union.inputs {
+        sources.push(union_distinct_branch(peel(input), tables)?);
+    }
+    if sources.len() < 2 {
+        return Err(unsupported("UNION needs at least two branches"));
+    }
+    let first = &sources[0];
+    let first_schema =
+        union_output_schema_for(&first.source.schema, &first.columns, &first.exprs)?;
+    for branch in &sources[1..] {
+        let schema = union_output_schema_for(
+            &branch.source.schema,
+            &branch.columns,
+            &branch.exprs,
+        )?;
+        if !same_union_schema(&first_schema, &schema) {
+            return Err(unsupported("UNION branches must have identical schemas"));
+        }
+    }
+    let keyed = !first.source.primary_keys.is_empty();
+    for branch in &sources {
+        if keyed != !branch.source.primary_keys.is_empty() {
+            return Err(unsupported(
+                "UNION branches must be all keyed or all append-only",
+            ));
+        }
+    }
+    Ok(ViewSpec::UnionDistinct {
+        view_id: request.view_id.clone(),
+        sources: sources
+            .into_iter()
+            .map(|branch| UnionSourceSpec {
+                table_id: branch.source.table_id,
+                filter: branch.filter,
+                columns: branch.columns,
+                exprs: branch.exprs,
+            })
+            .collect(),
+        mv_table_id: request.mv_table_id.clone(),
+    })
+}
+
+/// One parsed union branch: the source, the branch filter, the projected
+/// output columns (empty means every source column) and the rendered
+/// projection expressions (empty means plain columns).
+struct UnionBranch {
+    source: IvmTable,
+    filter: Option<String>,
+    columns: Vec<String>,
+    exprs: Vec<String>,
+}
+
+/// The columns a user sees through a union: the plan's output columns minus
+/// the IVM bookkeeping columns.  Those columns are an implementation detail
+/// and must not leak through `SELECT *` over a derived step.
+fn visible_union_columns(schema: &Schema) -> Vec<String> {
+    schema
+        .fields()
+        .iter()
+        .map(|field| field.name().clone())
+        .filter(|name| {
+            name != crate::runtime::IVM_ROW_KINDS_COLUMN
+                && name != crate::runtime::IVM_EPOCH_COLUMN
+        })
+        .collect()
+}
+
+/// Drop the bookkeeping columns from a branch projection, keeping the
+/// expression list aligned with the columns.
+fn strip_bookkeeping_columns(columns: &mut Vec<String>, exprs: &mut Vec<String>) {
+    if columns.is_empty() {
+        return;
+    }
+    let mut kept_columns = Vec::with_capacity(columns.len());
+    let mut kept_exprs = Vec::with_capacity(exprs.len());
+    for (index, column) in columns.iter().enumerate() {
+        if column == crate::runtime::IVM_ROW_KINDS_COLUMN
+            || column == crate::runtime::IVM_EPOCH_COLUMN
+        {
+            continue;
+        }
+        kept_columns.push(column.clone());
+        if let Some(expression) = exprs.get(index) {
+            kept_exprs.push(expression.clone());
+        }
+    }
+    *columns = kept_columns;
+    *exprs = kept_exprs;
+}
+
+/// The source of one `UNION ALL` branch.
+fn union_branch(
+    plan: &LogicalPlan,
+    tables: &HashMap<String, IvmTable>,
+) -> Result<UnionBranch> {
+    let mut scalars = Vec::new();
+    let (source, output_columns, output_exprs, filter) =
+        collect_row(plan, tables, &mut scalars)?;
+    if !scalars.is_empty() {
+        return Err(unsupported("a scalar subquery inside a UNION branch"));
+    }
+    let mut columns = output_columns.unwrap_or_default();
+    let mut exprs = output_exprs;
+    // A `SELECT *` over a derived step has no explicit projection; the scan
+    // may still expose the bookkeeping columns.  Project them away so the
+    // branch has the same shape as a plain source branch.
+    if columns.is_empty() {
+        let visible = visible_union_columns(&source.schema);
+        if visible.len() != source.schema.fields().len() {
+            columns = visible;
+        }
+    }
+    strip_bookkeeping_columns(&mut columns, &mut exprs);
+    Ok(UnionBranch {
+        source,
+        filter,
+        columns,
+        exprs,
+    })
+}
+
+/// Whether a rendered projection expression references `column`.
+fn projection_uses_column(
+    schema: &Schema,
+    expression: &str,
+    column: &str,
+) -> Result<bool> {
+    let context = SessionContext::new();
+    let df_schema = DFSchema::try_from(schema.clone())
+        .map_err(|error| unsupported(format!("invalid source schema: {error}")))?;
+    let expression = context
+        .state()
+        .create_logical_expr(expression, &df_schema)
+        .map_err(|error| {
+            unsupported(format!("invalid union projection {expression:?}: {error}"))
+        })?;
+    let mut uses = false;
+    expression
+        .apply(|node| {
+            if let Expr::Column(column_ref) = node
+                && column_ref.name == column
+            {
+                uses = true;
+            }
+            Ok(TreeNodeRecursion::Continue)
+        })
+        .map_err(|error| unsupported(format!("invalid union projection: {error}")))?;
+    Ok(uses)
+}
+
+/// Two union outputs match when their column names and types match; the
+/// nullability may differ between branches.
+/// A stable per-union branch-index column.  Deriving it from the plan keeps
+/// replays on the same spec while a nested union's inner marker cannot collide
+/// with the outer one.
+fn union_source_column(union: &Union) -> String {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for byte in format!("{union:?}").bytes() {
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    format!("__ivm_source_{hash:016x}")
+}
+
+fn align_union_branches(sources: &mut [UnionBranch]) {
+    if sources.len() < 2 {
+        return;
+    }
+    // Two materializations of the same inner union may carry different marker
+    // names; normalize a single inner marker to one canonical output name so
+    // the branches can share a schema.  The value is still the inner branch
+    // index, and the key helper maps the branch key to this output name.
+    for branch in sources.iter_mut() {
+        let mut columns = if branch.columns.is_empty() {
+            branch
+                .source
+                .schema
+                .fields()
+                .iter()
+                .map(|field| field.name().clone())
+                .collect::<Vec<_>>()
+        } else {
+            branch.columns.clone()
+        };
+        let markers = columns
+            .iter()
+            .enumerate()
+            .filter(|(_, column)| column.starts_with("__ivm_source"))
+            .map(|(index, _)| index)
+            .collect::<Vec<_>>();
+        if markers.len() != 1 {
+            continue;
+        }
+        let marker = markers[0];
+        if columns[marker] == "__ivm_source_inner" {
+            continue;
+        }
+        let original = columns[marker].clone();
+        if branch.exprs.is_empty() {
+            branch.exprs = columns.clone();
+        } else if branch.exprs.len() != columns.len() {
+            continue;
+        }
+        branch.exprs[marker] = original;
+        columns[marker] = "__ivm_source_inner".to_string();
+        branch.columns = columns;
+    }
+    let target = if sources[0].columns.is_empty() {
+        sources[0]
+            .source
+            .schema
+            .fields()
+            .iter()
+            .map(|field| field.name().clone())
+            .collect::<Vec<_>>()
+    } else {
+        sources[0].columns.clone()
+    };
+    for branch in &mut sources[1..] {
+        let columns = if branch.columns.is_empty() {
+            branch
+                .source
+                .schema
+                .fields()
+                .iter()
+                .map(|field| field.name().clone())
+                .collect::<Vec<_>>()
+        } else {
+            branch.columns.clone()
+        };
+        if columns == target || columns.len() != target.len() {
+            continue;
+        }
+        let mut order = Vec::with_capacity(columns.len());
+        let mut found = true;
+        for wanted in &target {
+            match columns.iter().position(|column| column == wanted) {
+                Some(index) if !order.contains(&index) => order.push(index),
+                _ => {
+                    found = false;
+                    break;
+                }
+            }
+        }
+        if !found {
+            continue;
+        }
+        let has_exprs = !branch.exprs.is_empty();
+        branch.columns = order.iter().map(|&index| columns[index].clone()).collect();
+        if has_exprs {
+            branch.exprs = order
+                .iter()
+                .map(|&index| branch.exprs[index].clone())
+                .collect();
+        }
+    }
+}
+
+/// The output column a union branch key is materialized under after an
+/// expression projection (`raw AS canonical`).
+pub(crate) fn union_key_output_name(
+    source: &UnionSourceSpec,
+    key: &str,
+) -> Option<String> {
+    if source.columns.is_empty() {
+        return Some(key.to_string());
+    }
+    if let Some(position) = source.columns.iter().position(|column| column == key) {
+        let unchanged = source.exprs.is_empty() || source.exprs[position] == key;
+        if unchanged {
+            return Some(key.to_string());
+        }
+    }
+    source
+        .exprs
+        .iter()
+        .position(|expression| expression == key)
+        .map(|position| source.columns[position].clone())
+}
+
+fn is_internal_column(name: &str) -> bool {
+    name == crate::runtime::IVM_ROW_KINDS_COLUMN
+        || name == crate::runtime::IVM_EPOCH_COLUMN
+        || name == crate::runtime::IVM_SOURCE_COLUMN
+}
+
+fn same_union_schema(left: &Schema, right: &Schema) -> bool {
+    left.fields().len() == right.fields().len()
+        && left
+            .fields()
+            .iter()
+            .zip(right.fields())
+            .all(|(left, right)| {
+                left.name() == right.name()
+                    && crate::table::normalize_data_type(left.data_type())
+                        == crate::table::normalize_data_type(right.data_type())
+            })
+}
+
+/// The source of one `UNION` (distinct) branch.  The CDC change column is
+/// maintained internally and therefore never part of the distinct key: a
+/// branch over a CDC source must project plain data columns.
+fn union_distinct_branch(
+    plan: &LogicalPlan,
+    tables: &HashMap<String, IvmTable>,
+) -> Result<UnionBranch> {
+    let mut scalars = Vec::new();
+    let (source, output_columns, output_exprs, filter) =
+        collect_row(plan, tables, &mut scalars)?;
+    if !scalars.is_empty() {
+        return Err(unsupported("a scalar subquery inside a UNION branch"));
+    }
+    let change = source.cdc_column.as_deref();
+    let mut columns = match output_columns {
+        Some(columns) => columns,
+        None => source
+            .schema
+            .fields()
+            .iter()
+            .map(|field| field.name().clone())
+            .filter(|name| Some(name.as_str()) != change)
+            .collect(),
+    };
+    let mut exprs = output_exprs;
+    strip_bookkeeping_columns(&mut columns, &mut exprs);
+    if let Some(change) = change {
+        if exprs.is_empty() {
+            if columns.iter().any(|column| column == change) {
+                return Err(unsupported(
+                    "the CDC change column cannot be part of a UNION output",
+                ));
+            }
+        } else {
+            for expression in &exprs {
+                if projection_uses_column(&source.schema, expression, change)? {
+                    return Err(unsupported(
+                        "the CDC change column cannot be part of a UNION output",
+                    ));
+                }
+            }
+        }
+    }
+    Ok(UnionBranch {
+        source,
+        filter,
+        columns,
+        exprs,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::sql::test_helpers::*;
+
+    #[tokio::test]
+    async fn analyzes_union_distinct() {
+        // `UNION` deduplicates the whole union row; the source fixture is
+        // keyed, so this covers the keyed branch.
+        let analyzed = analyze("select k, g, v from src union select k, g, v from src")
+            .await
+            .unwrap();
+        let ViewSpec::UnionDistinct { sources, .. } = analyzed.spec else {
+            panic!("expected a union-distinct spec");
+        };
+        assert_eq!(sources.len(), 2);
+        assert_eq!(sources[0].table_id, "table_src");
+        assert_eq!(sources[1].table_id, "table_src");
+        assert!(sources.iter().all(|source| source.filter.is_none()));
+
+        // Per-branch predicates are kept.
+        let analyzed = analyze(
+            "select k, g, v from src where v > 5 \
+             union select k, g, v from src where v < 3",
+        )
+        .await
+        .unwrap();
+        let ViewSpec::UnionDistinct { sources, .. } = analyzed.spec else {
+            panic!("expected a union-distinct spec");
+        };
+        assert!(sources.iter().all(|source| source.filter.is_some()));
+
+        // A UNION of a keyed and an append-only branch is rejected.
+        let ctx = SessionContext::new();
+        for name in ["src", "src2"] {
+            let table = MemTable::try_new(schema(), vec![vec![]]).unwrap();
+            ctx.register_table(name, Arc::new(table)).unwrap();
+        }
+        let plan = ctx
+            .sql("select k, g, v from src union select k, g, v from src2")
+            .await
+            .unwrap()
+            .logical_plan()
+            .clone();
+        let mut append_only = source_table("src2");
+        append_only.primary_keys.clear();
+        let tables = HashMap::from([
+            ("src".to_string(), source_table("src")),
+            ("src2".to_string(), append_only),
+        ]);
+        assert!(analyze_select(&plan, &tables, &request()).is_err());
+    }
+
+    #[tokio::test]
+    async fn probe_union_distinct() {
+        for sql in [
+            "select k, v from src union select k, v from src",
+            "select k, v from src union all select k, v from src",
+            "select k, v from src union select k, g from src",
+        ] {
+            let ctx = SessionContext::new();
+            let table = MemTable::try_new(schema(), vec![vec![]]).unwrap();
+            ctx.register_table("src", Arc::new(table)).unwrap();
+            match ctx.sql(sql).await {
+                Ok(frame) => {
+                    let plan = frame.logical_plan().clone();
+                    println!("SQL: {sql}\nRAW:\n{plan}");
+                    match ctx.state().optimize(&plan) {
+                        Ok(optimized) => println!("OPT:\n{optimized}\n----"),
+                        Err(error) => println!("OPT ERROR: {error}\n----"),
+                    }
+                }
+                Err(error) => println!("SQL: {sql}\nPLAN ERROR: {error}\n----"),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn analyzes_union_projections() {
+        // A UNION ALL branch over an append-only source is rejected: views
+        // need keyed sources.
+        let mut keyless = source_table("a");
+        keyless.primary_keys.clear();
+        assert!(
+            analyze_multi(
+                "select k as id, upper(g) as name from a \
+                 union all select k as id, g as name from b",
+                vec![keyless, source_table("b")],
+            )
+            .await
+            .is_err()
+        );
+
+        // A keyed UNION ALL branch must keep its primary keys unchanged.
+        let analyzed = analyze_multi(
+            "select k as id, g as name from a \
+             union all select k as id, g as name from b",
+            vec![source_table("a"), source_table("b")],
+        )
+        .await;
+        assert!(analyzed.is_err());
+
+        // UNION (distinct) accepts projected columns.
+        let analyzed = analyze_multi(
+            "select k as id, g as name from a \
+             union select k as id, g as name from b",
+            vec![source_table("a"), source_table("b")],
+        )
+        .await
+        .unwrap();
+        let ViewSpec::UnionDistinct { sources, .. } = analyzed.spec else {
+            panic!("expected a union-distinct spec");
+        };
+        assert_eq!(
+            sources[0].columns,
+            vec!["id".to_string(), "name".to_string()]
+        );
+        assert_eq!(sources[0].exprs[0], "k");
+
+        // The CDC change column cannot be part of a UNION output.
+        let mut left = source_table("a");
+        left.cdc_column = Some("g".to_string());
+        let mut right = source_table("b");
+        right.cdc_column = Some("g".to_string());
+        let analyzed = analyze_multi(
+            "select k, g from a union select k, g from b",
+            vec![left, right],
+        )
+        .await;
+        assert!(analyzed.is_err());
+    }
+
+    #[tokio::test]
+    async fn analyzes_union_all() {
+        let left = source_table("a");
+        let right = source_table("b");
+        let analyzed = analyze_multi(
+            "select * from a union all select * from b",
+            vec![left, right],
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            analyzed.spec,
+            ViewSpec::UnionAll {
+                source_column: crate::runtime::IVM_SOURCE_COLUMN.to_string(),
+                view_id: "view_1".to_string(),
+                sources: vec![
+                    UnionSourceSpec {
+                        table_id: "table_a".to_string(),
+                        filter: None,
+                        columns: vec!["k".to_string(), "g".to_string(), "v".to_string()],
+                        exprs: Vec::new(),
+                    },
+                    UnionSourceSpec {
+                        table_id: "table_b".to_string(),
+                        filter: None,
+                        columns: vec!["k".to_string(), "g".to_string(), "v".to_string()],
+                        exprs: Vec::new(),
+                    },
+                ],
+                mv_table_id: "table_mv".to_string(),
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn analyzes_union_all_where() {
+        let left = source_table("a");
+        let right = source_table("b");
+        let analyzed = analyze_multi(
+            "select * from a where v > 5 union all select * from b where g = 'x'",
+            vec![left, right],
+        )
+        .await
+        .unwrap();
+        let ViewSpec::UnionAll { sources, .. } = analyzed.spec else {
+            panic!("expected a union spec");
+        };
+        assert_eq!(sources.len(), 2);
+        assert_eq!(sources[0].table_id, "table_a");
+        assert_eq!(
+            normalized(sources[0].filter.as_deref()).as_deref(),
+            Some("v > 5")
+        );
+        assert_eq!(sources[1].table_id, "table_b");
+        assert_eq!(
+            normalized(sources[1].filter.as_deref()).as_deref(),
+            Some("g = 'x'")
+        );
+    }
+}

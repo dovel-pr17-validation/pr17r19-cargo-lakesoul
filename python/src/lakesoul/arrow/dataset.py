@@ -1,0 +1,892 @@
+# SPDX-FileCopyrightText: 2023,2025 LakeSoul Contributors
+#
+# SPDX-License-Identifier: Apache-2.0
+from __future__ import annotations
+
+import copy
+import functools
+import logging
+from collections.abc import Mapping
+from dataclasses import dataclass, field
+from typing import Any, Callable, Iterator, final
+
+import pyarrow as pa
+import pyarrow.dataset as ds
+from typing_extensions import override
+
+from lakesoul._lib._reader import _one_reader
+from lakesoul.metadata import LakeSoulScanPlanPartition
+from lakesoul.redaction import redacted_dataclass_repr
+
+DEFAULT_BATCH_SIZE: int = 2**10
+
+# Fields whose mappings are redacted in ``repr`` for diagnostics.
+_SCAN_CONFIG_SENSITIVE_FIELDS = frozenset({"object_store_options", "reader_options"})
+
+
+@dataclass(frozen=True, slots=True)
+class LakeSoulScanConfig:
+    """Resolved metadata and IO options for one Arrow dataset scan."""
+
+    table_name: str
+    namespace: str
+    schema: pa.Schema
+    partition_schema: pa.Schema | None
+    scan_partitions: tuple[LakeSoulScanPlanPartition, ...]
+    partitions: Mapping[str, str]
+    object_store_options: Mapping[str, str]
+    batch_size: int = DEFAULT_BATCH_SIZE
+    thread_count: int = 1
+    rank: int | None = None
+    world_size: int | None = None
+    filter: ds.Expression | None = None
+    reader_options: Mapping[str, str] = field(default_factory=dict)
+
+    def __repr__(self) -> str:
+        return redacted_dataclass_repr(self, _SCAN_CONFIG_SENSITIVE_FIELDS)
+
+
+@final
+class Dataset(ds.Dataset):
+    def __init__(  # pyright: ignore[reportMissingSuperCall]
+        self,
+        scan_config: LakeSoulScanConfig,
+    ) -> None:
+        """
+        lakeSoul dataset backed by Arrow reader
+        thread_count: 0 means use cpu count
+        """
+        if not isinstance(scan_config, LakeSoulScanConfig):
+            raise TypeError("scan_config must be a LakeSoulScanConfig")
+
+        self._scan_config = scan_config
+        self._lakesoul_table_name = scan_config.table_name
+        self._thread_count = scan_config.thread_count
+        self._namespace = scan_config.namespace
+
+        rank, world_size = self._check_rank_and_world_size(
+            scan_config.rank, scan_config.world_size
+        )
+        self._rank = rank
+        self._world_size = world_size
+
+        self._partitions = dict(scan_config.partitions)
+
+        self._oss_conf = dict(scan_config.object_store_options)
+        self._reader_options = dict(scan_config.reader_options)
+
+        if scan_config.batch_size <= 0:
+            raise ValueError(
+                f"batch_size must be non-negative int; "
+                f"{scan_config.batch_size} is invalid"
+            )
+        self._batch_size = scan_config.batch_size
+
+        if scan_config.thread_count < 0:
+            raise ValueError(
+                f"thread_count must be non-negative int; "
+                f"{scan_config.thread_count} is invalid"
+            )
+        if scan_config.thread_count == 0:
+            import multiprocessing
+
+            thread_count = multiprocessing.cpu_count()
+        else:
+            thread_count = scan_config.thread_count
+        self._thread_count = thread_count
+        self._schema = scan_config.schema
+        self._partition_schema = scan_config.partition_schema
+        filtered_scan_partitions = self._filter_scan_partitions(
+            list(scan_config.scan_partitions), self._rank, self._world_size
+        )
+        file_urls = []
+        pks = []
+        partition_infos = []
+        for scan_part in filtered_scan_partitions:
+            file_urls.append(scan_part.files)
+            pks.append(scan_part.primary_keys)
+            partition_infos.append(scan_part.partition_info)
+        self._file_urls = file_urls
+        self._pks = pks
+        self._partition_infos = partition_infos
+        self._filter = scan_config.filter
+
+    def count_rows(
+        self,
+        filter: ds.Expression | None = None,
+        batch_size: int = DEFAULT_BATCH_SIZE,
+        batch_readahead: int | None = None,
+        fragment_readahead: int | None = None,
+        fragment_scan_options: Any | None = None,
+        use_threads: bool = True,
+        cache_metadata: bool | None = None,
+        memory_pool: pa.MemoryPool | None = None,
+    ) -> int:
+        return self.scanner(
+            columns=None,
+            filter=filter,
+            batch_size=batch_size,
+            batch_readahead=batch_readahead,
+            fragment_readahead=fragment_readahead,
+            fragment_scan_options=fragment_scan_options,
+            use_threads=use_threads,
+            cache_metadata=cache_metadata,
+            memory_pool=memory_pool,
+        ).count_rows()
+
+    def filter(self, expression: ds.Expression) -> None:
+        self._filter = expression
+
+    def get_fragments(self, filter: ds.Expression | None = None) -> Iterator[Fragment]:
+        oss_conf = list(self._oss_conf.items())
+        for urls, keys, partition_info in zip(
+            self._file_urls, self._pks, self._partition_infos
+        ):
+            yield Fragment(
+                self._batch_size,
+                self._thread_count,
+                self._schema,
+                urls,
+                keys,
+                partition_info,
+                oss_conf,
+                self._partition_schema,
+                filter if filter is not None else self._filter,
+            )
+
+    def head(
+        self,
+        num_rows: int,
+        columns: list[str] | None = None,
+        filter: ds.Expression | None = None,
+        batch_size: int = DEFAULT_BATCH_SIZE,
+        batch_readahead: int | None = None,
+        fragment_readahead: int | None = None,
+        fragment_scan_options: Any | None = None,
+        use_threads: bool = True,
+        cache_metadata: bool | None = None,
+        memory_pool: pa.MemoryPool | None = None,
+    ) -> pa.Table:
+        return self.scanner(
+            columns,
+            filter,
+            batch_size,
+            batch_readahead,
+            fragment_readahead,
+            fragment_scan_options,
+            use_threads,
+            cache_metadata,
+            memory_pool,
+        ).head(num_rows)
+
+    def join(
+        self,
+        right_dataset: ds.Dataset,
+        keys: str | list[str],
+        right_keys: str | list[str],
+        join_type: str,
+        left_suffix: str | None,
+        right_suffix: str | None,
+        coalesce_keys: bool,
+        use_threads: bool,
+    ) -> ds.InMemoryDataset:
+        raise NotImplementedError("this method is not supported")
+
+    def join_asof(
+        self,
+        right_dataset: ds.Dataset,
+        on: str,
+        by: str | list[str] | None,
+        tolerance: int,
+        right_on: str | None = None,
+        right_by: str | list[str] | None = None,
+    ) -> ds.InMemoryDataset:
+        raise NotImplementedError("this method is not supported")
+
+    @property
+    def partition_expression(self) -> ds.Expression:
+        raise NotImplementedError("this method is not supported")
+
+    def replace_schema(self, schema: pa.Schema) -> Dataset:
+        raise NotImplementedError("this method is not supported")
+
+    def scanner(
+        self,
+        columns: list[str] | list[int] | int | None = None,
+        filter: ds.Expression | None = None,
+        batch_size: int = DEFAULT_BATCH_SIZE,
+        batch_readahead: int | None = None,
+        fragment_readahead: int | None = None,
+        fragment_scan_options: Any | None = None,
+        use_threads: bool = True,
+        cache_metadata: bool | None = None,
+        memory_pool: pa.MemoryPool | None = None,
+    ) -> Scanner:
+        return Scanner.from_dataset(
+            self,
+            columns=columns,  # pyright: ignore[reportCallIssue]
+            filter=filter if filter is not None else self._filter,  # pyright: ignore[reportCallIssue]
+            batch_size=batch_size,  # pyright: ignore[reportCallIssue]
+            batch_readahead=batch_readahead,  # pyright: ignore[reportCallIssue]
+            fragment_readahead=fragment_readahead,  # pyright: ignore[reportCallIssue]
+            fragment_scan_options=fragment_scan_options,  # pyright: ignore[reportCallIssue]
+            use_threads=use_threads,  # pyright: ignore[reportCallIssue]
+            cache_metadata=cache_metadata,  # pyright: ignore[reportCallIssue]
+            memory_pool=memory_pool,  # pyright: ignore[reportCallIssue]
+        )
+
+    @property
+    def schema(self) -> pa.Schema:
+        return self._schema
+
+    def sort_by(
+        self, sorting: str | list[tuple[str, str]], **kwargs: Any
+    ) -> ds.InMemoryDataset:
+        raise NotImplementedError("this method is not supported")
+
+    def take(
+        self,
+        indices: list[int] | pa.Array,
+        columns: list[str] | None = None,
+        filter: ds.Expression | None = None,
+        batch_size: int = DEFAULT_BATCH_SIZE,
+        batch_readahead: int | None = None,
+        fragment_readahead: int | None = None,
+        fragment_scan_options: Any | None = None,
+        use_threads: bool = True,
+        cache_metadata: bool | None = None,
+        memory_pool: pa.MemoryPool | None = None,
+    ) -> pa.Table:
+        raise NotImplementedError("this method is not supported")
+
+    def to_batches(
+        self,
+        columns: list[str] | None = None,
+        filter: ds.Expression | None = None,
+        batch_size: int = DEFAULT_BATCH_SIZE,
+        batch_readahead: int | None = None,
+        fragment_readahead: int | None = None,
+        fragment_scan_options: Any | None = None,
+        use_threads: bool = True,
+        cache_metadata: bool | None = None,
+        memory_pool: pa.MemoryPool | None = None,
+    ) -> Iterator[pa.RecordBatch]:
+        return self.scanner(
+            columns,
+            filter,
+            batch_size,
+            batch_readahead,
+            fragment_readahead,
+            fragment_scan_options,
+            use_threads,
+            cache_metadata,
+            memory_pool,
+        ).to_batches()
+
+    def to_table(
+        self,
+        columns: list[str] | None = None,
+        filter: ds.Expression | None = None,
+        batch_size: int = DEFAULT_BATCH_SIZE,
+        batch_readahead: int | None = None,
+        fragment_readahead: int | None = None,
+        fragment_scan_options: Any | None = None,
+        use_threads: bool = True,
+        cache_metadata: bool | None = None,
+        memory_pool: pa.MemoryPool | None = None,
+    ) -> pa.Table:
+        return self.scanner(
+            columns,
+            filter,
+            batch_size,
+            batch_readahead,
+            fragment_readahead,
+            fragment_scan_options,
+            use_threads,
+            cache_metadata,
+            memory_pool,
+        ).to_table()
+
+    @override
+    def __reduce__(self) -> tuple[type[Dataset], tuple[LakeSoulScanConfig]]:
+        """custom serialize"""
+        return self.__class__, (self._scan_config,)
+
+    @property
+    def scan_config(self) -> LakeSoulScanConfig:
+        return self._scan_config
+
+    def thread_count(self) -> int:
+        return self._thread_count
+
+    def file_urls(self) -> list[list[str]]:
+        return self._file_urls
+
+    def primary_keys(self) -> list[list[str]]:
+        return self._pks
+
+    def partition_infos(self) -> list[list[tuple[str, str]]]:
+        return self._partition_infos
+
+    def partitions(self) -> dict[str, str]:
+        return self._partitions
+
+    def oss_conf(self) -> dict[str, str]:
+        return self._oss_conf
+
+    def partition_schema(self) -> pa.Schema:
+        return self._partition_schema
+
+    def _check_rank_and_world_size(
+        self, rank: int | None, world_size: int | None
+    ) -> tuple[int | None, int | None]:
+        if rank is None and world_size is None:
+            return None, None
+        if rank is None or world_size is None:
+            raise ValueError("rank and world_size must be both set or both unset")
+        if rank < 0:
+            raise ValueError(f"rank must be non-negative int; {rank} is invalid")
+        if world_size <= 0:
+            raise ValueError(
+                f"world_size must be positive int; {world_size} is invalid"
+            )
+        if rank >= world_size:
+            raise ValueError(f"rank {rank} is out of range; world_size = {world_size}")
+        return rank, world_size
+
+    def _filter_scan_partitions(
+        self,
+        scan_partitions: list[LakeSoulScanPlanPartition],
+        rank: int | None,
+        world_size: int | None,
+    ) -> list[LakeSoulScanPlanPartition]:
+        import warnings
+
+        if rank is None or world_size is None:
+            return scan_partitions
+        if len(scan_partitions) < world_size and rank == 0:
+            warnings.warn(
+                f"LakeSoul table {self._lakesoul_table_name} "
+                f"in namespace {self._namespace} contains too few partitions to scan; "
+                f"world_size = {world_size}, "
+                f"#partition_num = {len(scan_partitions)}"
+            )
+        if len(scan_partitions) % world_size != 0 and rank == 0:
+            warnings.warn(
+                f"LakeSoul table {self._lakesoul_table_name}"
+                f"in namespace {self._namespace} "
+                f"contains {len(scan_partitions)} num of scan partitions, "
+                "which is not a multiple of "
+                f"world_size {world_size}"
+            )
+        filtered_scan_partitions = [
+            scan_part
+            for i, scan_part in enumerate(scan_partitions)
+            if i % world_size == rank
+        ]
+        return filtered_scan_partitions
+
+
+def check_parameters(
+    _func: Callable[..., Any] | None = None,
+    *,
+    check_columns: bool = True,
+    check_filter: bool = True,
+    check_fragment_scan_options: bool = True,
+    check_cache_metadata: bool = True,
+    check_memory_pool: bool = True,
+) -> Callable[..., Any]:
+    def decorator(func: Callable[..., Any]) -> Callable[..., Any]:
+        @functools.wraps(func)
+        def wrapper(*args: Any, **kwargs: Any) -> Any:
+            if (
+                check_columns
+                and kwargs.get("columns") is not None
+                and (
+                    not isinstance(kwargs["columns"], list)
+                    or not all(isinstance(item, str) for item in kwargs["columns"])
+                )
+            ):
+                raise NotImplementedError("columns with expression is not supported")
+            if (
+                check_filter
+                and kwargs["filter"] is not None
+                and not isinstance(kwargs["filter"], ds.Expression)
+            ):
+                raise NotImplementedError(
+                    f"filter type {type(kwargs['filter'])} is not supported"
+                )
+            if (
+                check_fragment_scan_options
+                and kwargs["fragment_scan_options"] is not None
+            ):
+                raise NotImplementedError("fragment scan optoins is not supported")
+            if check_cache_metadata and kwargs["cache_metadata"] is not None:
+                raise NotImplementedError("cache metadata is not supported")
+            if check_memory_pool and kwargs["memory_pool"] is not None:
+                raise NotImplementedError("memory pool is not supported")
+            return func(*args, **kwargs)
+
+        return wrapper
+
+    if _func is None:
+        return decorator
+    else:
+        return decorator(_func)
+
+
+@final
+class Fragment(ds.Fragment):
+    def __init__(  # pyright: ignore[reportMissingSuperCall]
+        self,
+        batch_size: int,
+        thread_count: int,
+        schema: pa.Schema,
+        file_urls: list[str],
+        pks: list[str],
+        partitions: list[tuple[str, str]],
+        oss_conf: list[tuple[str, str]],
+        partition_schema: pa.Schema | None,
+        filter: ds.Expression | None,
+    ) -> None:
+        self._batch_size = batch_size
+        self._thread_count = thread_count
+        self._schema = pa.schema(schema)  # copy
+        self._file_urls = file_urls[:]
+        self._pks = pks[:]
+        self._partitions = partitions[:]
+        self._oss_conf = oss_conf[:]
+        self._partition_schema = (
+            pa.schema(partition_schema) if partition_schema is not None else None
+        )  # copy
+        self._filter = filter
+
+    @property
+    def partition_expression(self) -> ds.Expression:
+        raise NotImplementedError
+
+    @property
+    def physical_schema(self) -> pa.Schema:
+        return self._schema
+
+    def count_rows(
+        self,
+        filter: ds.Expression | None = None,
+        batch_size: int = DEFAULT_BATCH_SIZE,
+        batch_readahead: int | None = None,
+        fragment_readahead: int | None = None,
+        fragment_scan_options: Any | None = None,
+        use_threads: bool = True,
+        cache_metadata: bool | None = None,
+        memory_pool: pa.MemoryPool | None = None,
+    ) -> int:
+        return self.scanner(
+            None,
+            None,
+            filter,
+            batch_size,
+            batch_readahead,
+            fragment_readahead,
+            fragment_scan_options,
+            use_threads,
+            cache_metadata,
+            memory_pool,
+        ).count_rows()
+
+    def head(
+        self,
+        num_rows: int,
+        schema: pa.Schema | None = None,
+        columns: list[str] | None = None,
+        filter: ds.Expression | None = None,
+        batch_size: int = DEFAULT_BATCH_SIZE,
+        batch_readahead: int | None = None,
+        fragment_readahead: int | None = None,
+        fragment_scan_options: Any | None = None,
+        use_threads: bool = True,
+        cache_metadata: bool | None = None,
+        memory_pool: pa.MemoryPool | None = None,
+    ) -> pa.Table:
+        return self.scanner(
+            schema,
+            columns,
+            filter,
+            batch_size,
+            batch_readahead,
+            fragment_readahead,
+            fragment_scan_options,
+            use_threads,
+            cache_metadata,
+            memory_pool,
+        ).head(num_rows)
+
+    def scanner(
+        self,
+        schema: pa.Schema | None = None,
+        columns: list[str] | None = None,
+        filter: ds.Expression | None = None,
+        batch_size: int = DEFAULT_BATCH_SIZE,
+        batch_readahead: int | None = None,
+        fragment_readahead: int | None = None,
+        fragment_scan_options: Any | None = None,
+        use_threads: bool = True,
+        cache_metadata: bool | None = None,
+        memory_pool: pa.MemoryPool | None = None,
+    ) -> Scanner:
+        return Scanner.from_fragment(
+            self,
+            schema=schema,  # pyright: ignore[reportCallIssue]
+            columns=columns,  # pyright: ignore[reportCallIssue]
+            filter=filter if filter is not None else self._filter,  # pyright: ignore[reportCallIssue]
+            batch_size=batch_size,  # pyright: ignore[reportCallIssue]
+            batch_readahead=batch_readahead,  # pyright: ignore[reportCallIssue]
+            fragment_readahead=fragment_readahead,  # pyright: ignore[reportCallIssue]
+            fragment_scan_options=fragment_scan_options,  # pyright: ignore[reportCallIssue]
+            use_threads=use_threads,  # pyright: ignore[reportCallIssue]
+            cache_metadata=cache_metadata,  # pyright: ignore[reportCallIssue]
+            memory_pool=memory_pool,  # pyright: ignore[reportCallIssue]
+        )
+
+    def take(
+        self,
+        indices: list[int] | pa.Array,
+        columns: list[str] | None = None,
+        filter: ds.Expression | None = None,
+        batch_size: int = DEFAULT_BATCH_SIZE,
+        batch_readahead: int | None = None,
+        fragment_readahead: int | None = None,
+        fragment_scan_options: Any | None = None,
+        use_threads: bool = True,
+        cache_metadata: bool | None = None,
+        memory_pool: pa.MemoryPool | None = None,
+    ) -> pa.Table:
+        raise NotImplementedError("this method is not supported")
+
+    def to_batches(
+        self,
+        schema: pa.Schema | None = None,
+        columns: list[str] | None = None,
+        filter: ds.Expression | None = None,
+        batch_size: int = DEFAULT_BATCH_SIZE,
+        batch_readahead: int | None = None,
+        fragment_readahead: int | None = None,
+        fragment_scan_options: Any | None = None,
+        use_threads: bool = True,
+        cache_metadata: bool | None = None,
+        memory_pool: pa.MemoryPool | None = None,
+    ) -> Iterator[pa.RecordBatch]:
+        return self.scanner(
+            schema=schema,
+            columns=columns,
+            filter=filter,
+            batch_size=batch_size,
+            batch_readahead=batch_readahead,
+            fragment_readahead=fragment_readahead,
+            fragment_scan_options=fragment_scan_options,
+            use_threads=use_threads,
+            cache_metadata=cache_metadata,
+            memory_pool=memory_pool,
+        ).to_batches()
+
+    def to_table(
+        self,
+        schema: pa.Schema | None = None,
+        columns: list[str] | None = None,
+        filter: ds.Expression | None = None,
+        batch_size: int = DEFAULT_BATCH_SIZE,
+        batch_readahead: int | None = None,
+        fragment_readahead: int | None = None,
+        fragment_scan_options: Any | None = None,
+        use_threads: bool = True,
+        cache_metadata: bool | None = None,
+        memory_pool: pa.MemoryPool | None = None,
+    ) -> pa.Table:
+        return self.scanner(
+            schema=schema,
+            columns=columns,
+            filter=filter,
+            batch_size=batch_size,
+            batch_readahead=batch_readahead,
+            fragment_readahead=fragment_readahead,
+            fragment_scan_options=fragment_scan_options,
+            use_threads=use_threads,
+            cache_metadata=cache_metadata,
+            memory_pool=memory_pool,
+        ).to_table()
+
+    def batch_size(self) -> int:
+        return self._batch_size
+
+    def thread_count(self) -> int:
+        return self._thread_count
+
+    def file_urls(self) -> list[str]:
+        return self._file_urls
+
+    def primary_keys(self) -> list[str]:
+        return self._pks
+
+    def partitions(self) -> list[tuple[str, str]]:
+        return self._partitions
+
+    def oss_conf(self) -> list[tuple[str, str]]:
+        return self._oss_conf
+
+    def partition_schema(self) -> pa.Schema:
+        return self._partition_schema
+
+
+def schema_projection(origin: pa.Schema, projections: list[str]) -> pa.Schema:
+    logging.debug(f"Projection: {projections}")
+    # O(n + m)
+    origin_fields = {field.name for field in origin}
+    redundant_fields = [col for col in projections if col not in origin_fields]
+    if redundant_fields:
+        raise ValueError(f"columns are not in origin schema : {redundant_fields}")
+
+    fields = [origin.field(field) for field in projections if field in origin_fields]
+
+    return pa.schema(fields)
+
+
+def _substrait_safe_schema(schema: pa.Schema) -> pa.Schema:
+    """Schema for pyarrow's Substrait conversion.
+
+    pyarrow cannot express some Arrow types (notably ``FixedSizeList``) in
+    Substrait, which made every filter fail on tables that contain them.
+    Fields the filter cannot reference still have to be present with their
+    names and order, so unsupported types are replaced by ``binary``.
+    """
+    fields = []
+    for schema_field in schema:
+        dtype = schema_field.type
+        if pa.types.is_fixed_size_list(dtype) or pa.types.is_struct(dtype):
+            dtype = pa.binary()
+        fields.append(
+            pa.field(
+                schema_field.name,
+                dtype,
+                nullable=schema_field.nullable,
+                metadata=schema_field.metadata,
+            )
+        )
+    return pa.schema(fields)
+
+
+def _to_substrait(expression: ds.Expression, schema: pa.Schema) -> bytes:
+    try:
+        return bytes(expression.to_substrait(schema))
+    except pa.ArrowNotImplementedError:
+        return bytes(expression.to_substrait(_substrait_safe_schema(schema)))
+
+
+def _apply_readahead_options(
+    scanner: Scanner,
+    batch_readahead: int | None,
+    fragment_readahead: int | None,
+) -> None:
+    """Map pyarrow-style readahead knobs onto the native reader.
+
+    ``batch_readahead`` becomes the native ``prefetch_size``: the reader pulls
+    that many batches ahead of the consumer. ``fragment_readahead`` is already
+    satisfied because every scan fragment's reader starts concurrently.
+    """
+    if batch_readahead is not None:
+        _validate_readahead("batch_readahead", batch_readahead)
+        scanner._reader_options = {
+            **getattr(scanner, "_reader_options", {}),
+            "prefetch_size": str(batch_readahead),
+        }
+    if fragment_readahead is not None:
+        _validate_readahead("fragment_readahead", fragment_readahead)
+        logging.debug(
+            "fragment_readahead=%s is already satisfied: "
+            "all fragments stream concurrently",
+            fragment_readahead,
+        )
+
+
+def _validate_readahead(name: str, value: int) -> None:
+    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+        raise ValueError(f"{name} must be a positive integer")
+
+
+@final
+class Scanner(ds.Scanner):
+    def __init__(  # pyright: ignore[reportMissingSuperCall]
+        self,
+        batch_size: int,
+        thread_count: int,
+        target_schema: pa.Schema,
+        file_urls: list[list[str]],
+        pks: list[list[str]],
+        partition_infos: list[list[tuple[str, str]]],
+        oss_conf: list[tuple[str, str]],
+        partiion_schema: pa.Schema | None,
+        filter: bytes | None,
+    ) -> None:
+        self._batch_size = batch_size
+        self._thread_count = thread_count
+        self._target_schema = pa.schema(target_schema)
+        self._partition_schema = pa.schema(partiion_schema) if partiion_schema else None
+        self._file_urls = copy.deepcopy(file_urls)
+        self._pks = copy.deepcopy(pks)
+        self._partition_infos = copy.deepcopy(partition_infos)
+        self._oss_conf = oss_conf
+        self._filter = filter
+
+    def count_rows(self) -> int:
+        return self.to_table().num_rows
+
+    @staticmethod
+    def from_batches(
+        source: Any,
+        *,
+        schema: pa.Schema | None = None,
+        colums: list[str] | None = None,
+        filter: ds.Expression | None = None,
+        batch_size: int = DEFAULT_BATCH_SIZE,
+        batch_readahead: int | None = None,
+        fragment_scan_options: Any | None = None,
+        use_threads: bool | None = None,
+        cache_metadata: bool | None = None,
+        memory_pool: pa.MemoryPool | None = None,
+    ) -> Scanner:
+        raise NotImplementedError("the method is not supported")
+
+    @staticmethod
+    @check_parameters
+    def from_dataset(
+        dataset: Dataset,
+        *,
+        columns: list[str] | None = None,
+        filter: ds.Expression | None = None,
+        batch_size: int = DEFAULT_BATCH_SIZE,
+        batch_readahead: int | None = None,
+        fragment_readahead: int | None = None,
+        fragment_scan_options: Any | None = None,
+        use_threads: bool = True,
+        cache_metadata: bool | None = None,
+        memory_pool: pa.MemoryPool | None = None,
+    ) -> Scanner:
+        logging.debug(f"from_dataset filter: {filter}")
+        if not use_threads:
+            thread_count = 1
+        else:
+            thread_count = dataset.thread_count()
+
+        if columns:
+            target_schema = schema_projection(dataset.schema, columns)
+        else:
+            target_schema = dataset.schema
+
+        if filter is not None:
+            filter = _to_substrait(filter, dataset.schema)
+
+        scanner = Scanner(
+            batch_size,
+            thread_count,
+            target_schema,
+            dataset.file_urls(),
+            dataset.primary_keys(),
+            dataset.partition_infos(),
+            list(dataset.oss_conf().items()),
+            dataset.partition_schema(),
+            filter,
+        )
+        scanner._reader_options = getattr(dataset, "_reader_options", {})
+        _apply_readahead_options(scanner, batch_readahead, fragment_readahead)
+        return scanner
+
+    @staticmethod
+    @check_parameters
+    def from_fragment(
+        fragment: Fragment,
+        *,
+        schema: pa.Schema | None = None,
+        columns: list[str] | None = None,
+        filter: ds.Expression | None = None,
+        batch_size: int = DEFAULT_BATCH_SIZE,
+        batch_readahead: int | None = None,
+        fragment_readahead: int | None = None,
+        fragment_scan_options: Any | None = None,
+        use_threads: bool = True,
+        cache_metadata: bool | None = None,
+        memory_pool: pa.MemoryPool | None = None,
+    ) -> Scanner:
+        logging.debug(f"from_fragement filter: {filter}")
+        if not use_threads:
+            thread_count = 1
+        else:
+            thread_count = fragment.thread_count()
+
+        if filter is not None:
+            filter = _to_substrait(filter, fragment.physical_schema)
+
+        schema = schema if schema is not None else fragment.physical_schema
+
+        if columns is not None:
+            schema = schema_projection(schema, columns)
+
+        scanner = Scanner(
+            batch_size,
+            thread_count,
+            schema,
+            [fragment.file_urls()],
+            [fragment.primary_keys()],
+            [fragment.partitions()],
+            fragment.oss_conf(),
+            fragment.partition_schema(),
+            filter,
+        )
+        _apply_readahead_options(scanner, batch_readahead, fragment_readahead)
+        return scanner
+
+    def head(self, num_rows: int) -> pa.Table:
+        reader = self.to_reader()
+        batches = []
+        total_rows = 0
+
+        for batch in reader:
+            if total_rows >= num_rows:
+                break
+            remaining = num_rows - total_rows
+            if batch.num_rows > remaining:
+                batch = batch.slice(0, remaining)
+            batches.append(batch)
+            total_rows += batch.num_rows
+        return pa.Table.from_batches(batches)
+
+    def scan_batches(self) -> Iterator[ds.TaggedRecordBatch]:
+        raise NotImplementedError("this method is not supported")
+
+    def take(self, indices: list[int] | pa.Array) -> pa.Table:
+        raise NotImplementedError("this method is not supported")
+
+    def to_batches(self) -> Iterator[pa.RecordBatch]:
+        reader = self.to_reader()
+        for rb in reader:
+            yield rb
+
+    def to_reader(self) -> pa.RecordBatchReader:
+        return _one_reader(
+            self._batch_size,
+            self._thread_count,
+            self._target_schema,
+            self._file_urls,
+            self._pks,
+            self._partition_infos,
+            self._oss_conf,
+            self._partition_schema,
+            self._filter,
+            list(opts.items())
+            if (opts := getattr(self, "_reader_options", {}))
+            else None,
+        )
+
+    def to_table(self) -> pa.Table:
+        return self.to_reader().read_all()
+
+
+def lakesoul_dataset(scan_config: LakeSoulScanConfig) -> Dataset:
+    return Dataset(scan_config)

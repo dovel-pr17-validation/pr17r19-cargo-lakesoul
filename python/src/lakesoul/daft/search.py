@@ -1,0 +1,506 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright 2026 LakeSoul contributors
+
+"""Index search through a Daft DataFrame.
+
+``vector_search`` pushes similarity filtering down to the native reader:
+every Daft task (one per scan partition / hash bucket) runs an ANN search
+against that bucket's IVF+RaBitQ index and only returns candidate rows.
+The candidates are then re-ranked by exact distance in Daft and truncated
+to the global top-``k`` with a ``sort`` + ``limit``, so the whole pipeline
+stays lazy and distributed.
+
+``text_search`` does the same for full-text queries: each task runs its
+bucket's Tantivy search and the native reader verifies every candidate
+against the current rows exactly (stale index entries are dropped), so the
+returned rows are true matches.
+"""
+
+from __future__ import annotations
+
+import json
+import math
+from collections.abc import Mapping, Sequence
+from typing import TYPE_CHECKING, Any
+
+import daft
+from daft import col
+
+if TYPE_CHECKING:
+    from lakesoul.catalog import LakeSoulScan, LakeSoulTable
+
+_DISTANCE_COLUMN = "vector_distance"
+
+
+def vector_search(
+    source: LakeSoulTable | LakeSoulScan,
+    query: Sequence[float],
+    *,
+    top_k: int = 10,
+    nprobe: int = 64,
+    column: str | None = None,
+    metric: str | None = None,
+    extra_columns: Sequence[str] = (),
+    rerank: str = "exact",
+    parallelism: int = 1,
+    with_distance: bool = False,
+) -> Any:
+    """Search the nearest ``top_k`` rows to ``query`` and return a Daft DataFrame.
+
+    The similarity filtering is executed by the LakeSoul vector index: each
+    per-bucket reader returns its approximate top-``top_k`` candidates, and
+    the candidates are re-ranked by exact vector distance in Daft before the
+    global top-``top_k`` is returned.
+
+    With ``rerank="index"`` the reader instead ranks the candidates by the
+    quantized distance computed inside the index and returns the reserved
+    ``__lakesoul_vector_distance`` column; the scan never reads the stored
+    vector column.  This is only supported for L2 (inner product keeps the
+    exact rerank) and trades a small amount of recall for fewer bytes and
+    less CPU; ``parallelism`` probes that many clusters concurrently per
+    reader.
+
+    Args:
+        source: A :class:`lakesoul.catalog.LakeSoulTable` or a configured
+            :class:`lakesoul.catalog.LakeSoulScan`.  When a scan is passed,
+            its partition filter, projection, and runtime options are kept
+            except that the primary key and the searched vector column are
+            always read.
+        query: The query vector.  Must be a sequence of floats whose length
+            matches the index dimension.
+        top_k: Number of rows to return (global, across buckets).
+        nprobe: Number of IVF clusters to probe in each bucket.
+        column: Vector column to search.  Defaults to the single vector
+            column declared in the table's ``vector_index_columns`` property.
+        metric: Distance metric, ``"L2"`` or ``"IP"``.  Defaults to the
+            table property.
+        extra_columns: Additional columns to return alongside the primary
+            key and the vector column.
+        rerank: ``"exact"`` (default) re-ranks the candidates against the
+            stored vector column; ``"index"`` orders by the index distance
+            and skips the vector column entirely (L2 only).
+        parallelism: Number of clusters to probe concurrently per reader
+            (default 1); it lowers single-query latency at the cost of
+            throughput when many queries run at once.
+        with_distance: Also return the distance of each row in a
+            ``vector_distance`` column (the exact distance for ``"exact"``,
+            the index distance for ``"index"``).
+
+    Returns:
+        A lazy ``daft.DataFrame`` with the top-``top_k`` rows (nearest first),
+        ordered by distance.  The distance column itself is not included;
+        pass ``source.scan(columns=[...])`` and use ``extra_columns`` for
+        the columns to project.
+
+    Raises:
+        ValueError: If the table has no vector index configuration, the
+            searched column is not indexed, the query dimension does not
+            match, or multiple indexed columns require an explicit ``column``.
+    """
+    from lakesoul.catalog import LakeSoulScan, LakeSoulTable
+
+    if not isinstance(source, (LakeSoulTable, LakeSoulScan)):
+        raise TypeError("source must be a LakeSoulTable or LakeSoulScan")
+    table = source if isinstance(source, LakeSoulTable) else source.table
+
+    if top_k < 1:
+        raise ValueError("top_k must be >= 1")
+    if nprobe < 1:
+        raise ValueError("nprobe must be >= 1")
+    if isinstance(query, str):
+        raise TypeError("query must be a sequence of floats, not a string")
+
+    configs = table._vector_configs()
+    if not configs:
+        raise ValueError(
+            "the table has no vector_index_columns property; "
+            "create the table with vector_index=[...] to enable vector search"
+        )
+    if column is None:
+        if len(configs) == 1:
+            column = configs[0]["column"]
+        else:
+            raise ValueError(
+                "multiple vector columns are indexed; set 'column' explicitly"
+            )
+    cfg = next((c for c in configs if c["column"] == column), None)
+    if cfg is None:
+        raise ValueError(f"column {column!r} is not declared in vector_index_columns")
+    if metric is None:
+        metric = cfg.get("metric", "L2")
+
+    query = [float(v) for v in query]
+    if not query:
+        raise ValueError("query must not be empty")
+    expected_dim = cfg.get("dim")
+    if expected_dim is not None and len(query) != expected_dim:
+        raise ValueError(
+            f"query dimension {len(query)} does not match the index "
+            f"dimension {expected_dim}"
+        )
+
+    primary_keys = table.primary_keys
+    if not primary_keys:
+        raise ValueError("a vector index requires a table with a primary key")
+    pk_column = primary_keys[0]
+
+    metric = "IP" if metric.upper() in ("IP", "INNERPRODUCT") else "L2"
+    if rerank not in ("exact", "index"):
+        raise ValueError(f"rerank must be 'exact' or 'index', got {rerank!r}")
+    if parallelism < 1:
+        raise ValueError("parallelism must be >= 1")
+    # Index-distance ordering is only comparable with L2 for now; IP keeps
+    # the exact rerank.
+    index_only = rerank == "index" and metric == "L2"
+
+    if index_only:
+        from lakesoul.catalog import VECTOR_DISTANCE_COLUMN
+
+        # Each shard only needs its own top-k (a globally top-k row is inside
+        # its own shard's top-k); the small margin backfills rows dropped by
+        # the merge-on-read pass (deletes, stale versions).
+        candidates_per_shard = max(top_k * 2, top_k + 8)
+        columns = _dedup_columns((pk_column, *extra_columns, VECTOR_DISTANCE_COLUMN))
+        reader_options = {
+            "vector_search_query": ",".join(f"{v:.6f}" for v in query),
+            "vector_search_column": column,
+            "vector_search_top_k": str(candidates_per_shard),
+            "vector_search_nprobe": str(nprobe),
+            "vector_search_metric": metric,
+            "vector_search_order_by": "true",
+            "vector_search_parallelism": str(parallelism),
+        }
+        if isinstance(source, LakeSoulScan):
+            scan = source._replace(
+                columns=tuple(columns), _reader_options=reader_options
+            )
+        else:
+            scan = source.scan(columns=tuple(columns)).options(
+                reader_options=reader_options
+            )
+
+        dataframe = scan.to_daft()
+        if with_distance:
+            dataframe = dataframe.with_column(
+                _DISTANCE_COLUMN, col(VECTOR_DISTANCE_COLUMN)
+            )
+        dataframe = dataframe.sort(VECTOR_DISTANCE_COLUMN).limit(top_k)
+        return dataframe.exclude(VECTOR_DISTANCE_COLUMN)
+
+    columns = _dedup_columns((pk_column, column, *extra_columns))
+    reader_options = {
+        "vector_search_query": ",".join(f"{v:.6f}" for v in query),
+        "vector_search_column": column,
+        "vector_search_top_k": str(top_k),
+        "vector_search_nprobe": str(nprobe),
+        "vector_search_metric": metric,
+    }
+
+    if isinstance(source, LakeSoulScan):
+        scan = source._replace(columns=tuple(columns), _reader_options=reader_options)
+    else:
+        scan = source.scan(columns=tuple(columns)).options(
+            reader_options=reader_options
+        )
+
+    dataframe = scan.to_daft()
+    dataframe = dataframe.with_column(
+        _DISTANCE_COLUMN, _exact_distance_udf(col(column), query, metric)
+    )
+    dataframe = dataframe.sort(_DISTANCE_COLUMN).limit(top_k)
+    if with_distance:
+        return dataframe
+    return dataframe.exclude(_DISTANCE_COLUMN)
+
+
+def multi_vector_search(
+    source: LakeSoulTable | LakeSoulScan,
+    queries: Mapping[str, Sequence[float]],
+    *,
+    top_k: int = 10,
+    nprobe: int = 64,
+    weights: Mapping[str, float] | None = None,
+    extra_columns: Sequence[str] = (),
+    rerank: str = "exact",
+    parallelism: int = 1,
+    with_distance: bool = False,
+) -> Any:
+    """Search several indexed vector columns and fuse the per-column distances.
+
+    Every queried column is searched independently; a row must be a candidate
+    in **every** column's index (the candidate sets are intersected) and the
+    rows are ranked by the weighted sum of the per-column distances.  With
+    ``rerank="index"`` the distances come from the indexes and the stored
+    vector columns are never read; the default ``rerank="exact"`` computes the
+    exact weighted sum on the candidate rows inside Daft.
+
+    Only L2 columns are supported (fusing inner-product scores is not
+    defined); every queried column must carry the same metric.
+
+    Args:
+        source: A :class:`lakesoul.catalog.LakeSoulTable` or a configured
+            :class:`lakesoul.catalog.LakeSoulScan`.
+        queries: Mapping from indexed vector column to its query vector.
+        top_k: Number of rows to return globally (across buckets), best
+            (smallest fused distance) first.
+        nprobe: Number of IVF clusters to probe per column and bucket.
+        weights: Optional per-column fusion weights (default 1.0 each).
+        extra_columns: Additional columns to return alongside the primary
+            key and the queried vector columns.
+        rerank: ``"exact"`` (default) or ``"index"`` (rank by the fused index
+            distance, skipping the vector columns).
+        parallelism: Number of clusters to probe concurrently per reader.
+        with_distance: Also return the fused distance in a
+            ``vector_distance`` column.
+
+    Returns:
+        A lazy ``daft.DataFrame`` ordered by the fused distance.
+    """
+    from lakesoul.catalog import LakeSoulScan, LakeSoulTable, VECTOR_DISTANCE_COLUMN
+
+    if not isinstance(source, (LakeSoulTable, LakeSoulScan)):
+        raise TypeError("source must be a LakeSoulTable or LakeSoulScan")
+    table = source if isinstance(source, LakeSoulTable) else source.table
+
+    if not isinstance(queries, Mapping) or isinstance(queries, (str, bytes)):
+        raise TypeError("queries must be a mapping from column to query vector")
+    if not queries:
+        raise ValueError("queries must select at least one vector column")
+    if top_k < 1:
+        raise ValueError("top_k must be >= 1")
+    if nprobe < 1:
+        raise ValueError("nprobe must be >= 1")
+    if rerank not in ("exact", "index"):
+        raise ValueError(f"rerank must be 'exact' or 'index', got {rerank!r}")
+    if parallelism < 1:
+        raise ValueError("parallelism must be >= 1")
+
+    configs = table._vector_configs()
+    if not configs:
+        raise ValueError(
+            "the table has no vector_index_columns property; "
+            "create the table with vector_index=[...] to enable vector search"
+        )
+    by_column = {config["column"]: config for config in configs}
+    default_weights = {column: 1.0 for column in queries}
+    if weights is None:
+        weights = default_weights
+    else:
+        unknown = set(weights) - set(queries)
+        if unknown:
+            raise ValueError(f"weights given for unqueried columns: {sorted(unknown)}")
+        weights = {column: float(weights.get(column, 1.0)) for column in queries}
+    if any(weight <= 0 for weight in weights.values()):
+        raise ValueError("fusion weights must be positive")
+
+    resolved: list[tuple[str, list[float], float]] = []
+    for column, query in queries.items():
+        config = by_column.get(column)
+        if config is None:
+            raise ValueError(
+                f"column {column!r} is not declared in vector_index_columns"
+            )
+        if str(config.get("metric", "L2")).upper() in ("IP", "INNERPRODUCT"):
+            raise ValueError(
+                f"column {column!r} uses inner product; multi-column fusion "
+                "supports L2 columns only"
+            )
+        if isinstance(query, str):
+            raise TypeError(f"query for {column!r} must be a sequence of floats")
+        query = [float(value) for value in query]
+        expected_dim = config.get("dim")
+        if expected_dim is not None and len(query) != expected_dim:
+            raise ValueError(
+                f"query dimension {len(query)} does not match the index "
+                f"dimension {expected_dim} for column {column!r}"
+            )
+        resolved.append((column, query, weights[column]))
+
+    primary_keys = table.primary_keys
+    if not primary_keys:
+        raise ValueError("a vector index requires a table with a primary key")
+    pk_column = primary_keys[0]
+
+    index_only = rerank == "index"
+    candidates_per_shard = max(top_k * 2, top_k + 8) if index_only else top_k
+    requested = [
+        {
+            "column": column,
+            "query": ",".join(f"{value:.6f}" for value in query),
+            "top_k": candidates_per_shard,
+            "weight": weight,
+            "metric": "L2",
+        }
+        for column, query, weight in resolved
+    ]
+    reader_options = {
+        "vector_search_requests": json.dumps(requested),
+        "vector_search_nprobe": str(nprobe),
+        "vector_search_metric": "L2",
+    }
+
+    if index_only:
+        reader_options["vector_search_order_by"] = "true"
+        reader_options["vector_search_parallelism"] = str(parallelism)
+        columns = _dedup_columns((pk_column, *extra_columns, VECTOR_DISTANCE_COLUMN))
+        if isinstance(source, LakeSoulScan):
+            scan = source._replace(
+                columns=tuple(columns), _reader_options=reader_options
+            )
+        else:
+            scan = source.scan(columns=tuple(columns)).options(
+                reader_options=reader_options
+            )
+        dataframe = scan.to_daft()
+        if with_distance:
+            dataframe = dataframe.with_column(
+                _DISTANCE_COLUMN, col(VECTOR_DISTANCE_COLUMN)
+            )
+        dataframe = dataframe.sort(VECTOR_DISTANCE_COLUMN).limit(top_k)
+        return dataframe.exclude(VECTOR_DISTANCE_COLUMN)
+
+    columns = _dedup_columns(
+        (pk_column, *(column for column, _, _ in resolved), *extra_columns)
+    )
+    if isinstance(source, LakeSoulScan):
+        scan = source._replace(columns=tuple(columns), _reader_options=reader_options)
+    else:
+        scan = source.scan(columns=tuple(columns)).options(
+            reader_options=reader_options
+        )
+    dataframe = scan.to_daft()
+    fused = None
+    for column, query, weight in resolved:
+        term = _exact_distance_udf(col(column), query, "L2") * weight
+        fused = term if fused is None else fused + term
+    dataframe = dataframe.with_column(_DISTANCE_COLUMN, fused)
+    dataframe = dataframe.sort(_DISTANCE_COLUMN).limit(top_k)
+    if with_distance:
+        return dataframe
+    return dataframe.exclude(_DISTANCE_COLUMN)
+
+
+def _dedup_columns(names: Sequence[str]) -> list[str]:
+    return list(dict.fromkeys(names))
+
+
+def text_search(
+    source: LakeSoulTable | LakeSoulScan,
+    query: str,
+    *,
+    top_k: int = 10,
+    column: str | None = None,
+    with_score: bool = False,
+    extra_columns: Sequence[str] = (),
+) -> Any:
+    """Search the full-text index and return a Daft DataFrame of matches.
+
+    The search runs inside the native reader: each Daft task (one per scan
+    partition / hash bucket) searches that bucket's Tantivy index and keeps a
+    candidate set; the native reader verifies every candidate against the
+    current rows exactly, so stale index entries (updated or deleted rows)
+    never appear in the result.  The candidates are then ranked globally by
+    their BM25 score in Daft and truncated to ``top_k``.
+
+    Args:
+        source: A :class:`lakesoul.catalog.LakeSoulTable` or a configured
+            :class:`lakesoul.catalog.LakeSoulScan`.  When a scan is passed,
+            its partition filter, projection, and runtime options are kept
+            except that the primary key and the searched text column are
+            always read.
+        query: The Tantivy query string.
+        top_k: Number of rows to return globally (across buckets), best
+            relevance first.
+        column: Text column to search.  Defaults to the single text column
+            declared in the table's ``text_index_columns`` property.
+        with_score: Also return the BM25 score of each row in the reserved
+            ``__lakesoul_text_score`` column.
+        extra_columns: Additional columns to return alongside the primary
+            key and the text column.
+
+    Returns:
+        A lazy ``daft.DataFrame`` with the top-``top_k`` exact matches,
+        best-scoring first.  Cross-bucket ranking uses each bucket's BM25
+        statistics, so it is approximate (the same trade-off as a default
+        Elasticsearch search across shards).
+
+    Raises:
+        ValueError: If the table has no text index configuration, the
+            searched column is not indexed, the query is empty, or multiple
+            indexed columns require an explicit ``column``.
+    """
+    from lakesoul.catalog import (
+        TEXT_SEARCH_SCORE_COLUMN,
+        LakeSoulScan,
+        LakeSoulTable,
+    )
+
+    if not isinstance(source, (LakeSoulTable, LakeSoulScan)):
+        raise TypeError("source must be a LakeSoulTable or LakeSoulScan")
+    table = source if isinstance(source, LakeSoulTable) else source.table
+
+    if top_k < 1:
+        raise ValueError("top_k must be >= 1")
+    if not isinstance(query, str):
+        raise TypeError("query must be a string")
+    if not query.strip():
+        raise ValueError("query must not be empty")
+
+    configs = table._text_configs()
+    if not configs:
+        raise ValueError(
+            "the table has no text_index_columns property; "
+            "create the table with text_index=[...] to enable text search"
+        )
+    if column is None:
+        if len(configs) == 1:
+            column = configs[0]["column"]
+        else:
+            raise ValueError(
+                "multiple text columns are indexed; set 'column' explicitly"
+            )
+    if not any(c["column"] == column for c in configs):
+        raise ValueError(f"column {column!r} is not declared in text_index_columns")
+
+    primary_keys = table.primary_keys
+    if not primary_keys:
+        raise ValueError("a text index requires a table with a primary key")
+    pk_column = primary_keys[0]
+
+    # Fetch extra candidates per shard so stale entries dropped by the exact
+    # verification pass cannot leave the global top-k short.
+    candidates_per_shard = max(top_k * 3, 16)
+    columns = _dedup_columns(
+        (pk_column, column, *extra_columns, TEXT_SEARCH_SCORE_COLUMN)
+    )
+    reader_options = {
+        "text_search_query": query,
+        "text_search_column": column,
+        "text_search_top_k": str(candidates_per_shard),
+        "text_search_scores": "true",
+    }
+
+    if isinstance(source, LakeSoulScan):
+        scan = source._replace(columns=tuple(columns), _reader_options=reader_options)
+    else:
+        scan = source.scan(columns=tuple(columns)).options(
+            reader_options=reader_options
+        )
+    dataframe = scan.to_daft()
+    dataframe = dataframe.sort(TEXT_SEARCH_SCORE_COLUMN, desc=True).limit(top_k)
+    if not with_score:
+        dataframe = dataframe.exclude(TEXT_SEARCH_SCORE_COLUMN)
+    return dataframe
+
+
+def _exact_distance(vec: Any, query: Any, metric: Any) -> float:
+    if vec is None:
+        return float("inf")
+    if metric == "IP":
+        return float(-sum(a * b for a, b in zip(vec, query)))
+    # Euclidean distance, matching `array_distance` and the index-only path
+    # (the squared distance would sort the same but report different values).
+    return float(math.sqrt(sum((a - b) * (a - b) for a, b in zip(vec, query))))
+
+
+_exact_distance_udf = daft.func(return_dtype=daft.DataType.float32())(_exact_distance)

@@ -1,0 +1,268 @@
+// SPDX-FileCopyrightText: 2023 LakeSoul Contributors
+//
+// SPDX-License-Identifier: Apache-2.0
+
+//! The physical planner for LakeSoul table.
+
+use std::sync::Arc;
+
+use datafusion::catalog::Session;
+use datafusion::common::{DFSchema, SchemaExt};
+use datafusion::error::{DataFusionError, Result as DFResult};
+use datafusion::logical_expr::physical_planning_context::PhysicalPlanningContext;
+use datafusion::logical_expr::{Expr, LogicalPlan};
+use datafusion::physical_expr::{LexOrdering, PhysicalExpr, create_physical_expr};
+use datafusion::physical_plan::filter::FilterExec;
+use datafusion::physical_plan::metrics::ExecutionPlanMetricsSet;
+use datafusion::physical_plan::sorts::sort::SortExec;
+use datafusion::physical_plan::sorts::sort_preserving_merge::SortPreservingMergeExec;
+use datafusion::physical_plan::{ExecutionPlan, ExecutionPlanProperties, Partitioning};
+use datafusion::physical_planner::{DefaultPhysicalPlanner, PhysicalPlanner};
+
+use async_trait::async_trait;
+
+use datafusion::logical_expr::{DmlStatement, WriteOp};
+use lakesoul_io::helpers::{
+    column_names_to_physical_expr, column_names_to_physical_sort_expr,
+};
+use lakesoul_io::physical_plan::RepartitionByRangeAndHashExec;
+use rootcause::compat::boxed_error::IntoBoxedError;
+
+use crate::catalog::LakeSoulProviderOptions;
+use crate::lakesoul_table::LakeSoulTable;
+
+pub struct LakeSoulPhysicalPlanner {
+    default_planner: DefaultPhysicalPlanner,
+}
+
+impl LakeSoulPhysicalPlanner {
+    pub fn new() -> Self {
+        Self {
+            default_planner: DefaultPhysicalPlanner::default(),
+        }
+    }
+}
+
+#[async_trait]
+impl PhysicalPlanner for LakeSoulPhysicalPlanner {
+    /// Create a physical plan from a logical plan
+    async fn create_physical_plan(
+        &self,
+        logical_plan: &LogicalPlan,
+        session_state: &dyn Session,
+    ) -> DFResult<Arc<dyn ExecutionPlan>> {
+        debug!("create_physical_plan: {}", &logical_plan);
+        match logical_plan {
+            LogicalPlan::Filter(filter) => {
+                debug!("filter: {}", &filter.predicate);
+                let physical_input = self
+                    .create_physical_plan(&filter.input, session_state)
+                    .await?;
+                let input_schema = physical_input.as_ref().schema();
+                let input_dfschema = filter.input.schema();
+                debug!("input_schema: {}", &input_schema);
+                debug!("input_dfschema: {}", &input_dfschema);
+
+                // Text search: the logical predicate keeps the user-facing
+                // 2-argument `text_match`; here the table provider is
+                // available, so it is rewritten to the table's configured
+                // analyzer before physical evaluation.
+                let predicate = crate::udf::text_search_marker::configure_predicate(
+                    &filter.predicate,
+                    &filter.input,
+                    session_state,
+                )
+                .await?;
+                let runtime_expr = self.create_physical_expr(
+                    &predicate,
+                    input_dfschema,
+                    session_state,
+                    &PhysicalPlanningContext::default(),
+                )?;
+                Ok(Arc::new(FilterExec::try_new(runtime_expr, physical_input)?))
+            }
+            LogicalPlan::Dml(DmlStatement {
+                table_name,
+                op: WriteOp::Insert(insert_op),
+                input,
+                ..
+            }) => {
+                debug!("insert into: {}, {}", &table_name, &input);
+                let name = table_name.table();
+                let schema = table_name.schema();
+                let lakesoul_table = LakeSoulTable::for_namespace_and_name(
+                    schema.unwrap_or("default"),
+                    name,
+                    None,
+                )
+                .await
+                .map_err(|report| DataFusionError::External(report.into_boxed_error()))?;
+
+                let provider_options =
+                    LakeSoulProviderOptions::from_session(session_state);
+                match lakesoul_table
+                    .as_provider_without_session(provider_options)
+                    .await
+                {
+                    Ok(provider) => {
+                        let physical_input =
+                            self.create_physical_plan(input, session_state).await?;
+
+                        if lakesoul_table.primary_keys().is_empty()
+                            && lakesoul_table
+                                .schema()
+                                .logically_equivalent_names_and_types(
+                                    input.schema().as_arrow(),
+                                )
+                                .is_err()
+                        {
+                            return Err(DataFusionError::Plan(
+                                // Return an error if schema of the input query does not match with the table schema.
+                                "Inserting query must have the same schema with the table.".to_string(),
+                            ));
+                        }
+
+                        let physical_input = if !lakesoul_table.primary_keys().is_empty()
+                            || !lakesoul_table.range_partitions().is_empty()
+                        {
+                            let _input_schema = physical_input.schema();
+                            let input_dfschema = input.as_ref().schema();
+                            let sort_expr = column_names_to_physical_sort_expr(
+                                [
+                                    lakesoul_table.range_partitions().clone(),
+                                    lakesoul_table.primary_keys().clone(),
+                                ]
+                                .concat()
+                                .as_slice(),
+                                input_dfschema,
+                                session_state,
+                            )
+                            .map_err(|report| {
+                                DataFusionError::External(report.into_boxed_error())
+                            })?;
+                            let hash_partitioning_expr = column_names_to_physical_expr(
+                                lakesoul_table.primary_keys(),
+                                input_dfschema,
+                                session_state,
+                            )
+                            .map_err(|report| {
+                                DataFusionError::External(report.into_boxed_error())
+                            })?;
+
+                            let hash_partitioning = Partitioning::Hash(
+                                hash_partitioning_expr,
+                                lakesoul_table.hash_bucket_num().map_err(|report| {
+                                    DataFusionError::External(report.into_boxed_error())
+                                })?,
+                            );
+                            let range_partitioning_expr = column_names_to_physical_expr(
+                                lakesoul_table.range_partitions(),
+                                input_dfschema,
+                                session_state,
+                            )
+                            .map_err(|report| {
+                                DataFusionError::External(report.into_boxed_error())
+                            })?;
+                            // The partitioning writer appends batches to the
+                            // range/bucket files in encounter order and never
+                            // sorts again, so it needs a single stream ordered by
+                            // `range_partitions + primary_keys` *globally*. This
+                            // wrapper runs after the input plan was already
+                            // optimized and the DML plan is never optimized again,
+                            // so the ordering has to be built here without losing
+                            // what the input already provides:
+                            // - a single-partition input is sorted in place;
+                            //   `SortExec` passes input through untouched at
+                            //   runtime when it already satisfies the ordering, so
+                            //   wrapping a CoalescePartitionsExec around it first
+                            //   (which clears the ordering metadata) would force
+                            //   an ordered input such as
+                            //   `INSERT ... SELECT ... ORDER BY pk` through another
+                            //   blocking sort;
+                            // - a multi-partition input sorts every partition and
+                            //   merges the sorted streams: a plain `SortExec` over
+                            //   several partitions only reads the first one, and
+                            //   coalescing first would funnel every row of the
+                            //   insert through a single blocking sorter, since the
+                            //   per-partition-sort + merge rewrite of the physical
+                            //   optimizer never runs on this plan.
+                            let ordering = LexOrdering::new(sort_expr)
+                                .ok_or(DataFusionError::Plan("empty sort expr".into()))?;
+                            let sorted_input: Arc<dyn ExecutionPlan> =
+                                if physical_input.output_partitioning().partition_count()
+                                    <= 1
+                                {
+                                    Arc::new(SortExec::new(ordering, physical_input))
+                                } else {
+                                    let per_partition = Arc::new(
+                                        SortExec::new(ordering.clone(), physical_input)
+                                            .with_preserve_partitioning(true),
+                                    );
+                                    Arc::new(SortPreservingMergeExec::new(
+                                        ordering,
+                                        per_partition,
+                                    ))
+                                };
+                            let sort_exec = sorted_input;
+                            Arc::new(
+                                RepartitionByRangeAndHashExec::try_new(
+                                    sort_exec,
+                                    range_partitioning_expr,
+                                    hash_partitioning,
+                                    ExecutionPlanMetricsSet::new(),
+                                )
+                                .map_err(|report| {
+                                    DataFusionError::External(report.into_boxed_error())
+                                })?,
+                            )
+                        } else {
+                            physical_input
+                        };
+
+                        provider
+                            .insert_into(session_state, physical_input, *insert_op)
+                            .await
+                    }
+                    Err(report) => return Err(report.into_boxed_error().into()),
+                }
+            }
+            LogicalPlan::Statement(statement) => {
+                // DataFusion is a read-only query engine, but also a library, so consumers may implement this
+                let name = statement.name();
+
+                Err(DataFusionError::NotImplemented(format!(
+                    "Unsupported logical plan: Statement({name})"
+                )))
+            }
+            _ => {
+                self.default_planner
+                    .create_physical_plan(logical_plan, session_state)
+                    .await
+            }
+        }
+    }
+
+    /// Create a physical expression from a logical expression
+    /// suitable for evaluation
+    ///
+    /// `expr`: the expression to convert
+    ///
+    /// `input_dfschema`: the logical plan schema for evaluating `expr`
+    ///
+    /// `input_schema`: the physical schema for evaluating `expr`
+    fn create_physical_expr(
+        &self,
+        expr: &Expr,
+        input_dfschema: &DFSchema,
+        session_state: &dyn Session,
+        planning_ctx: &PhysicalPlanningContext,
+    ) -> DFResult<Arc<dyn PhysicalExpr>> {
+        debug!("create_physical_expr: {}", &expr);
+        create_physical_expr(
+            expr,
+            input_dfschema,
+            session_state.execution_props(),
+            planning_ctx,
+        )
+    }
+}

@@ -1,0 +1,72 @@
+// SPDX-FileCopyrightText: 2023 LakeSoul Contributors
+//
+// SPDX-License-Identifier: Apache-2.0
+
+package org.apache.flink.lakesoul.tool;
+
+import static org.apache.flink.configuration.ConfigOptions.key;
+
+import org.apache.flink.configuration.ConfigOption;
+
+import java.util.Arrays;
+import java.util.List;
+
+public class NativeOptions {
+    public static final ConfigOption<String> MEM_LIMIT =
+            key("lakesoul.native_writer.mem_limit")
+                    .stringType()
+                    .defaultValue(String.valueOf(50 * 1024 * 1024))
+                    .withDescription("Option to set flush limit of native writer");
+
+    public static final ConfigOption<String> SPILL_MEM_POOL_SIZE =
+            key("lakesoul.native_writer.pool_size")
+                    .stringType()
+                    .defaultValue(String.valueOf(1024 * 1024 * 1024))
+                    .withDescription(
+                            "Option to set memory pool limit before spill of native writer");
+
+    public static final ConfigOption<String> SPILL_MEM_POOL_DIR =
+            key("lakesoul.native_writer.pool_dir")
+                    .stringType()
+                    .noDefaultValue()
+                    .withDescription("Option to set mem pool spill dir");
+
+    public static final ConfigOption<String> HASH_BUCKET_ID =
+            key("hash_bucket_id")
+                    .stringType()
+                    .defaultValue("0")
+                    .withDescription("Option to set hash bucket id of native writer");
+
+    public static final ConfigOption<String> KEEP_ORDERS =
+            key("lakesoul.native_writer.keep_orders")
+                    .stringType()
+                    .noDefaultValue()
+                    .withDescription("Option to set if keep order of records for native writer");
+
+    public static final ConfigOption<String> STABLE_SORT =
+            key("lakesoul.native_writer.stable_sort")
+                    .stringType()
+                    .defaultValue("false")
+                    .withDescription("Option to set if use stable sort for native writer");
+
+    public static final ConfigOption<String> PHYSICAL_FORMAT =
+            key("file_format")
+                    .stringType()
+                    .defaultValue("vortex-compact")
+                    .withDescription("Option to set the physical file format for native writer");
+
+    public static final ConfigOption<String> FILE_FILTER_PUSHDOWN =
+            key("lakesoul.native_writer.file_filter_pushdown")
+                    .stringType()
+                    .defaultValue("false")
+                    .withDescription("Option to set pushdown filters to physical format");
+
+    public static final List<ConfigOption<String>> OPTION_LIST =
+            Arrays.asList(
+                    MEM_LIMIT,
+                    KEEP_ORDERS,
+                    STABLE_SORT,
+                    SPILL_MEM_POOL_SIZE,
+                    PHYSICAL_FORMAT,
+                    FILE_FILTER_PUSHDOWN);
+}
