@@ -161,7 +161,7 @@ test-log = { version = "0.2", features = ["trace"] }
 tempfile = "3.3.0"
 # error handling
 thiserror = "1.0"
-anyhow = "1"
+anyhow = "1.0.104"
 rootcause = "0.13"
 reqwest = "0.13"
 # sync
